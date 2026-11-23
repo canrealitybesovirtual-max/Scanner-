@@ -1183,39 +1183,18 @@ function plyBlob(rec) {
 }
 /* glTF binary: coloured point cloud, Quest room meshes (in world space), wall/stair/object boxes, understanding in extras */
 async function exportGLB(rec) {
-  $('st').textContent = 'Building the mesh…'; await new Promise(r => setTimeout(r, 30));
-  if (!(viewer.on && viewer.id === rec.id)) { clearMap(); pmat.uniforms.floorY.value = rec.floorY || 0; mergeRecord(rec, new M4()); }
-  for (let guard = 0; cellQ.size && guard < 100000; guard++) tileSlice(50); tileFlush();
-  const tl0 = [];                                                    // live tiles -> quads + a 6x6-texel atlas
-  for (const c of cells.values()) if (c.slot >= 0) tl0.push(c.slot);
-  const TMx = Math.min(tl0.length, 65536), A = 2048, per = A / 8, cv = document.createElement('canvas'); cv.width = cv.height = A; const g = cv.getContext('2d'), img = g.createImageData(A, A);
-  const TP = new Float32Array(TMx * 12), TN = new Float32Array(TMx * 12), TU = new Float32Array(TMx * 8), TI = new Uint32Array(TMx * 6), im = tiles.instanceMatrix.array;
-  for (let t = 0; t < TMx; t++) {
-    const sl = tl0[t], e = im.subarray(sl * 16, sl * 16 + 16), words = []; for (let i = 0; i < 7; i++) for (const w of tileGeo.attributes['iT' + i].array.subarray(sl * 4, sl * 4 + 4)) words.push(w);
-    const cx = e[12], cy = e[13], cz = e[14], ux = e[0] / 2, uy = e[1] / 2, uz = e[2] / 2, vx = e[4] / 2, vy = e[5] / 2, vz = e[6] / 2;
-    [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([a, b], j) => { TP.set([cx + a * ux + b * vx, cy + a * uy + b * vy, cz + a * uz + b * vz], t * 12 + j * 3); TN.set([e[8], e[9], e[10]], t * 12 + j * 3); });
-    const ax = (t % per) * 8, ay = Math.floor(t / per) * 8;
-    TU.set([(ax + 1) / A, (ay + 7) / A, (ax + 7) / A, (ay + 7) / A, (ax + 7) / A, (ay + 1) / A, (ax + 1) / A, (ay + 1) / A], t * 8);
-    TI.set([t * 4, t * 4 + 1, t * 4 + 2, t * 4, t * 4 + 2, t * 4 + 3], t * 6);
-    const has = words[27] > 0, h = Math.max(0, Math.min(1, (cy - (rec.floorY || 0)) / 2.7));
-    for (let py = 0; py < 8; py++) for (let px = 0; px < 8; px++) {           // 6x6 texels plus a repeated 1-px border; texel row 0 is the tile's bottom
-      const i = Math.min(5, Math.max(0, px - 1)), j = 5 - Math.min(5, Math.max(0, py - 1)), k = (j * 6 + i) * 3, o = ((ay + py) * A + ax + px) * 4;
-      for (let ch = 0; ch < 3; ch++) { const b = k + ch; img.data[o + ch] = has ? (words[b >> 2] >>> ((b & 3) * 8)) & 255 : [160 + 40 * h, 130 + 85 * h, 100 + 130 * h][ch]; }
-      img.data[o + 3] = 255; }
-  }
-  g.putImageData(img, 0, 0); const png = new Uint8Array(await (await new Promise(r => cv.toBlob(r, 'image/png'))).arrayBuffer());
-  /* points not already drawn by a tile (corners, furniture, clutter) + detail points */
-  const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF && !tl[i]) keep.push(i);
-  const fk = []; for (let i = 0; i < FN; i++) if (fcnt[i] >= CONF) fk.push(i);
-  const PP = new Float32Array((keep.length + fk.length) * 3), PC = new Uint8Array((keep.length + fk.length) * 4);
-  const putPt = (j, x, y, z, w, r, gg, b) => { PP[j * 3] = x; PP[j * 3 + 1] = y; PP[j * 3 + 2] = z; const h = Math.max(0, Math.min(1, (y - (rec.floorY || 0)) / 2.7));
-    PC[j * 4] = w > .01 ? r * 255 : 160 + 40 * h; PC[j * 4 + 1] = w > .01 ? gg * 255 : 130 + 85 * h; PC[j * 4 + 2] = w > .01 ? b * 255 : 100 + 130 * h; PC[j * 4 + 3] = 255; };
-  keep.forEach((id, j) => putPt(j, pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2], cw[id], col[id * 3], col[id * 3 + 1], col[id * 3 + 2]));
-  fk.forEach((id, j) => putPt(keep.length + j, fpos[id * 3], fpos[id * 3 + 1], fpos[id * 3 + 2], fcw[id], fcol[id * 3], fcol[id * 3 + 1], fcol[id * 3 + 2]));
-  if (!viewer.on) { clearMap(); flushGeo(); }
-  rec = Object.assign({}, rec, { points: PP, colors: PC, _tiles: TMx ? { P: TP, N: TN, U: TU, I: TI, png } : null });
-  $('st').textContent = TMx.toLocaleString() + ' surface tiles + ' + (PP.length / 3).toLocaleString() + ' points';
-  return exportGLBraw(rec);
+  $('st').textContent = 'Building the 3D mesh… (this can take a minute for a whole house)'; await new Promise(r => setTimeout(r, 30));
+  const own = !(viewer.on && viewer.id === rec.id);
+  if (own) { clearMap(); pmat.uniforms.floorY.value = rec.floorY || 0; mergeRecord(rec, new M4()); }
+  const zones = det.zones.slice(), t0 = performance.now(), parts = [];
+  try {
+    parts.push(await meshPoints(...gatherForMesh(false, zones), VS));
+    if (FN) parts.push(await meshPoints(...gatherForMesh(true, zones), VSF));
+  } catch (e) { $('st').textContent = 'Meshing failed: ' + e.message; if (own && !viewer.on) clearMap(); return; }
+  if (own && !viewer.on) { clearMap(); flushGeo(); }
+  const tris = parts.reduce((a, m) => a + m.I.length / 3, 0);
+  $('st').textContent = 'Mesh: ' + tris.toLocaleString() + ' triangles in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s';
+  return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts }));
 }
 function exportGLBraw(rec) {
   const chunks = [], views = [], accs = [], meshesG = [], nodes = []; let off = 0;
@@ -1225,8 +1204,15 @@ function exportGLBraw(rec) {
   const n = rec.points.length / 3, C = new Uint8Array(n * 4);
   for (let k = 0; k < n; k++) { const hc = rec.colors && rec.colors[k * 4 + 3], h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7));
     C[k * 4] = hc ? rec.colors[k * 4] : 160 + 40 * h; C[k * 4 + 1] = hc ? rec.colors[k * 4 + 1] : 130 + 85 * h; C[k * 4 + 2] = hc ? rec.colors[k * 4 + 2] : 100 + 130 * h; C[k * 4 + 3] = 255; }
-  meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5121, n, true) } }] }); nodes.push({ name: 'scan points', mesh: 0 });
+  if (n) { meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5121, n, true) } }] }); nodes.push({ name: 'scan points', mesh: meshesG.length - 1 }); }
   const extra = {};
+  if (rec._meshes) {                                                  // continuous surface, vertex-coloured from the camera (unlit: colours already hold the room's light)
+    Object.assign(extra, { materials: [{ name: 'scan', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: 1 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }], extensionsUsed: ['KHR_materials_unlit'] });
+    rec._meshes.forEach((m, i) => { if (!m.I.length) return; const vc = m.P.length / 3, CL = new Float32Array(vc * 3); for (let k = 0; k < vc * 3; k++) { const c = Math.min(1, Math.max(0, m.C[k])); CL[k] = c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }   // glTF vertex colours are linear
+      const name = i ? 'detail surfaces (5 mm)' : 'scan surfaces (2 cm)';
+      meshesG.push({ name, primitives: [{ mode: 4, material: 0, attributes: { POSITION: acc(m.P, 'VEC3', 5126, vc, false, bounds(m.P)), NORMAL: acc(m.N, 'VEC3', 5126, vc), COLOR_0: acc(CL, 'VEC3', 5126, vc) }, indices: acc(m.I, 'SCALAR', 5125, m.I.length) }] });
+      nodes.push({ name, mesh: meshesG.length - 1 }); });
+  }
   if (rec._tiles) {                                                   // textured surface mesh (unlit: the photos already carry the room's lighting)
     const T = rec._tiles, imgView = add(T.png);
     Object.assign(extra, { images: [{ bufferView: imgView, mimeType: 'image/png' }], samplers: [{ magFilter: 9729, minFilter: 9729, wrapS: 33071, wrapT: 33071 }], textures: [{ source: 0, sampler: 0 }],
@@ -1253,6 +1239,68 @@ function parseJSON(o) {
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
 }
 
+
+/* ================= meshing: oriented points -> signed distance (implicit MLS) -> surface nets, in a worker ================= */
+const MESH_SRC = `
+onmessage = e => {
+  const { P, Nn, C, cell, minW } = e.data, n = P.length / 3, h2 = (1.1 * cell) * (1.1 * cell);
+  const key = (i, j, k) => ((i + 32768) * 65536 + (j + 32768)) * 65536 + (k + 32768);
+  const cid = new Map(); let cn = 0, cap = 1 << 16;
+  let W = new Float32Array(cap), Fs = new Float32Array(cap), Cs = new Float32Array(cap * 3), Ns = new Float32Array(cap * 3), I3 = new Int32Array(cap * 3);
+  const grow = () => { cap *= 2; const g = (A, k) => { const B = new A.constructor(cap * k); B.set(A); return B; }; W = g(W, 1); Fs = g(Fs, 1); Cs = g(Cs, 3); Ns = g(Ns, 3); I3 = g(I3, 3); };
+  /* every point votes on the signed distance of the grid corners around it: f(x) = n·(x - p), weighted by closeness */
+  for (let q = 0; q < n; q++) {
+    const px = P[q * 3], py = P[q * 3 + 1], pz = P[q * 3 + 2], nx = Nn[q * 3], ny = Nn[q * 3 + 1], nz = Nn[q * 3 + 2];
+    const bi = Math.floor(px / cell), bj = Math.floor(py / cell), bk = Math.floor(pz / cell);
+    for (let a = -1; a <= 2; a++) for (let b = -1; b <= 2; b++) for (let c = -1; c <= 2; c++) {          // the 4x4x4 corners around the point
+      const i = bi + a, j = bj + b, k = bk + c, x = i * cell - px, y = j * cell - py, z = k * cell - pz, w = Math.exp(-(x * x + y * y + z * z) / h2);
+      const kk = key(i, j, k); let id = cid.get(kk); if (id === undefined) { if (cn >= cap) grow(); id = cn++; cid.set(kk, id); I3[id * 3] = i; I3[id * 3 + 1] = j; I3[id * 3 + 2] = k; }
+      W[id] += w; Fs[id] += w * (nx * x + ny * y + nz * z); Cs[id * 3] += w * C[q * 3]; Cs[id * 3 + 1] += w * C[q * 3 + 1]; Cs[id * 3 + 2] += w * C[q * 3 + 2]; Ns[id * 3] += w * nx; Ns[id * 3 + 1] += w * ny; Ns[id * 3 + 2] += w * nz;
+    }
+  }
+  const F = id => Fs[id] / W[id], ok = id => id !== undefined && W[id] >= minW;
+  /* surface nets: one vertex per cube that the surface passes through, at the mean of its edge crossings */
+  const E = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]], OFF = [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]];
+  const vid = new Map(), VP = [], VN = [], VC = []; const cc = new Array(8), cf = new Float32Array(8);
+  for (let id = 0; id < cn; id++) {
+    if (W[id] < minW) continue; const i = I3[id * 3], j = I3[id * 3 + 1], k = I3[id * 3 + 2]; let pos = 0, neg = 0, good = true;
+    for (let o = 0; o < 8; o++) { const c = o ? cid.get(key(i + OFF[o][0], j + OFF[o][1], k + OFF[o][2])) : id; if (!ok(c)) { good = false; break; } cc[o] = c; cf[o] = F(c); if (cf[o] > 0) pos++; else neg++; }
+    if (!good || !pos || !neg) continue;
+    let sx = 0, sy = 0, sz = 0, m = 0;
+    for (const [a, b] of E) { const fa = cf[a], fb = cf[b]; if ((fa > 0) === (fb > 0)) continue; const t = fa / (fa - fb);
+      sx += OFF[a][0] + (OFF[b][0] - OFF[a][0]) * t; sy += OFF[a][1] + (OFF[b][1] - OFF[a][1]) * t; sz += OFF[a][2] + (OFF[b][2] - OFF[a][2]) * t; m++; }
+    vid.set(key(i, j, k), VP.length / 3); VP.push((i + sx / m) * cell, (j + sy / m) * cell, (k + sz / m) * cell);
+    let nx = 0, ny = 0, nz = 0, r = 0, g = 0, bb = 0, ws = 0; for (const c of cc) { nx += Ns[c * 3]; ny += Ns[c * 3 + 1]; nz += Ns[c * 3 + 2]; r += Cs[c * 3]; g += Cs[c * 3 + 1]; bb += Cs[c * 3 + 2]; ws += W[c]; }
+    const nl = Math.hypot(nx, ny, nz) || 1; VN.push(nx / nl, ny / nl, nz / nl); VC.push(r / ws, g / ws, bb / ws);
+  }
+  /* faces: every grid edge the surface crosses joins the 4 cubes around it */
+  const T = [], AX = [[1,0,0],[0,1,0],[0,0,1]], RING = [[[0,0,0],[0,-1,0],[0,-1,-1],[0,0,-1]], [[0,0,0],[0,0,-1],[-1,0,-1],[-1,0,0]], [[0,0,0],[-1,0,0],[-1,-1,0],[0,-1,0]]];
+  for (let id = 0; id < cn; id++) {
+    if (W[id] < minW) continue; const i = I3[id * 3], j = I3[id * 3 + 1], k = I3[id * 3 + 2], f0 = F(id);
+    for (let a = 0; a < 3; a++) {
+      const nb = cid.get(key(i + AX[a][0], j + AX[a][1], k + AX[a][2])); if (!ok(nb)) continue; const f1 = F(nb); if ((f0 > 0) === (f1 > 0)) continue;
+      const q = RING[a].map(d => vid.get(key(i + d[0], j + d[1], k + d[2]))); if (q.some(v => v === undefined)) continue;
+      if (f1 > f0) T.push(q[0], q[1], q[2], q[0], q[2], q[3]); else T.push(q[0], q[2], q[1], q[0], q[3], q[2]);   // face toward open space
+    }
+  }
+  const out = { P: new Float32Array(VP), N: new Float32Array(VN), C: new Float32Array(VC), I: new Uint32Array(T) };
+  postMessage(out, [out.P.buffer, out.N.buffer, out.C.buffer, out.I.buffer]);
+};`;
+function meshPoints(P, Nn, C, cell, minW = .12) {
+  return new Promise((res, rej) => { const w = new Worker(URL.createObjectURL(new Blob([MESH_SRC], { type: 'text/javascript' })));
+    w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); rej(new Error(e.message || 'mesh worker failed')); };
+    w.postMessage({ P, Nn, C, cell, minW }, [P.buffer, Nn.buffer, C.buffer]); });
+}
+function gatherForMesh(fine, zones) {                              // confirmed points with normals, colours (camera or height tint), zones split coarse/fine
+  const n = fine ? FN : N, Cn = fine ? fcnt : cnt, Pp = fine ? fpos : pos, Nm = fine ? fnrm : nrm, Cl = fine ? fcol : col, Cw = fine ? fcw : cw, fy = pmat.uniforms.floorY.value;
+  const inZ = (x, y, z) => zones.some(q => (x - q.c.x) ** 2 + (y - q.c.y) ** 2 + (z - q.c.z) ** 2 < q.r * q.r);
+  const idx = []; for (let i = 0; i < n; i++) { if (Cn[i] < CONF) continue; const l = Math.hypot(Nm[i * 3], Nm[i * 3 + 1], Nm[i * 3 + 2]); if (l < 1e-6) continue;
+    if (!fine && zones.length && inZ(Pp[i * 3], Pp[i * 3 + 1], Pp[i * 3 + 2])) continue; idx.push(i); }
+  const P = new Float32Array(idx.length * 3), Nn = new Float32Array(idx.length * 3), C = new Float32Array(idx.length * 3);
+  idx.forEach((i, k) => { P.set(Pp.subarray(i * 3, i * 3 + 3), k * 3); const l = Math.hypot(Nm[i * 3], Nm[i * 3 + 1], Nm[i * 3 + 2]); Nn[k * 3] = Nm[i * 3] / l; Nn[k * 3 + 1] = Nm[i * 3 + 1] / l; Nn[k * 3 + 2] = Nm[i * 3 + 2] / l;
+    if (Cw[i] > .01) C.set(Cl.subarray(i * 3, i * 3 + 3), k * 3); else { const h = Math.max(0, Math.min(1, (Pp[i * 3 + 1] - fy) / 2.7)); C[k * 3] = (160 + 40 * h) / 255; C[k * 3 + 1] = (130 + 85 * h) / 255; C[k * 3 + 2] = (100 + 130 * h) / 255; } });
+  return [P, Nn, C];
+}
 
 /* ================= understanding the house: floors, ceilings, walls, stairs, objects =================
    Works on the confirmed points (plus, when known, which directions each was seen from) and the
