@@ -71,11 +71,11 @@ input[type=file]{display:none}
   </ul>
   <div class="btns">
     <button id="bAR" class="primary" type="button" disabled>Checking headset…</button>
-    <label class="btn" for="fOpen">Open an exported scan file</label>
+    <label class="btn" for="fOpen">Restore a backup or open a scan file</label>
     <button id="bDiag" type="button">Diagnostics</button>
   </div>
   <label class="chk"><input id="cColor" type="checkbox" checked> Real colours from the headset camera (asks for camera permission)</label>
-  <input id="fOpen" type="file" accept=".json,application/json">
+  <input id="fOpen" type="file" accept=".zip,.json,application/zip,application/json">
   <div id="scans"></div>
   <div id="st"></div>
 </div></div>
@@ -1730,6 +1730,34 @@ async function photoDepths(rec, frames, say, raw, scale) {
   finally { renderer.xr.enabled = !!xrSession || renderer.xr.enabled; renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose(); sc2.traverse(o => o.geometry && o.geometry.dispose()); }   // restores the headset's own target
   return out;
 }
+/* full backup: the scan and every photo in one .zip in the headset's Downloads (survives clearing the browser); Restore reads it back */
+async function backupBlob(rec, say) {
+  say('Packing the scan…'); const files = [{ name: 'scan.json', blob: scanJSONBlob(rec) }];
+  const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t), meta = [];
+  fr.forEach((f, i) => { const name = 'photos/' + String(i + 1).padStart(5, '0') + '.jpg', m = Object.assign({}, f); delete m.blob; delete m.scan; delete m.k; m.file = name; meta.push(m); if (f.blob) files.push({ name, blob: f.blob }); });
+  files.push({ name: 'photos.json', blob: new Blob([JSON.stringify(meta)]) }, { name: 'backup.json', blob: new Blob([JSON.stringify({ format: 'house-scanner-backup/1', name: rec.name, date: rec.date, photos: fr.length, made: new Date().toISOString(), note: 'Restore: House Scanner > Open a backup or scan file. Raw depth frames are not included (Refine starts from the restored surface).' })]) });
+  say('Packing ' + fr.length + ' photos…'); return zipMany(files);
+}
+async function exportBackup(rec) { const st = $('st'); try { const z = await backupBlob(rec, m => st.textContent = m); await download((rec.name || 'scan').replace(/\W+/g, '-') + '-backup-' + new Date().toISOString().slice(0, 10) + '.zip', z); st.textContent = 'Backup saved to Downloads (' + (z.size / 1048576).toFixed(0) + ' MB). Keep it: it restores this scan with its photos.'; } catch (e) { st.textContent = 'Backup failed: ' + e.message; } }
+async function unzipIndex(blob) {                                     // our zips are stored (no compression): read the central directory, slice the files
+  const tail = new DataView(await blob.slice(Math.max(0, blob.size - 22)).arrayBuffer()); if (tail.getUint32(0, true) !== 0x06054b50) throw new Error('not a backup zip');
+  const n = tail.getUint16(10, true), cdSize = tail.getUint32(12, true), cdOff = tail.getUint32(16, true), cd = new DataView(await blob.slice(cdOff, cdOff + cdSize).arrayBuffer()), td = new TextDecoder(), out = new Map(); let p = 0;
+  for (let i = 0; i < n; i++) { const size = cd.getUint32(p + 20, true), nl = cd.getUint16(p + 28, true), xl = cd.getUint16(p + 30, true), cl = cd.getUint16(p + 32, true), off = cd.getUint32(p + 42, true), name = td.decode(new Uint8Array(cd.buffer, p + 46, nl));
+    out.set(name, { off, size }); p += 46 + nl + xl + cl; }
+  const get = async name => { const e = out.get(name); if (!e) return null; const lh = new DataView(await blob.slice(e.off, e.off + 30).arrayBuffer()); const start = e.off + 30 + lh.getUint16(26, true) + lh.getUint16(28, true); return blob.slice(start, start + e.size); };
+  return { names: [...out.keys()], get };
+}
+async function restoreBackup(file, say) {
+  const z = await unzipIndex(file), sj = await z.get('scan.json'); if (!sj) throw new Error('no scan in this zip');
+  say('Restoring the scan…'); const rec = parseJSON(JSON.parse(await sj.text())); rec.id = 'scan-' + Date.now(); const pj = await z.get('photos.json'), meta = pj ? JSON.parse(await pj.text()) : [];
+  let k = 0; for (const m of meta) { const b = await z.get(m.file); if (!b) continue; const f = Object.assign({}, m, { scan: rec.id, k: rec.id + '/r' + String(k).padStart(5, '0'), blob: new Blob([b], { type: 'image/jpeg' }) }); delete f.file; await DB.putFrame(f); if (++k % 50 === 0) say('Restoring photos ' + k + ' / ' + meta.length + '…'); }
+  delete rec.auto; await DB.put(rec); return { rec, photos: k };
+}
+async function shareFile(name, blob, title) {                        // the system share sheet (phone, cloud drive, messages) where the browser has one
+  const f = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+  if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f], title }); return true; } catch (e) { if (e && e.name === 'AbortError') return true; } }
+  await download(name, blob); return false;
+}
 async function exportPhotos(rec) {
   $('st').textContent = 'Packing photos…';
   const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
@@ -1759,13 +1787,15 @@ async function download(name, blob) {
   }
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
 }
-function exportJSON(rec) {
+function scanJSONBlob(rec) { let o = null; exportJSON(rec, x => o = x); return new Blob([JSON.stringify(o)], { type: 'application/json' }); }
+function exportJSON(rec, grab) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null, D: rec.D || null,
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
     layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null,
     tsdf: rec.tsdf ? { vs: rec.tsdf.vs, bs: rec.tsdf.bs, mu: rec.tsdf.mu, wscale: rec.tsdf.wscale || 6, keys: b64(rec.tsdf.keys), d: b64(rec.tsdf.d), w: b64(rec.tsdf.w), c: b64(rec.tsdf.c) } : null,
     fineVoxel: rec.fineVoxel || null, zones: rec.zones || null, fpoints: rec.fpoints ? b64(rec.fpoints) : null, fcolors: rec.fcolors ? b64(rec.fcolors) : null, fnormals: rec.fnormals ? b64(rec.fnormals) : null, fcounts: rec.fcounts ? b64(rec.fcounts) : null };
+  if (grab) return grab(o);
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
 function exportPLY(rec) { download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', plyBlob(rec)); }
@@ -1810,13 +1840,14 @@ async function refineScan(rec, say) {
     if (best >= 0) { const Cc = new M4().fromArray(res.corr[best]); k.m = Array.from(Cc.clone().multiply(new M4().fromArray(k.m)).elements); if (k.m0) k.m0 = Array.from(Cc.multiply(new M4().fromArray(k.m0)).elements); await DB.putFrame(k); moved++; } }
   st.textContent = 'Refined in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s: ' + res.aligned + '/' + fr.length + ' frames re-aligned (median shift ' + (res.median * 1000).toFixed(0) + ' mm), ' + moved + ' photos updated';
 }
-async function exportGLB(rec) {
+async function glbBlob(rec) { let b = null; await exportGLB(rec, x => b = x); if (!b) throw new Error('could not build the 3D model'); return b; }
+async function exportGLB(rec, grab) {
   $('st').textContent = rec.meshCache ? 'Packing the mesh…' : 'Building the 3D mesh… (up to a minute for a whole house)'; await new Promise(r => setTimeout(r, 30));
   let parts; try { parts = await recMesh(rec); } catch (e) { $('st').textContent = 'Meshing failed: ' + e.message; return; }
-  if (rec.tex) return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts.filter(p => p.fine), _texMesh: rec.tex }));
-  if (!parts.length) { $('st').textContent = 'This scan has no surface normals (made with an older version): exporting points'; return exportGLBraw(rec); }
+  if (rec.tex) return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts.filter(p => p.fine), _texMesh: rec.tex, _grab: grab }));
+  if (!parts.length) { $('st').textContent = 'This scan has no surface normals (made with an older version): exporting points'; return exportGLBraw(Object.assign({}, rec, { _grab: grab })); }
   $('st').textContent = 'Mesh: ' + parts.reduce((a, m) => a + m.I.length / 3, 0).toLocaleString() + ' triangles';
-  return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts }));
+  return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts, _grab: grab }));
 }
 async function exportGLBraw(rec) {
   const chunks = [], views = [], accs = [], meshesG = [], nodes = []; let off = 0;
@@ -1860,7 +1891,8 @@ async function exportGLBraw(rec) {
   const jb = new TextEncoder().encode(JSON.stringify(json)), jpad = (4 - jb.length % 4) % 4, jlen = jb.length + jpad;
   const head = new DataView(new ArrayBuffer(20)); head.setUint32(0, 0x46546C67, true); head.setUint32(4, 2, true); head.setUint32(8, 12 + 8 + jlen + 8 + off, true); head.setUint32(12, jlen, true); head.setUint32(16, 0x4E4F534A, true);
   const bh = new DataView(new ArrayBuffer(8)); bh.setUint32(0, off, true); bh.setUint32(4, 0x004E4942, true);
-  download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
+  const gb = new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }); if (rec._grab) return rec._grab(gb);
+  download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', gb);
 }
 function parseJSON(o) {
   return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, tsdf: o.tsdf ? { vs: o.tsdf.vs, bs: o.tsdf.bs, mu: o.tsdf.mu, wscale: o.tsdf.wscale || 6, keys: unb64(o.tsdf.keys, Float64Array), d: unb64(o.tsdf.d, Int8Array), w: unb64(o.tsdf.w, Uint8Array), c: unb64(o.tsdf.c, Uint8Array) } : null,
@@ -3052,7 +3084,7 @@ async function autoRun() {
       if (nd >= 20 && !rec.refined) { await refineScan(rec, m => say('Refining: ' + m.replace(/^Refining:? ?/, ''))); rec = await DB.get(id); }
       say('Building surface…'); await recMesh(rec);
       if (np >= 5 && nd) { try { const a = await alignPhotos(rec, m => say('Photo matching: ' + m + '…')); rec = await DB.get(id); say('Photos matched: error ' + (a.rms0 * 100).toFixed(1) + '% → ' + (a.rms1 * 100).toFixed(1) + '%'); } catch (e) { say('Photo matching skipped: ' + e.message); rec = await DB.get(id); } }
-      if (np && nd) { try { await recTexture(rec, m => say('Photo texture: ' + m + '…')); } catch (e) { say('No photo texture: ' + e.message); } }
+      if (np) { try { await recTexture(rec, m => say('Photo texture: ' + m + '…')); } catch (e) { say('No photo texture: ' + e.message); } }
       rec.auto = { v: 1, at: Date.now() }; if (!(await putIfSame(rec))) throw new Error('scan was saved again: will reprocess');
     }
     let joined = null; try { joined = await autoMerge(id, say); } catch (e) { if (/paused/.test(e && e.message)) throw e; diagLog('automerge', e && e.message); }
@@ -3314,8 +3346,8 @@ function listRows(el, all, lives) {
     if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
     const acts = document.createElement('div'); acts.className = 'acts'; const menus = {};
     const menu = (title) => { const d = document.createElement('details'), su = document.createElement('summary'), m = document.createElement('div'); su.textContent = title; m.className = 'menu'; d.append(su, m); menus[title] = { d, m }; return m; };
-    const GROUP = { '.json': 'Export', '.ply': 'Export', '.glb': 'Export', 'Photos .zip': 'Export', 'Floor plan': 'Export', 'Floor plan DXF': 'Export', 'Merge with…': 'More', 'Refine': 'More', 'Match photos': 'More', 'Photo texture': 'More', 'Rename': 'More', 'Delete': 'More' };
-    const LABEL = { '.glb': '3D model (.glb)', '.ply': 'Points (.ply)', '.json': 'Full backup (.json)', 'Photos .zip': 'Photos + camera poses (.zip)', 'Floor plan': 'Floor plan with room sizes (.svg)', 'Floor plan DXF': 'Floor plan for CAD apps (.dxf)', 'Merge with…': 'Join with another scan…', 'Refine': 'Refine again', 'Match photos': 'Re-match photos', 'Photo texture': 'Re-make photo texture', 'Continue scanning': 'Continue scanning' };
+    const GROUP = { '.json': 'Export', '.ply': 'Export', '.glb': 'Export', 'Photos .zip': 'Export', 'Floor plan': 'Export', 'Floor plan DXF': 'Export', 'Backup': 'Export', 'Share model': 'Export', 'Share plan': 'Export', 'Merge with…': 'More', 'Refine': 'More', 'Match photos': 'More', 'Photo texture': 'More', 'Rename': 'More', 'Delete': 'More' };
+    const LABEL = { '.glb': '3D model (.glb)', '.ply': 'Points (.ply)', '.json': 'Scan data only (.json)', 'Backup': 'Full backup with photos (.zip)', 'Share model': 'Share 3D model…', 'Share plan': 'Share floor plan…', 'Photos .zip': 'Photos + camera poses (.zip)', 'Floor plan': 'Floor plan with room sizes (.svg)', 'Floor plan DXF': 'Floor plan for CAD apps (.dxf)', 'Merge with…': 'Join with another scan…', 'Refine': 'Refine again', 'Match photos': 'Re-match photos', 'Photo texture': 'Re-make photo texture', 'Continue scanning': 'Continue scanning' };
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = LABEL[label] || label; b.addEventListener('click', e => { const d = b.closest('details'); if (d) d.open = false; fn(e); });
       if (label === 'Walk through') b.className = 'primary'; if (label === 'Delete') b.className = 'danger';
       const g = GROUP[label]; if (g) (menus[g] ? menus[g].m : menu(g)).appendChild(b); else acts.appendChild(b); };
@@ -3328,6 +3360,9 @@ function listRows(el, all, lives) {
     mk('.json', load(r, exportJSON)); mk('.ply', load(r, exportPLY)); mk('.glb', load(r, exportGLB));
     mk('Refine', async () => { try { const x = await fresh(r); if (x.refined && !confirm('This scan is already refined. Refine again?')) return; await refineScan(x, m => $('st').textContent = m); listScans(); } catch (e) { $('st').textContent = 'Refine: ' + e.message; } });
     mk('Floor plan', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + (fp.floors > 1 ? fp.floors + ' floors, ' : '') + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
+    mk('Backup', load(r, exportBackup));
+    mk('Share model', load(r, async x => { const st = $('st'); try { st.textContent = 'Preparing the 3D model…'; const b = await glbBlob(x); const shared = await shareFile((r.name || 'scan').replace(/\W+/g, '-') + '.glb', b, r.name); st.textContent = shared ? 'Shared.' : 'This browser has no share sheet here: saved to Downloads instead.'; } catch (e) { st.textContent = 'Share: ' + e.message; } }));
+    mk('Share plan', load(r, async x => { try { const fp = floorPlan(x); const shared = await shareFile((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' }), r.name + ' floor plan'); $('st').textContent = shared ? 'Shared.' : 'No share sheet here: saved to Downloads instead.'; } catch (e) { $('st').textContent = 'Share: ' + e.message; } }));
     mk('Floor plan DXF', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.dxf', new Blob([fp.dxf], { type: 'application/dxf' })); $('st').textContent = 'Floor plan (CAD): ' + fp.floors + ' floor' + (fp.floors > 1 ? 's' : '') + ', ' + fp.rooms + ' rooms'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
     mk('Merge with…', async () => { const others = all.filter(o => o.id !== r.id); if (!others.length) { $('st').textContent = 'Scan another room first, then merge.'; return; }
       const pick = prompt('Merge "' + r.name + '" with which scan? Type its number:\n' + others.map((o, i) => (i + 1) + '. ' + o.name + ' (' + new Date(o.date).toLocaleDateString() + ')').join('\n'), '1'); const o = others[(+pick || 0) - 1]; if (!o) return;
@@ -3338,7 +3373,7 @@ function listRows(el, all, lives) {
       catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (!nm) return; try { const x = await fresh(r); x.name = nm; x.date = Date.now(); await DB.put(x); listScans(); } catch (e) { $('st').textContent = 'Rename: ' + e.message; } });
     mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor) queueAnchorDelete(r.anchor.uuid, listScans.full || [], r.id); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
-    const ORDER = ['3D model (.glb)', 'Floor plan with room sizes (.svg)', 'Floor plan for CAD apps (.dxf)', 'Photos + camera poses (.zip)', 'Points (.ply)', 'Full backup (.json)', 'Join with another scan…', 'Rename', 'Refine again', 'Re-match photos', 'Re-make photo texture', 'Delete'];
+    const ORDER = ['Full backup with photos (.zip)', 'Share 3D model…', 'Share floor plan…', '3D model (.glb)', 'Floor plan with room sizes (.svg)', 'Floor plan for CAD apps (.dxf)', 'Photos + camera poses (.zip)', 'Points (.ply)', 'Scan data only (.json)', 'Join with another scan…', 'Rename', 'Refine again', 'Re-match photos', 'Re-make photo texture', 'Delete'];
     for (const g of ['Export', 'More']) if (menus[g]) { [...menus[g].m.children].sort((a, b) => ORDER.indexOf(a.textContent) - ORDER.indexOf(b.textContent)).forEach(b => menus[g].m.appendChild(b)); acts.appendChild(menus[g].d); }
     row.appendChild(acts);
     el.appendChild(row);
@@ -3392,6 +3427,7 @@ cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
 cv.addEventListener('wheel', e => { if (viewer.on) { viewer.dist = Math.max(.5, viewer.dist * Math.exp(e.deltaY * .001)); e.preventDefault(); } }, { passive: false });
 $('fOpen').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
+  if (/\.zip$/i.test(f.name)) { try { const r2 = await restoreBackup(f, m => $('st').textContent = m); $('st').textContent = 'Restored "' + r2.rec.name + '" with ' + r2.photos + ' photos. Rebuilding its surface and photo texture now.'; listScans(); autoEnqueue(r2.rec.id); } catch (err) { $('st').textContent = 'Restore failed: ' + err.message; } e.target.value = ''; return; }
   try { const rec = parseJSON(JSON.parse(await f.text())); if (confirm('Keep "' + rec.name + '" on this device too?')) { await DB.put(rec); listScans(); } openViewer(rec); }
   catch (err) { $('st').textContent = 'Not a scan file: ' + err.message; }
   e.target.value = '';
