@@ -1150,7 +1150,7 @@ onmessage = e => {
   const P = out.slice(0, np * 11);
   let meshes = null, tsdfBlocks = 0, tms = 0, raw = null;
   if (!F && d.tsdf && d.saveRaw) { const mm = new Uint16Array(DW * DH); for (let k = 0; k < mm.length; k++) { const z = zf[k]; mm[k] = z > .2 && z < 6 ? Math.round(z * 1000) : 0; }
-    raw = { mm, DW, DH, INV: I, PRJ: d.PRJ, NDI: d.NDI, ND, flip, R0, jx: d.jx, jy: d.jy, X: Array.from(X) }; }
+    raw = { tCap: d.tCap, mm, DW, DH, INV: I, PRJ: d.PRJ, NDI: d.NDI, ND, flip, R0, jx: d.jx, jy: d.jy, X: Array.from(X) }; }
   if (!F && d.tsdf && d.PRJ) {
     const t0 = performance.now(), now = t0;
     tsdfBlocks = tsdfIntegrate({ X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
@@ -1199,7 +1199,7 @@ function integWorker() {
     if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
     if (d.corr) { setD(new M4().fromArray(d.corr).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
     if (d.track) { depth.track = d.track; depth.trackOK = (depth.trackOK || 0) * .9 + (d.track.ok ? .1 : 0); }
-    if (d.raw && scanning && !replayMode) { if (!currentId) currentId = 'scan-' + Date.now(); DB.putDepth(Object.assign(d.raw, { scan: currentId, k: currentId + '/d' + Date.now(), t: Date.now() })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
+    if (d.raw && scanning && !replayMode) { if (!currentId) currentId = 'scan-' + Date.now(); DB.putDepth(Object.assign(d.raw, { scan: currentId, k: currentId + '/d' + d.raw.tCap, t: d.raw.tCap })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
     if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
     exposureMatch(d);
     if (d.moving) { lagTest(d); if (!depth.lagOK || (d.lagUsed || 0) !== (depth.lag || 0)) return;   // a moving frame is fused only once the lag is known
@@ -1217,7 +1217,7 @@ function postIntegration(M) {                                       // hand a de
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
   if (M.cam && (M.cam.bmp || M.cam.data)) { cam = { bmp: M.cam.bmp || null, data: M.cam.bmp ? null : M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; if (!M.cam.bmp) { colorCam.data = null; colorCam.t = 0; } }   // hand the frame over; grab a fresh one next time
-  const msg = { DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
+  const msg = { tCap: Date.now(), DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [hd.x, hd.y, hd.z], hands: M.hands.map(h => { const v = h.clone().applyMatrix4(Dm); return [v.x, v.y, v.z]; }), cam, vinv: Array.from(vinvD.elements), t: M.tNow, icp: icpOn, saveRaw,
     fine: !!M.fine, VSF, roi: M.roi || null, zone: M.zone || null,
@@ -1361,7 +1361,7 @@ function mergeRecord(rec, T) {
   if (rec.tsdf && !viewer.on) integWorker().postMessage({ tsdfLoad: rec.tsdf, T: Array.from(T.elements) });
   flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); integWorker().postMessage({ knownFine: Float64Array.from(fmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
   toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
-  if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(parts => { if (replayMode && parts.length) { showMesh(parts, Tm); toast('Surfaces ready'); } }).catch(e => toast('Surface build failed: ' + e.message)); }
+  if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(async parts => { if (!replayMode || !parts.length) return; if (rec.tex) await showTexMesh(rec.tex, Tm, parts.filter(p => p.fine)); else showMesh(parts, Tm); toast(rec.tex ? 'Photo surfaces ready' : 'Surfaces ready'); }).catch(e => toast('Surface build failed: ' + e.message)); }
 }
 
 /* ================= exporting files: .json (everything) and .ply (points, opens in Blender / MeshLab / CloudCompare) ================= */
@@ -1456,7 +1456,7 @@ async function refineScan(rec) {
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.refineMsg) st.textContent = 'Refining: ' + e.data.refineMsg + '…'; if (e.data.refined) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'refine failed'));
     st.textContent = 'Refining ' + fr.length + ' frames…'; w.postMessage({ refine: 1, frames: fr, tsdf: rec.tsdf || null }); }).catch(e => { st.textContent = 'Refine failed: ' + e.message; return null; });
   w.terminate(); if (!res) return;
-  rec.tsdf = res.t; delete rec.meshCache; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, at: Date.now() };
+  rec.tsdf = res.t; delete rec.meshCache; delete rec.tex; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, at: Date.now() };
   /* photos: move each one by the correction of the depth frame taken closest to it */
   const kfs = await DB.frames(rec.id).catch(() => []); let moved = 0;
   for (const k of kfs) { let best = -1, bd = 2500; fr.forEach((f, i) => { const dt = Math.abs(f.t - k.t); if (dt < bd) { bd = dt; best = i; } });
@@ -1467,11 +1467,12 @@ async function refineScan(rec) {
 async function exportGLB(rec) {
   $('st').textContent = rec.meshCache ? 'Packing the mesh…' : 'Building the 3D mesh… (up to a minute for a whole house)'; await new Promise(r => setTimeout(r, 30));
   let parts; try { parts = await recMesh(rec); } catch (e) { $('st').textContent = 'Meshing failed: ' + e.message; return; }
+  if (rec.tex) return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts.filter(p => p.fine), _texMesh: rec.tex }));
   if (!parts.length) { $('st').textContent = 'This scan has no surface normals (made with an older version): exporting points'; return exportGLBraw(rec); }
   $('st').textContent = 'Mesh: ' + parts.reduce((a, m) => a + m.I.length / 3, 0).toLocaleString() + ' triangles';
   return exportGLBraw(Object.assign({}, rec, { points: new Float32Array(0), colors: null, _meshes: parts }));
 }
-function exportGLBraw(rec) {
+async function exportGLBraw(rec) {
   const chunks = [], views = [], accs = [], meshesG = [], nodes = []; let off = 0;
   const add = (arr, target) => { const b = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength); chunks.push(b); const pad = (4 - b.byteLength % 4) % 4; if (pad) chunks.push(new Uint8Array(pad)); views.push({ buffer: 0, byteOffset: off, byteLength: b.byteLength, ...(target ? { target } : {}) }); off += b.byteLength + pad; return views.length - 1; };
   const acc = (arr, type, ct, count, norm, mm) => { accs.push({ bufferView: add(arr, ct === 5125 ? 34963 : 34962), componentType: ct, count, type, ...(norm ? { normalized: true } : {}), ...(mm || {}) }); return accs.length - 1; };
@@ -1481,11 +1482,18 @@ function exportGLBraw(rec) {
     C[k * 4] = hc ? rec.colors[k * 4] : 160 + 40 * h; C[k * 4 + 1] = hc ? rec.colors[k * 4 + 1] : 130 + 85 * h; C[k * 4 + 2] = hc ? rec.colors[k * 4 + 2] : 100 + 130 * h; C[k * 4 + 3] = 255; }
   if (n) { meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5121, n, true) } }] }); nodes.push({ name: 'scan points', mesh: meshesG.length - 1 }); }
   const extra = {};
+  if (rec._texMesh) {                                                 // photo-textured surface (JPEG atlas)
+    const T = rec._texMesh, jpg = new Uint8Array(await T.img.arrayBuffer()), iv = add(jpg);
+    Object.assign(extra, { images: [{ bufferView: iv, mimeType: 'image/jpeg' }], samplers: [{ magFilter: 9729, minFilter: 9729, wrapS: 33071, wrapT: 33071 }], textures: [{ source: 0, sampler: 0 }],
+      materials: [{ name: 'photo surfaces', pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 1 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }, { name: 'scan', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: 1 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }], extensionsUsed: ['KHR_materials_unlit'] });
+    meshesG.push({ name: 'photo surfaces', primitives: [{ mode: 4, material: 0, attributes: { POSITION: acc(T.P, 'VEC3', 5126, T.P.length / 3, false, bounds(T.P)), NORMAL: acc(T.N, 'VEC3', 5126, T.N.length / 3), TEXCOORD_0: acc(T.U, 'VEC2', 5126, T.U.length / 2) }, indices: acc(T.I, 'SCALAR', 5125, T.I.length) }] });
+    nodes.push({ name: 'photo surfaces', mesh: meshesG.length - 1 });
+  }
   if (rec._meshes) {                                                  // continuous surface, vertex-coloured from the camera (unlit: colours already hold the room's light)
-    Object.assign(extra, { materials: [{ name: 'scan', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: 1 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }], extensionsUsed: ['KHR_materials_unlit'] });
+    const matIx = rec._texMesh ? 1 : 0; if (!rec._texMesh) Object.assign(extra, { materials: [{ name: 'scan', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: 1 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }], extensionsUsed: ['KHR_materials_unlit'] });
     rec._meshes.forEach((m, i) => { if (!m.I.length) return; const vc = m.P.length / 3, CL = new Float32Array(vc * 3); for (let k = 0; k < vc * 3; k++) { const c = Math.min(1, Math.max(0, m.C[k])); CL[k] = c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }   // glTF vertex colours are linear
       const name = m.fine ? 'detail surfaces (5 mm)' : 'scan surfaces (2 cm)';
-      meshesG.push({ name, primitives: [{ mode: 4, material: 0, attributes: { POSITION: acc(m.P, 'VEC3', 5126, vc, false, bounds(m.P)), NORMAL: acc(m.N, 'VEC3', 5126, vc), COLOR_0: acc(CL, 'VEC3', 5126, vc) }, indices: acc(m.I, 'SCALAR', 5125, m.I.length) }] });
+      meshesG.push({ name, primitives: [{ mode: 4, material: matIx, attributes: { POSITION: acc(m.P, 'VEC3', 5126, vc, false, bounds(m.P)), NORMAL: acc(m.N, 'VEC3', 5126, vc), COLOR_0: acc(CL, 'VEC3', 5126, vc) }, indices: acc(m.I, 'SCALAR', 5125, m.I.length) }] });
       nodes.push({ name, mesh: meshesG.length - 1 }); });
   }
   if (rec._tiles) {                                                   // textured surface mesh (unlit: the photos already carry the room's lighting)
@@ -1598,10 +1606,11 @@ function showMesh(parts, T) {
     const o = new THREE.Mesh(g, meshMat); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; meshG.add(o); }
   applySurf();
 }
-function meshClear() { for (const o of meshG.children) o.geometry.dispose(); meshG.clear(); }
+function meshClear() { for (const o of meshG.children) { o.geometry.dispose(); if (o.userData.tex) { o.material.map.dispose(); o.material.dispose(); } } meshG.clear(); }
 function applySurf() {                                          // saved surface mesh, else the live mesh (in mesh mode), else the point map
   const m = surfOn && meshG.children.length > 0, live = !m && showMode === 3 && liveM.size > 0;
   meshG.visible = m && reality !== 2; meshMat.opacity = reality === 1 ? .55 : 1; meshMat.depthWrite = reality !== 1;
+  for (const o of meshG.children) if (o.userData.tex) { o.material.opacity = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
   tsdfG.visible = live && reality !== 2;
   cloud.visible = !m && !live && showMode !== 2 && reality !== 2; fcloud.visible = !(m && meshG.children.length > 1) && showMode !== 2 && reality !== 2;
   const vb = document.getElementById('vSurf'); if (vb) vb.textContent = m ? 'Show points' : 'Show surface';
@@ -1615,6 +1624,96 @@ function gatherForMesh(fine, zones) {                              // confirmed 
   idx.forEach((i, k) => { P.set(Pp.subarray(i * 3, i * 3 + 3), k * 3); const l = Math.hypot(Nm[i * 3], Nm[i * 3 + 1], Nm[i * 3 + 2]); Nn[k * 3] = Nm[i * 3] / l; Nn[k * 3 + 1] = Nm[i * 3 + 1] / l; Nn[k * 3 + 2] = Nm[i * 3 + 2] / l;
     if (Cw[i] > .01) C.set(Cl.subarray(i * 3, i * 3 + 3), k * 3); else { const h = Math.max(0, Math.min(1, (Pp[i * 3 + 1] - fy) / 2.7)); C[k * 3] = (160 + 40 * h) / 255; C[k * 3 + 1] = (130 + 85 * h) / 255; C[k * 3 + 2] = (100 + 130 * h) / 255; } });
   return [P, Nn, C];
+}
+
+/* ================= photo texture: project the saved photos onto the surface mesh, best view per patch ================= */
+const BAKE_SRC = `
+const inv4r = X => { const R = [X[0], X[4], X[8], 0, X[1], X[5], X[9], 0, X[2], X[6], X[10], 0, 0, 0, 0, 1]; R[12] = -(R[0] * X[12] + R[4] * X[13] + R[8] * X[14]); R[13] = -(R[1] * X[12] + R[5] * X[13] + R[9] * X[14]); R[14] = -(R[2] * X[12] + R[6] * X[13] + R[10] * X[14]); return R; };
+onmessage = async e => {
+  const { m, photos, depths, A, Ts } = e.data, P = m.P, NV = m.N, CV = m.C, I = m.I, Q = I.length / 6, cs = Ts + 2, per = Math.floor(A / cs), say = t => postMessage({ msg: t });
+  if (Q > per * per) { postMessage({ error: 'mesh too large for one texture (' + Q + ' patches)' }); return; }
+  /* quads: corners in cycle order U1, Sa, U2, Sb (the two triangles share the diagonal Sa-Sb) */
+  const QV = new Int32Array(Q * 4), QC = new Float32Array(Q * 3), QN = new Float32Array(Q * 3), QK = new Float32Array(Q * 3);
+  for (let q = 0; q < Q; q++) {
+    const t1 = [I[q * 6], I[q * 6 + 1], I[q * 6 + 2]], t2 = [I[q * 6 + 3], I[q * 6 + 4], I[q * 6 + 5]], sh = t1.filter(v => t2.includes(v)), u1 = t1.find(v => !t2.includes(v)), u2 = t2.find(v => !t1.includes(v));
+    QV.set([u1, sh[0], u2, sh[1]], q * 4);
+    for (let a = 0; a < 3; a++) { let c = 0, n = 0, k = 0; for (const v of [u1, sh[0], u2, sh[1]]) { c += P[v * 3 + a]; n += NV[v * 3 + a]; k += CV[v * 3 + a]; } QC[q * 3 + a] = c / 4; QN[q * 3 + a] = n / 4; QK[q * 3 + a] = k / 4; }
+  }
+  /* atlas starts with the fused colours, so patches no photo saw still look right */
+  const img = new Uint8ClampedArray(A * A * 4), best = new Float32Array(Q);
+  const texel = (q, cb) => { const ox = (q % per) * cs, oy = Math.floor(q / per) * cs, v = QV.subarray(q * 4, q * 4 + 4);
+    for (let gy = 0; gy < cs; gy++) for (let gx = 0; gx < cs; gx++) { const s = Math.min(1, Math.max(0, (gx - .5) / Ts)), t = Math.min(1, Math.max(0, (gy - .5) / Ts)), w0 = (1 - s) * (1 - t), w1 = s * (1 - t), w2 = s * t, w3 = (1 - s) * t;
+      cb(((oy + gy) * A + ox + gx) * 4, w0, w1, w2, w3, v); } };
+  for (let q = 0; q < Q; q++) texel(q, (o, w0, w1, w2, w3, v) => { for (let a = 0; a < 3; a++) img[o + a] = 255 * (w0 * CV[v[0] * 3 + a] + w1 * CV[v[1] * 3 + a] + w2 * CV[v[2] * 3 + a] + w3 * CV[v[3] * 3 + a]); img[o + 3] = 255; });
+  /* regions for quick culling */
+  const reg = new Map(); for (let q = 0; q < Q; q++) { const k = Math.floor(QC[q * 3] / .64) + ',' + Math.floor(QC[q * 3 + 1] / .64) + ',' + Math.floor(QC[q * 3 + 2] / .64); let g = reg.get(k); if (!g) reg.set(k, g = []); g.push(q); }
+  const regs = [...reg.values()].map(g => { let x = 0, y = 0, z = 0; for (const q of g) { x += QC[q * 3]; y += QC[q * 3 + 1]; z += QC[q * 3 + 2]; } return { g, c: [x / g.length, y / g.length, z / g.length] }; });
+  const maxSharp = Math.max(1e-6, ...photos.map(p => p.sharp || 0));
+  let used = 0;
+  for (let pi = 0; pi < photos.length; pi++) {
+    const ph = photos[pi]; if (pi % 5 === 0) say('photo ' + (pi + 1) + ' / ' + photos.length);
+    let dep = null, dbest = 700; for (const d of depths) { const dt = Math.abs(d.t - ph.t); if (dt < dbest) { dbest = dt; dep = d; } }
+    if (!dep) continue;                                              // no depth frame near this photo: can't check what's hidden, skip it
+    let bmp; try { bmp = await createImageBitmap(ph.blob); } catch (err) { continue; }
+    const W = Math.min(960, bmp.width), H = Math.round(W * bmp.height / bmp.width), oc = new OffscreenCanvas(W, H), cx2 = oc.getContext('2d'); cx2.drawImage(bmp, 0, 0, W, H); bmp.close();
+    const px = cx2.getImageData(0, 0, W, H).data, V = inv4r(ph.m), f = 1 / Math.tan(ph.hfov / 2), asp = W / H, pcx = ph.cx || 0, pcy = ph.cy || 0, ox = ph.m[12], oy = ph.m[13], oz = ph.m[14];
+    const DV = inv4r(dep.X), DP = dep.PRJ, DN = dep.NDI, DR0 = dep.R0;
+    const proj = (x, y, z, out) => { const ex = V[0] * x + V[4] * y + V[8] * z + V[12], ey = V[1] * x + V[5] * y + V[9] * z + V[13], ez = V[2] * x + V[6] * y + V[10] * z + V[14]; if (ez > -.15) return false;
+      out[0] = .5 + pcx + .5 * f * ex / -ez; out[1] = .5 - .5 * f * asp * ey / -ez + pcy; out[2] = -ez; return out[0] > .01 && out[0] < .99 && out[1] > .01 && out[1] < .99; };
+    const hidden = (x, y, z) => {                                    // the depth frame taken with this photo saw something nearer: occluded
+      const ax = x - dep.X[12], ay = y - dep.X[13], az = z - dep.X[14], cx = dep.X[0] * ax + dep.X[1] * ay + dep.X[2] * az, cy = dep.X[4] * ax + dep.X[5] * ay + dep.X[6] * az, cz = dep.X[8] * ax + dep.X[9] * ay + dep.X[10] * az, zv = -cz;
+      if (zv < .15) return true; const qw = DP[3] * cx + DP[7] * cy + DP[11] * cz + DP[15]; let vu = (DP[0] * cx + DP[4] * cy + DP[8] * cz + DP[12]) / qw * .5 + .5, vv = (DP[1] * cx + DP[5] * cy + DP[9] * cz + DP[13]) / qw * .5 + .5;
+      if (dep.flip) vv = 1 - vv; let u = vu, w = vv; if (DN) { u = DN[0] * vu + DN[4] * vv + DN[12]; w = DN[1] * vu + DN[5] * vv + DN[13]; }
+      const xi = Math.round(((u - DR0[0]) / DR0[2] - dep.jx) * dep.DW - .5), yi = Math.round(((w - DR0[1]) / DR0[3] - dep.jy) * dep.DH - .5); if (xi < 0 || yi < 0 || xi >= dep.DW || yi >= dep.DH) return true;
+      const zm = dep.mm[yi * dep.DW + xi] / 1000; return !(zm > .2) || zv > zm + .05; };
+    const sample = (u, v, out) => { const fx = u * W - .5, fy = v * H - .5, x0 = Math.max(0, Math.floor(fx)), y0 = Math.max(0, Math.floor(fy)), x1 = Math.min(W - 1, x0 + 1), y1 = Math.min(H - 1, y0 + 1), ax = fx - x0, ay = fy - y0;
+      for (let a = 0; a < 3; a++) out[a] = (px[(y0 * W + x0) * 4 + a] * (1 - ax) + px[(y0 * W + x1) * 4 + a] * ax) * (1 - ay) + (px[(y1 * W + x0) * 4 + a] * (1 - ax) + px[(y1 * W + x1) * 4 + a] * ax) * ay; return out; };
+    const o3 = [0, 0, 0], c3 = [0, 0, 0], cand = [], ratios = [];
+    for (const R of regs) { const dx = R.c[0] - ox, dy = R.c[1] - oy, dz = R.c[2] - oz; if (dx * dx + dy * dy + dz * dz > 20) continue;
+      for (const q of R.g) {
+        const x = QC[q * 3], y = QC[q * 3 + 1], z = QC[q * 3 + 2], vx = ox - x, vy = oy - y, vz = oz - z, dist = Math.hypot(vx, vy, vz), nl = Math.hypot(QN[q * 3], QN[q * 3 + 1], QN[q * 3 + 2]) || 1;
+        const cosA = (QN[q * 3] * vx + QN[q * 3 + 1] * vy + QN[q * 3 + 2] * vz) / (nl * dist); if (cosA < .3 || dist > 4) continue;
+        if (!proj(x, y, z, o3)) continue; const uu = o3[0] * 2 - 1, vv = o3[1] * 2 - 1;
+        const score = cosA / Math.max(.4, dist) * Math.sqrt((ph.sharp || maxSharp) / maxSharp) * (1 - .45 * Math.min(1, (uu * uu + vv * vv) * .5));
+        if (score <= best[q]) continue;
+        let inside = true; for (let k = 0; k < 4 && inside; k++) { const v = QV[q * 4 + k]; inside = proj(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], c3); } if (!inside || hidden(x, y, z)) continue;
+        cand.push(q, score); if (ratios.length < 400 && q % 3 === 0) { sample(o3[0], o3[1], c3); const lp = .3 * c3[0] + .59 * c3[1] + .11 * c3[2], lv = 255 * (.3 * QK[q * 3] + .59 * QK[q * 3 + 1] + .11 * QK[q * 3 + 2]); if (lp > 12 && lp < 243 && lv > 8) ratios.push(lv / lp); }
+      } }
+    if (!cand.length) continue;
+    ratios.sort((a, b) => a - b); const gain = ratios.length > 20 ? Math.max(.6, Math.min(1.6, ratios[ratios.length >> 1])) : 1;   // match this photo's exposure to the fused colours
+    for (let i = 0; i < cand.length; i += 2) { const q = cand[i]; best[q] = cand[i + 1];
+      texel(q, (o, w0, w1, w2, w3, v) => { const x = w0 * P[v[0] * 3] + w1 * P[v[1] * 3] + w2 * P[v[2] * 3] + w3 * P[v[3] * 3], y = w0 * P[v[0] * 3 + 1] + w1 * P[v[1] * 3 + 1] + w2 * P[v[2] * 3 + 1] + w3 * P[v[3] * 3 + 1], z = w0 * P[v[0] * 3 + 2] + w1 * P[v[1] * 3 + 2] + w2 * P[v[2] * 3 + 2] + w3 * P[v[3] * 3 + 2];
+        if (!proj(x, y, z, o3)) return; sample(o3[0], o3[1], c3); img[o] = c3[0] * gain; img[o + 1] = c3[1] * gain; img[o + 2] = c3[2] * gain; }); }
+    used++;
+  }
+  say('packing'); let painted = 0; for (let q = 0; q < Q; q++) if (best[q] > 0) painted++;
+  /* the textured mesh: 4 vertices per patch so every patch owns its square of the atlas */
+  const OP = new Float32Array(Q * 12), ON = new Float32Array(Q * 12), OU = new Float32Array(Q * 8), OI = new Uint32Array(Q * 6), ST = [[0, 0], [1, 0], [1, 1], [0, 1]];
+  for (let q = 0; q < Q; q++) { const ox = (q % per) * cs, oy = Math.floor(q / per) * cs;
+    for (let k = 0; k < 4; k++) { const v = QV[q * 4 + k]; OP.set(P.subarray(v * 3, v * 3 + 3), (q * 4 + k) * 3); ON.set(NV.subarray(v * 3, v * 3 + 3), (q * 4 + k) * 3); OU[(q * 4 + k) * 2] = (ox + 1 + ST[k][0] * Ts) / A; OU[(q * 4 + k) * 2 + 1] = (oy + 1 + ST[k][1] * Ts) / A; }
+    for (let j = 0; j < 6; j++) OI[q * 6 + j] = q * 4 + QV.subarray(q * 4, q * 4 + 4).indexOf(I[q * 6 + j]); }
+  const oc = new OffscreenCanvas(A, A); oc.getContext('2d').putImageData(new ImageData(img, A, A), 0, 0);
+  const blob = await oc.convertToBlob({ type: 'image/jpeg', quality: .9 });
+  postMessage({ done: true, tex: { v: 1, P: OP, N: ON, U: OU, I: OI, img: blob, A, painted, patches: Q, photosUsed: used } }, [OP.buffer, ON.buffer, OU.buffer, OI.buffer]);
+};`;
+async function recTexture(rec, say = () => {}) {
+  if (rec.tex && rec.tex.v === 1) return rec.tex;
+  const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface to texture');
+  const photos = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob), depths = await DB.depthFrames(rec.id).catch(() => []);
+  if (!photos.length) throw new Error('no photos saved with this scan (turn on Real colours while scanning)');
+  if (!depths.length) throw new Error('no depth frames saved with this scan (scans from this version on have them)');
+  const Q = m.I.length / 6, A = Q < 110000 ? 2048 : Q < 450000 ? 4096 : 8192, Ts = Q < 110000 ? 4 : 4;
+  const w = new Worker(URL.createObjectURL(new Blob([BAKE_SRC], { type: 'text/javascript' })));
+  const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onerror = e => no(new Error(e.message || 'texture bake failed'));
+    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map(f => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, sharp: f.sharp, t: f.t })), depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }); });
+  w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await DB.put(rec).catch(() => {});
+  return tex;
+}
+async function showTexMesh(tex, T, extraParts) {
+  const bmp = await createImageBitmap(tex.img), t = new THREE.Texture(bmp); t.flipY = false; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; t.needsUpdate = true;
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(tex.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(tex.N, 3)); g.setAttribute('uv', new THREE.BufferAttribute(tex.U, 2)); g.setIndex(new THREE.BufferAttribute(tex.I, 1));
+  showMesh(extraParts || [], T);                                    // detail zones keep their own coloured mesh
+  const o = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: t, side: THREE.DoubleSide, transparent: true })); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; o.userData.tex = true; meshG.add(o); applySurf();
 }
 
 /* ================= understanding the house: floors, ceilings, walls, stairs, objects =================
@@ -2083,6 +2182,9 @@ async function listScans() {
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Refine', () => refineScan(r));
+    mk('Photo texture', async () => { const st = $('st'), t0 = performance.now(); st.textContent = 'Texturing…';
+      try { delete r.tex; const t = await recTexture(r, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
+      catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
     mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
     el.appendChild(row);
@@ -2101,7 +2203,7 @@ function openViewer(rec) {
   cloud.visible = true; layout.visible = false; applySurf();
   $('ui').classList.add('hide'); $('vbar').classList.add('on'); const info = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
   $('vInfo').textContent = info + ' · building surface…';
-  recMesh(rec).then(parts => { if (!viewer.on || viewer.id !== rec.id) return; showMesh(parts, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
+  recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
 function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 3; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
