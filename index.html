@@ -166,10 +166,18 @@ function planeLine(e) {
 function meshWire(e) {
   if (e.obj) { layout.remove(e.obj); e.obj.geometry.dispose(); }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(e.v, 3)); g.setIndex(new THREE.BufferAttribute(e.i, 1));
-  e.obj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: LABEL_COL[e.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .28, depthWrite: false }));
+  e.obj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: LABEL_COL[e.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .12, depthWrite: false }));
   e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
 }
-function clearMeta() { for (const e of planes.values()) layout.remove(e.obj); for (const e of meshes.values()) layout.remove(e.obj); planes.clear(); meshes.clear(); }
+function clearMeta() { metaSurf.set = new Set(); metaSurf.n = 0; for (const e of planes.values()) layout.remove(e.obj); for (const e of meshes.values()) layout.remove(e.obj); planes.clear(); meshes.clear(); }
+const metaSurf = { set: new Set(), dirty: false, t: 0, n: 0 }, MG = .06, mkey = (x, y, z) => Math.floor(x / MG) + ',' + Math.floor(y / MG) + ',' + Math.floor(z / MG);
+function buildMetaSurf() {                                       // sample every Meta triangle and plane every ~4 cm into a voxel set
+  const S = new Set(), a = new V3(), b = new V3(), c = new V3(), p = new V3(), mm = new M4();
+  const tri = () => { const l = Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a)), n = Math.min(60, Math.ceil(l / .04)); for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) { const u = i / n, v = j / n; p.set(0, 0, 0).addScaledVector(a, 1 - u - v).addScaledVector(b, u).addScaledVector(c, v); S.add(mkey(p.x, p.y, p.z)); } };
+  for (const e of meshes.values()) { if (!e.v) continue; mm.copy(e.m); for (let t = 0; t < e.i.length; t += 3) { a.fromArray(e.v, e.i[t] * 3).applyMatrix4(mm); b.fromArray(e.v, e.i[t + 1] * 3).applyMatrix4(mm); c.fromArray(e.v, e.i[t + 2] * 3).applyMatrix4(mm); tri(); } }
+  for (const e of planes.values()) { const P = e.poly; if (!P || P.length < 3) continue; for (let t = 1; t < P.length - 1; t++) { a.set(P[0].x, 0, P[0].z).applyMatrix4(e.m); b.set(P[t].x, 0, P[t].z).applyMatrix4(e.m); c.set(P[t + 1].x, 0, P[t + 1].z).applyMatrix4(e.m); tri(); } }
+  metaSurf.set = S; metaSurf.n = S.size; metaSurf.dirty = false;
+}
 function syncLayout(frame, ref) {
   const dp = frame.detectedPlanes;
   if (dp) {
@@ -177,7 +185,7 @@ function syncLayout(frame, ref) {
       const pose = frame.getPose(p.planeSpace, ref); if (!pose) continue;
       let e = planes.get(p); if (!e) { e = { label: p.semanticLabel || 'other', m: new M4(), t: -1, poly: [], obj: null }; planes.set(p, e); }
       e.m.fromArray(pose.transform.matrix);
-      if (e.t !== p.lastChangedTime) { e.t = p.lastChangedTime; e.poly = p.polygon.map(q => ({ x: q.x, z: q.z })); planeLine(e); } else e.obj.matrix.copy(e.m);
+      if (e.t !== p.lastChangedTime) { e.t = p.lastChangedTime; e.poly = p.polygon.map(q => ({ x: q.x, z: q.z })); planeLine(e); metaSurf.dirty = true; } else e.obj.matrix.copy(e.m);
     }
     for (const [p, e] of planes) if (!dp.has(p)) { layout.remove(e.obj); planes.delete(p); }
   }
@@ -187,7 +195,7 @@ function syncLayout(frame, ref) {
       const pose = frame.getPose(m.meshSpace, ref); if (!pose) continue;
       let e = meshes.get(m); if (!e) { e = { label: m.semanticLabel || 'mesh', m: new M4(), t: -1, obj: null }; meshes.set(m, e); }
       e.m.fromArray(pose.transform.matrix);
-      if (e.t !== m.lastChangedTime) { e.t = m.lastChangedTime; e.v = new Float32Array(m.vertices); e.i = new Uint32Array(m.indices); meshWire(e); } else e.obj.matrix.copy(e.m);
+      if (e.t !== m.lastChangedTime) { e.t = m.lastChangedTime; e.v = new Float32Array(m.vertices); e.i = new Uint32Array(m.indices); meshWire(e); metaSurf.dirty = true; } else e.obj.matrix.copy(e.m);
     }
     for (const [m, e] of meshes) if (!dm.has(m)) { layout.remove(e.obj); meshes.delete(m); }
   }
@@ -316,6 +324,10 @@ function camFrame(vp) {
 function sampleDepth(frame, ref, session, tNow) {
   if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
+  /* the depth image trails the head slightly: integrating while you turn smears surfaces into streaks, so only take it when you're steady */
+  { const m = vp.transform.matrix, q = new THREE.Quaternion().setFromRotationMatrix(new M4().fromArray(m)), pos = new V3(m[12], m[13], m[14]), mo = depth.motion || (depth.motion = { q: q.clone(), p: pos.clone(), t: tNow, spin: 0, lin: 0 });
+    const dt = Math.max(1e-3, tNow - mo.t); mo.spin = mo.spin * .6 + (mo.q.angleTo(q) / dt) * .4; mo.lin = mo.lin * .6 + (mo.p.distanceTo(pos) / dt) * .4; mo.q.copy(q); mo.p.copy(pos); mo.t = tNow;
+    if (mo.spin > .45 || mo.lin > .6) { depth.steady = false; return; } depth.steady = true; }
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   const freeze = (extra) => Object.assign({
     tNow, xf: new M4().fromArray(((info && info.transform) || view.transform).matrix), inv: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).invert(),
@@ -333,11 +345,13 @@ function sampleDepth(frame, ref, session, tNow) {
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
-  try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy, session.depthDataFormat); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
+  const calib = depth.cal && !depth.cal.locked, swap = calib ? ((depth.calFrame = (depth.calFrame || 0) + 1) % 2 === 1) : !!(depth.cfg && depth.cfg.swap);
+  let layer = info.imageIndex ?? depth.vi; if (swap && isArr) layer = 1 - layer;
+  try { readDepth(info, isArr, layer, lumA, jx, jy, session.depthDataFormat); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
   depth.sensor = (isArr ? 'array' : '2d') + ' ' + (info.width || '?') + '×' + (info.height || '?') + ' near ' + (+(info.depthNear ?? session.renderState.depthNear)).toFixed(2) + ' far ' + (+(info.depthFar ?? session.renderState.depthFar)).toFixed(1);
   depth.meta = {
-    fwdY: -vp.transform.matrix[9],
+    fwdY: -vp.transform.matrix[9], swap: swap && isArr,
     isArr, lumA, jx, jy, tNow, fmt: session.depthDataFormat,
     inv: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).invert(), PE: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements,
     xf: new M4().fromArray((info.transform || view.transform).matrix),
@@ -363,7 +377,7 @@ const CAL_PAIRS = 16, DEF_CFG = { nd: 0, flip: false, src: 'info' }, CPU_CFG = {
 function calCandidates(M, modes) {
   const out = [], isId = m => !m || m.elements.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-4);
   const nds = isId(M.ndRaw) ? [0] : [0, 1, 2], srcs = M.projI ? ['info', 'view'] : ['view'];
-  for (const mode of modes) for (const nd of nds) for (const flip of [false, true]) for (const src of srcs) out.push({ mode, nd, flip, src });
+  for (const mode of modes) for (const nd of nds) for (const flip of [false, true]) for (const src of srcs) out.push({ mode, nd, flip, src, swap: !!M.swap });
   return out;
 }
 const _ndI = new M4();
@@ -375,26 +389,48 @@ function backproject(M, cfg, x, y, z, out) {                         // depth pi
   _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(inv); out.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w).multiplyScalar(z / -(_q.z / _q.w));
   return out.applyMatrix4(xf);
 }
+/* score one geometry guess by how many depth points land on Meta's scanned surfaces */
+function metaAgreement(M, raws, cfg, f, step) {
+  const p = new V3(); let hit = 0, tot = 0;
+  for (let y = 2; y < DH - 2; y += step) for (let x = 2; x < DW - 2; x += step) {
+    const z = f(raws[y * DW + x]); if (!(z > .3 && z < 4)) continue; tot++;
+    backproject(M, cfg, x, y, z, p);
+    const ix = Math.floor(p.x / MG), iy = Math.floor(p.y / MG), iz = Math.floor(p.z / MG);
+    if (metaSurf.set.has(ix + ',' + iy + ',' + iz) || metaSurf.set.has(ix + ',' + (iy + 1) + ',' + iz) || metaSurf.set.has(ix + ',' + (iy - 1) + ',' + iz) || metaSurf.set.has((ix + 1) + ',' + iy + ',' + iz) || metaSurf.set.has((ix - 1) + ',' + iy + ',' + iz) || metaSurf.set.has(ix + ',' + iy + ',' + (iz + 1)) || metaSurf.set.has(ix + ',' + iy + ',' + (iz - 1))) hit++;
+  }
+  return tot > 40 ? hit / tot : -1;
+}
 function calibrateStep(M, raws, modes) {
+  if (metaSurf.n > 3000) {                                         // the reliable way: Meta's room scan is the ground truth
+    const cal = depth.cal, MODES = depthModes(M);
+    for (const c of calCandidates(M, modes)) { const sc = metaAgreement(M, raws, c, MODES[c.mode], 4); if (sc < 0) continue; const k = JSON.stringify(c), o = cal.score.get(k) || { s: 0, n: 0 }; o.s += sc; o.n++; cal.score.set(k, o); }
+    cal.pairs++; cal.method = 'Meta scan';
+    if (cal.pairs >= 24) {
+      let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (o.n >= 4 && m > bs) { bs = m; best = k; } }
+      if (best) { depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.locked = true; depth.agree = bs; try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {} clearMap();
+        toast(bs > .45 ? 'Depth matched to the Meta scan (' + Math.round(bs * 100) + '%): scanning' : 'Depth only ' + Math.round(bs * 100) + '% matches the Meta scan. Redo the Meta room scan?'); }
+    }
+    return;
+  }
   const cal = depth.cal, MODES = depthModes(M), cur = { M, raws: raws.slice() };
   if (cal.prev) {
     const A = cal.prev, qa = new THREE.Quaternion().setFromRotationMatrix(A.M.xfV), qb = new THREE.Quaternion().setFromRotationMatrix(M.xfV);
     const rot = qa.angleTo(qb), mv = new V3().setFromMatrixPosition(A.M.xfV).distanceTo(new V3().setFromMatrixPosition(M.xfV));
-    if ((rot > .03 || mv > .02) && rot < .45 && mv < .4) {
+    if ((rot > .03 || mv > .02) && rot < .45 && mv < .4 && !!A.M.swap === !!M.swap) {
       const cands = calCandidates(M, modes), p = new V3(), G = .05, key = v => Math.floor(v.x / G) + ',' + Math.floor(v.y / G) + ',' + Math.floor(v.z / G);
       for (const c of cands) {
         const f = MODES[c.mode], set = new Set(); let hit = 0, tot = 0;
         for (let y = 2; y < DH - 2; y += 2) for (let x = 2; x < DW - 2; x += 2) { const z = f(A.raws[y * DW + x]); if (z > .3 && z < 4) set.add(key(backproject(A.M, c, x, y, z, p))); }
         for (let y = 2; y < DH - 2; y += 4) for (let x = 2; x < DW - 2; x += 4) { const z = f(raws[y * DW + x]); if (z > .3 && z < 4) { tot++; if (set.has(key(backproject(M, c, x, y, z, p)))) hit++; } }
-        const k = JSON.stringify(c); cal.score.set(k, (cal.score.get(k) || 0) + (tot > 50 ? hit / tot : 0));
+        const k = JSON.stringify(c), o = cal.score.get(k) || { s: 0, n: 0 }; o.s += tot > 50 ? hit / tot : 0; o.n++; cal.score.set(k, o);
       }
       cal.pairs++;
     }
   }
   cal.prev = cur;
   if (cal.pairs >= CAL_PAIRS) {
-    let best = null, bs = -1, second = -1; for (const [k, v] of cal.score) { if (v > bs) { second = bs; bs = v; best = k; } else if (v > second) second = v; }
-    depth.cfg = JSON.parse(best); depth.cfgScore = bs / cal.pairs; cal.locked = true; cal.prev = null;
+    let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (m > bs) { bs = m; best = k; } }
+    depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.method = 'two views'; cal.locked = true; cal.prev = null;
     try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {}
     clearMap(); toast('Depth calibrated (' + Math.round(depth.cfgScore * 100) + '% agreement): scanning');
   }
@@ -422,11 +458,16 @@ function integrateDepth() {
       const plaus = cands.map(m => { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } return [m, sc]; }).sort((a, b) => b[1] - a[1]);
       const modes = plaus.filter(p => p[1] >= plaus[0][1] * .6).slice(0, 2).map(p => p[0]);
       calibrateStep(M, raws, modes); depth.frames++;
-      depth.status = depth.cal.locked ? 'calibrated' : 'CALIBRATING ' + depth.cal.pairs + '/' + CAL_PAIRS + ' · look around slowly';
+      depth.status = depth.cal.locked ? 'calibrated' : 'CALIBRATING ' + depth.cal.pairs + '/' + (metaSurf.n > 3000 ? 24 : CAL_PAIRS) + (metaSurf.n > 3000 ? ' vs Meta scan' : ' · Meta scan missing: two-view') + ' · look around';
       return;
     }
     if (depth.cfg && depth.cfg.mode && cands.includes(depth.cfg.mode)) depth.mode = depth.cfg.mode;
-    const f = MODES[depth.mode]; depth.modeName = depth.mode + (depth.cfg ? ' · nd' + depth.cfg.nd + (depth.cfg.flip ? ' flip' : '') + ' ' + depth.cfg.src : '');
+    if (depth.cfg && metaSurf.n > 3000 && depth.frames % 3 === 0) {
+      const a = metaAgreement(M, raws, depth.cfg, MODES[depth.cfg.mode] || MODES[depth.mode], 6);
+      if (a >= 0) { depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
+        if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; } }
+    }
+    const f = MODES[depth.mode]; depth.modeName = depth.mode + (depth.cfg ? ' · nd' + depth.cfg.nd + (depth.cfg.flip ? ' flip' : '') + (depth.cfg.swap ? ' swap' : '') + ' ' + depth.cfg.src : '');
     for (let k = 0; k < DW * DH; k++) { const z = f(raws[k]); zs[k] = z; if (z > .2 && z < 4.5) valid++; }
     depth.rawSample = raws[(DH >> 1) * DW + (DW >> 1)];
   }
@@ -890,7 +931,8 @@ function drawPanel() {
   const lines = [
     'surface points  ' + confirmed.toLocaleString() + '  (~' + area.toFixed(1) + ' m²)',
     'Meta layout     ' + (useMeta ? '' : '(off) ') + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
-    'depth           ' + depth.status,
+    'depth           ' + (depth.steady === false ? 'paused: turning fast (look around slower)' : depth.status),
+    'matches Meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% of live depth lands on the Meta scan' : 'checking…') : 'no Meta scan (press Redo Meta room scan)'),
     'sensor          ' + (depth.sensor || '-') + ' · ' + (depth.modeName || '-') + (depth.rawSample !== undefined ? ' · raw ' + (+depth.rawSample).toPrecision(4) : ''),
     '                ' + (depth.diag || '').slice(0, 50),
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
@@ -969,7 +1011,7 @@ $('bAR').addEventListener('click', async () => {
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null;
-    try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; useMeta = false; clearMeta();
+    try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
     depth.status = hasDepth ? 'starting' : 'NOT GRANTED by the browser (Quest settings > browser permissions; update Horizon OS)';
     depth.diag = 'usage ' + (s.depthUsage || '-') + ' · format ' + (s.depthDataFormat || '-') + ' · feats ' + feats.filter(f => /depth|mesh|plane|anchor|unbounded/.test(f)).join(',');
@@ -983,7 +1025,7 @@ $('bAR').addEventListener('click', async () => {
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
 });
-let pendingOpen = null, askedRoom = true, useMeta = false, scanErr = '';
+let pendingOpen = null, askedRoom = true, useMeta = true, scanErr = '';
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
@@ -1054,14 +1096,14 @@ renderer.setAnimationLoop((t, frame) => {
     if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
-    if (useMeta) syncLayout(frame, refSpace);
+    if (useMeta) { syncLayout(frame, refSpace); if (metaSurf.dirty && clockT - metaSurf.t > 2) { metaSurf.t = clockT; buildMetaSurf(); } }
     if (pendingLoad) {                                       // the saved anchor has been found: map old coordinates into this session's
       const ap = frame.getPose(pendingLoad.anchor.anchorSpace, refSpace);
       if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m); mergeRecord(pendingLoad.rec, now.multiply(then.invert())); pendingLoad = null; }
       else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
     }
     if (depth.meta && depthReady()) integrateDepth();
-    if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
+    if (clockT - depth.lastT > depth.rate || depth.steady === false) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
     { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
     if (scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
