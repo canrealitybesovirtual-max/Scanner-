@@ -454,7 +454,7 @@ function integrateDepth() {
       depth.mode = best;
     }
     /* calibration first: nothing goes into the map until the geometry is known */
-    if (!depth.cal.locked && depth.frames > 15) {
+    if (!depth.cal.locked && depth.frames >= 15) {
       const plaus = cands.map(m => { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } return [m, sc]; }).sort((a, b) => b[1] - a[1]);
       const modes = plaus.filter(p => p[1] >= plaus[0][1] * .6).slice(0, 2).map(p => p[0]);
       calibrateStep(M, raws, modes); depth.frames++;
