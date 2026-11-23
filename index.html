@@ -2169,10 +2169,10 @@ function relocArrays(SP, SN, LP, LN) {                              // wall-matc
   const w = srcWorker(RELOC_SRC);
   return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); }; w.postMessage({ SP, SN, LP, LN, guess: null, minCells: 30 }); });
 }
-async function mergeScans(A, B, say) {
+async function mergeScans(A, B, say, opt = {}) {
   say('finding where the two scans overlap…');
   const BN = new Float32Array(B.points.length); if (B.normals) for (let i = 0; i < BN.length; i++) BN[i] = B.normals[i] / 127;
-  const res = await relocArrays(A.points, A.normals || new Int8Array(A.points.length), B.points, BN);
+  const res = opt.pre || await relocArrays(A.points, A.normals || new Int8Array(A.points.length), B.points, BN);
   if (!res.ok && (res.wallFit || 0) > .6) throw new Error('the shared area matches in more than one place (too plain or symmetric). Scan a doorway or furniture that both scans see, then try again');
   if (res.noSaved || res.need) throw new Error('one of the scans has too few walls with surface directions to match (' + Math.round(res.wallCells || 0) + ' wall cells)');
   if (!res.ok) throw new Error('no shared area found (' + Math.round((res.wallFit || 0) * 100) + '% fit). Scan the doorway or hall that connects them in both scans, then try again');
@@ -2191,7 +2191,8 @@ async function mergeScans(A, B, say) {
     points: cat(Float32Array, A.points, tP(B.points)), counts: cat(Uint16Array, A.counts || new Uint16Array(A.points.length / 3).fill(CONF), B.counts || new Uint16Array(nB).fill(CONF)), masks: null, colors: cat(Uint8Array, A.colors || new Uint8Array(A.points.length / 3 * 4), B.colors || new Uint8Array(nB * 4)),
     normals: cat(Int8Array, A.normals || new Int8Array(A.points.length), B.normals ? tN(B.normals) : new Int8Array(B.points.length)), tsdf, fineVoxel: A.fineVoxel || B.fineVoxel || null,
     fpoints: cat(Float32Array, A.fpoints, B.fpoints ? tP(B.fpoints) : null), fcolors: fcat(Uint8Array, 4, 'fcolors', 0), fnormals: A.fpoints || B.fpoints ? cat(Int8Array, A.fnormals || new Int8Array(A.fpoints ? A.fpoints.length : 0), B.fnormals ? tN(B.fnormals) : new Int8Array(B.fpoints ? B.fpoints.length : 0)) : null, fcounts: fcat(Uint16Array, 1, 'fcounts', CONF),
-    zones: (A.zones || []).concat((B.zones || []).map(z => { v.set(z[0], z[1], z[2]).applyMatrix4(M); return [v.x, v.y, v.z, z[3]]; })), merged: { from: [A.id, B.id], wallFit: res.wallFit, overlap: res.overlap } };
+    zones: (A.zones || []).concat((B.zones || []).map(z => { v.set(z[0], z[1], z[2]).applyMatrix4(M); return [v.x, v.y, v.z, z[3]]; })), merged: { from: [A.id, B.id], wallFit: res.wallFit, overlap: res.overlap, auto: !!opt.auto, at: Date.now() } };
+  if (opt.name) rec.name = opt.name;
   say('copying photos and depth frames…'); const mm = (arr) => Array.from(M.clone().multiply(new M4().fromArray(arr)).elements);
   for (const [src, move] of [[A, false], [B, true]]) {
     for (const f of await DB.frames(src.id).catch(() => [])) { const g = Object.assign({}, f, { scan: id, k: id + '/' + f.k }); if (move) { g.m = mm(f.m); if (f.m0) g.m0 = mm(f.m0); } await DB.putFrame(g); }
@@ -2203,8 +2204,44 @@ async function mergeScans(A, B, say) {
     return [pick(P, 3), pick(C, 1), pick(Co, 4), pick(Nn, 3)]; };
   let r1 = dd(rec.points, rec.counts, rec.colors, rec.normals, rec.voxelSize || .02); if (r1) [rec.points, rec.counts, rec.colors, rec.normals] = r1;
   r1 = dd(rec.fpoints, rec.fcounts, rec.fcolors, rec.fnormals, rec.fineVoxel); if (r1) [rec.fpoints, rec.fcounts, rec.fcolors, rec.fnormals] = r1;
-  await DB.put(rec); autoEnqueue(id);
+  await DB.put(rec);
+  if (opt.auto) for (const src of [A, B]) { const x = await DB.get(src.id).catch(() => null); if (x) { x.archived = { into: id, at: Date.now() }; await DB.put(x); } }   // originals hidden, kept for Undo
+  autoEnqueue(id);
   return { rec, fit: res.wallFit, overlap: res.overlap };
+}
+/* auto-merge: after a scan is processed, look for other scans that clearly overlap it (a rescan, the next room seen
+   through a doorway, a "new part") and join them into one house scan. Strict match in either direction; Undo restores both. */
+const mergeTried = (() => { try { return new Set(JSON.parse(localStorage.getItem('scanner.mergeTried') || '[]')); } catch (e) { return new Set(); } })();
+function markTried(k) { mergeTried.add(k); try { localStorage.setItem('scanner.mergeTried', JSON.stringify([...mergeTried].slice(-400))); } catch (e) {} }
+const strongMatch = r => r && r.ok && r.wallFit > .6 && r.ratio > 1.35 && r.overlap > .5;
+async function autoMerge(id, say) {
+  let rec = await DB.get(id); if (!rec || rec.archived || !rec.normals || !rec.points.length) return null;
+  const others = (await DB.all()).filter(o => o.id !== id && !o.archived && o.normals && o.points && o.points.length).sort((a, b) => a.date - b.date);
+  for (const o of others) {
+    const pair = [id, o.id].sort().join('|'), k = pair + '|' + rec.date + '|' + o.date; if (mergeTried.has(k) || noMerge.has(pair)) continue;
+    if (xrSession) return null;
+    say('Looking for overlap with "' + o.name + '"…');
+    const [A, B] = o.date <= rec.date ? [o, rec] : [rec, o];            // the older scan keeps its frame
+    const BN = n => { const f = new Float32Array(n.points.length); if (n.normals) for (let i = 0; i < f.length; i++) f[i] = n.normals[i] / 127; return f; };
+    let res = await relocArrays(A.points, A.normals, B.points, BN(B));
+    if (!strongMatch(res)) { const r2 = await relocArrays(B.points, B.normals, A.points, BN(A));   // the other way round (one scan may see much more than the other)
+      res = strongMatch(r2) ? Object.assign({}, r2, { A: Array.from(new M4().fromArray(r2.A).invert().elements) }) : null; }
+    markTried(k); if (!res) continue;
+    const base = n => String(n || 'House scan').replace(/ · new part$/, '').replace(/ \(recovered\)$/, ''), name = base(A.name) === base(B.name) ? base(A.name) : base(A.name) + ' + ' + base(B.name);   // a rescan or a new part keeps the house's name
+    const m = await mergeScans(A, B, t => say('Joining with "' + o.name + '": ' + t), { pre: res, auto: true, name });
+    diagLog('automerge', JSON.stringify({ a: A.id, b: B.id, fit: res.wallFit, ratio: res.ratio, overlap: res.overlap }));
+    return m.rec;                                                     // the merged scan is processed next and looks for further matches
+  }
+  return null;
+}
+const noMerge = (() => { try { return new Set(JSON.parse(localStorage.getItem('scanner.noMerge') || '[]')); } catch (e) { return new Set(); } })();
+async function undoMerge(rec) {                                      // bring both originals back; never auto-join this pair again
+  const from = (rec.merged && rec.merged.from) || []; let back = 0;
+  for (const fid of from) { const x = await DB.get(fid).catch(() => null); if (x && x.archived && x.archived.into === rec.id) { delete x.archived; await DB.put(x); back++; } }
+  if (!back) throw new Error('the original scans are no longer kept');
+  noMerge.add(from.slice().sort().join('|')); try { localStorage.setItem('scanner.noMerge', JSON.stringify([...noMerge])); } catch (e) {}
+  await DB.del(rec.id); await DB.delFrames(rec.id).catch(() => {}); DB.delDepth(rec.id).catch(() => {});
+  return back;
 }
 /* floor plan: walls and rooms from the scan, each room with its size and area (SVG) */
 function floorPlan(rec) {
@@ -2890,7 +2927,7 @@ async function autoRun() {
   autoRun.cur = id;
   try {
     let rec = await DB.get(id);
-    if (rec && !(rec.auto && rec.auto.v === 1)) {
+    if (rec && !rec.archived && !(rec.auto && rec.auto.v === 1)) {
       const nd = await DB.countDepth(id).catch(() => 0), np = await DB.countFrames(id).catch(() => 0);
       if (nd >= 20 && !rec.refined) { await refineScan(rec, m => say('Refining: ' + m.replace(/^Refining:? ?/, ''))); rec = await DB.get(id); }
       say('Building surface…'); await recMesh(rec);
@@ -2898,7 +2935,8 @@ async function autoRun() {
       if (np && nd) { try { await recTexture(rec, m => say('Photo texture: ' + m + '…')); } catch (e) { say('No photo texture: ' + e.message); } }
       rec.auto = { v: 1, at: Date.now() }; if (!(await putIfSame(rec))) throw new Error('scan was saved again: will reprocess');
     }
-    autoMsg.set(id, 'Ready ✓');
+    let joined = null; try { joined = await autoMerge(id, say); } catch (e) { if (/paused/.test(e && e.message)) throw e; diagLog('automerge', e && e.message); }
+    autoMsg.set(id, joined ? 'Joined into "' + joined.name + '" ✓' : 'Ready ✓'); if (joined) autoMsg.set(joined.id, 'queued');
   } catch (e) { if (xrSession && /paused/.test(e.message)) { autoPending.add(id); autoMsg.set(id, 'queued'); } else { autoMsg.set(id, 'Processing stopped: ' + e.message); } try { const rec = await DB.get(id); if (rec && !/saved again|paused/.test(e.message)) { rec.auto = { v: 1, error: e.message }; await putIfSame(rec); } } catch (_) {} }
   autoBusy = false; autoRun.cur = null; autoShow(id); if (!xrSession && !autoQ.length) listScans(); setTimeout(autoRun, 300);
 }
@@ -3087,10 +3125,15 @@ async function recoverLive(L, existing) {                         // turn a save
 }
 async function listScans() {
   const gen = listScans.gen = (listScans.gen || 0) + 1, el0 = $('scans');
-  let all = []; try { all = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
+  let full = []; try { full = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
+  const all = full.filter(x => !x.archived); listScans.full = full;
+  for (const x of full) if (x.archived && (Date.now() - x.archived.at > 7 * 864e5 || !full.some(y => y.id === x.archived.into))) purgeScan(x, full);   // originals of an auto-merge: kept 7 days for Undo
   let lives = []; try { lives = (await DB.allLive()).filter(L => !xrSession || L.id !== currentId); } catch (e) {}
   if (gen !== listScans.gen) return; el0.innerHTML = ''; const el = document.createDocumentFragment(); try { listRows(el, all, lives); } finally { el0.appendChild(el); }
 }
+function queueAnchorDelete(uuid, full, exceptId) { if (!uuid || full.some(y => y.id !== exceptId && y.anchor && y.anchor.uuid === uuid)) return;   // merged scans share their originals' anchor
+  try { const q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); q.push(uuid); localStorage.setItem('scanner.delAnchors', JSON.stringify(q)); } catch (e) {} }
+function purgeScan(x, full) { queueAnchorDelete(x.anchor && x.anchor.uuid, full, x.id); DB.del(x.id).catch(() => {}); DB.delFrames(x.id).catch(() => {}); DB.delDepth(x.id).catch(() => {}); }
 const fresh = async (r) => { if (autoRun.cur === r.id || autoQ.includes(r.id)) throw new Error('still processing this scan: wait for Ready'); const x = await DB.get(r.id); if (!x) throw new Error('scan no longer exists'); return x; };
 function listRows(el, all, lives) {
   for (const L of lives) { const ex = all.find(r => r.id === L.id); if (ex && ex.date >= L.at) { DB.delLive(L.id).catch(() => {}); continue; }
@@ -3103,7 +3146,7 @@ function listRows(el, all, lives) {
   for (const r of all) {
     const row = document.createElement('div'); row.className = 'scan';
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
-    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : ''); n.appendChild(sm); row.appendChild(n);
+    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : '') + (r.merged && r.merged.auto ? ' · joined automatically' : ''); n.appendChild(sm); row.appendChild(n);
     const as = document.createElement('small'); as.dataset.auto = r.id; as.style.display = 'block'; as.style.color = '#7fe3f0'; as.textContent = r.auto ? (r.auto.error ? 'Processing stopped: ' + r.auto.error : 'Ready: ' + (r.refined ? 'refined, ' : '') + 'meshed' + (r.photoAlign ? ', photos matched' : '') + (r.tex ? ', photo-textured' : '') + ' ✓') : autoMsg.get(r.id) || ''; row.appendChild(as);
     if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
@@ -3111,6 +3154,8 @@ function listRows(el, all, lives) {
     mk('Photos .zip', () => exportPhotos(r));
     mk('Continue scanning', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
+    if (r.merged && r.merged.auto && (listScans.full || []).some(x => x.archived && x.archived.into === r.id)) mk('Undo join', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing: wait for Ready'; return; }
+      try { const n2 = await undoMerge(r); $('st').textContent = 'Separated back into ' + n2 + ' scans (they will not be joined automatically again)'; listScans(); } catch (e) { $('st').textContent = 'Undo: ' + e.message; } });
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Refine', async () => { try { const x = await fresh(r); if (x.refined && !confirm('This scan is already refined. Refine again?')) return; await refineScan(x, m => $('st').textContent = m); listScans(); } catch (e) { $('st').textContent = 'Refine: ' + e.message; } });
     mk('Floor plan', () => { try { const fp = floorPlan(r); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } });
@@ -3122,7 +3167,7 @@ function listRows(el, all, lives) {
       try { const x = await fresh(r); delete x.tex; const t = await recTexture(x, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
       catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (!nm) return; try { const x = await fresh(r); x.name = nm; x.date = Date.now(); await DB.put(x); listScans(); } catch (e) { $('st').textContent = 'Rename: ' + e.message; } });
-    mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid) { try { const q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); q.push(r.anchor.uuid); localStorage.setItem('scanner.delAnchors', JSON.stringify(q)); } catch (e) {} } await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
+    mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor) queueAnchorDelete(r.anchor.uuid, listScans.full || [], r.id); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
     el.appendChild(row);
   }
 }
