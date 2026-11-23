@@ -123,7 +123,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -282,29 +282,41 @@ function tileFlush() {
 
 /* ================= room layout from Space Setup: planes and the room mesh ================= */
 const LABEL_COL = { wall: 0x8fb6c9, floor: 0xb8956a, ceiling: 0xcfcfcf, table: 0xd9a54a, couch: 0xa070c0, door: 0x60c080, window: 0x70a8ff, bed: 0xc07070, storage: 0xb0b060, screen: 0x50d0d0, other: 0x9a9a9a };
-const layout = new THREE.Group(); scene.add(layout);
+const layout = new THREE.Group(); layout.visible = false;   // Meta's layout is never drawn: it's reference data for calibration and checking
 const planes = new Map(), meshes = new Map();
 let showMode = 0;                                          // 0 points + layout, 1 points only, 2 layout only
-function planeLine(e) {
-  if (e.obj) { layout.remove(e.obj); e.obj.geometry.dispose(); }
-  const pts = e.poly.map(p => new V3(p.x, 0, p.z)); pts.push(pts[0].clone());
-  e.obj = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[e.label] || LABEL_COL.other, transparent: true, opacity: .9 }));
-  e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
+function planeLine(e) {}
+function meshWire(e) {}
+function clearMeta() { metaSurf.base = new Set(); metaSurf.set = new Set(); metaSurf.n = 0; cov.done.clear(); lay.removed.clear(); lay.added.clear(); planes.clear(); meshes.clear(); metaToWorker(); }
+const metaSurf = { base: new Set(), set: new Set(), dirty: false, t: 0, n: 0 }, MG = .06, mkey = (x, y, z) => keyOf(Math.floor(x / MG), Math.floor(y / MG), Math.floor(z / MG));
+/* our edits to Meta's layout, learnt live: cells Meta has but depth sees straight through (removed), surfaces Meta never had (added) */
+const lay = { removed: new Set(), added: new Set() };
+const unkey = k => { const iz = k % 16384 - 8192, r = (k - (iz + 8192)) / 16384, iy = r % 16384 - 8192, ix = (r - (iy + 8192)) / 16384 - 8192; return [ix, iy, iz]; };
+function applyLayoutEdits() {                                     // effective layout = Meta's, minus what's gone, plus what's new
+  const S = new Set(metaSurf.base); for (const k of lay.removed) S.delete(k); for (const k of lay.added) S.add(k);
+  metaSurf.set = S; metaSurf.n = S.size; covRebuild(); metaToWorker();
 }
-function meshWire(e) {
-  if (e.obj) { layout.remove(e.obj); e.obj.geometry.dispose(); }
-  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(e.v, 3)); g.setIndex(new THREE.BufferAttribute(e.i, 1));
-  e.obj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: LABEL_COL[e.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .12, depthWrite: false }));
-  e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
+function metaToWorker() { if (integ || metaSurf.n) integWorker().postMessage({ metaSet: Float64Array.from(metaSurf.set) }); }
+function layoutEdit(rem, add) {                                   // decisions from the worker (only sent while the Meta scan broadly matches this room)
+  for (const k of rem) { if (!metaSurf.set.delete(k)) continue; if (lay.added.has(k)) lay.added.delete(k); else lay.removed.add(k); cov.done.delete(k); }
+  for (const k of add) { if (metaSurf.set.has(k)) continue; metaSurf.set.add(k); if (lay.removed.has(k)) lay.removed.delete(k); else lay.added.add(k); cov.done.add(k); }
+  metaSurf.n = metaSurf.set.size;
 }
-function clearMeta() { metaSurf.set = new Set(); metaSurf.n = 0; if (cov.pts) { scene.remove(cov.pts); cov.pts = null; } cov.n = 0; cov.covered = 0; for (const e of planes.values()) layout.remove(e.obj); for (const e of meshes.values()) layout.remove(e.obj); planes.clear(); meshes.clear(); }
-const metaSurf = { set: new Set(), dirty: false, t: 0, n: 0 }, MG = .06, mkey = (x, y, z) => Math.floor(x / MG) + ',' + Math.floor(y / MG) + ',' + Math.floor(z / MG);
+function layoutEditsOut() {                                       // saved with a scan as cell centres, so they survive the anchor transform on reload
+  const pack = S => { const a = new Float32Array(S.size * 3); let i = 0; for (const k of S) { const [x, y, z] = unkey(k); a[i++] = (x + .5) * MG; a[i++] = (y + .5) * MG; a[i++] = (z + .5) * MG; } return a; };
+  return { cell: MG, removed: pack(lay.removed), added: pack(lay.added) };
+}
+function layoutEditsIn(e, T) {
+  if (!e) return; const v = new V3();
+  for (const [src, dst] of [[e.removed, lay.removed], [e.added, lay.added]]) for (let i = 0; i < (src ? src.length : 0); i += 3) { v.set(src[i], src[i + 1], src[i + 2]).applyMatrix4(T); dst.add(mkey(v.x, v.y, v.z)); }
+  applyLayoutEdits();
+}
 function buildMetaSurf() {                                       // sample every Meta triangle and plane every ~4 cm into a voxel set
   const S = new Set(), a = new V3(), b = new V3(), c = new V3(), p = new V3(), mm = new M4();
   const tri = () => { const l = Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a)), n = Math.min(60, Math.ceil(l / .04)); for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) { const u = i / n, v = j / n; p.set(0, 0, 0).addScaledVector(a, 1 - u - v).addScaledVector(b, u).addScaledVector(c, v); S.add(mkey(p.x, p.y, p.z)); } };
   for (const e of meshes.values()) { if (!e.v) continue; mm.copy(e.m); for (let t = 0; t < e.i.length; t += 3) { a.fromArray(e.v, e.i[t] * 3).applyMatrix4(mm); b.fromArray(e.v, e.i[t + 1] * 3).applyMatrix4(mm); c.fromArray(e.v, e.i[t + 2] * 3).applyMatrix4(mm); tri(); } }
   for (const e of planes.values()) { const P = e.poly; if (!P || P.length < 3) continue; for (let t = 1; t < P.length - 1; t++) { a.set(P[0].x, 0, P[0].z).applyMatrix4(e.m); b.set(P[t].x, 0, P[t].z).applyMatrix4(e.m); c.set(P[t + 1].x, 0, P[t + 1].z).applyMatrix4(e.m); tri(); } }
-  metaSurf.set = S; metaSurf.n = S.size; metaSurf.dirty = false; covRebuild();
+  metaSurf.base = S; metaSurf.dirty = false; applyLayoutEdits();
 }
 function syncLayout(frame, ref) {
   const dp = frame.detectedPlanes;
@@ -313,9 +325,9 @@ function syncLayout(frame, ref) {
       const pose = frame.getPose(p.planeSpace, ref); if (!pose) continue;
       let e = planes.get(p); if (!e) { e = { label: p.semanticLabel || 'other', m: new M4(), t: -1, poly: [], obj: null }; planes.set(p, e); }
       e.m.fromArray(pose.transform.matrix);
-      if (e.t !== p.lastChangedTime) { e.t = p.lastChangedTime; e.poly = p.polygon.map(q => ({ x: q.x, z: q.z })); planeLine(e); metaSurf.dirty = true; } else e.obj.matrix.copy(e.m);
+      if (e.t !== p.lastChangedTime) { e.t = p.lastChangedTime; e.poly = p.polygon.map(q => ({ x: q.x, z: q.z })); planeLine(e); metaSurf.dirty = true; }
     }
-    for (const [p, e] of planes) if (!dp.has(p)) { layout.remove(e.obj); planes.delete(p); }
+    for (const [p, e] of planes) if (!dp.has(p)) { planes.delete(p); metaSurf.dirty = true; }
   }
   const dm = frame.detectedMeshes;
   if (dm) {
@@ -323,9 +335,9 @@ function syncLayout(frame, ref) {
       const pose = frame.getPose(m.meshSpace, ref); if (!pose) continue;
       let e = meshes.get(m); if (!e) { e = { label: m.semanticLabel || 'mesh', m: new M4(), t: -1, obj: null }; meshes.set(m, e); }
       e.m.fromArray(pose.transform.matrix);
-      if (e.t !== m.lastChangedTime) { e.t = m.lastChangedTime; e.v = new Float32Array(m.vertices); e.i = new Uint32Array(m.indices); meshWire(e); metaSurf.dirty = true; } else e.obj.matrix.copy(e.m);
+      if (e.t !== m.lastChangedTime) { e.t = m.lastChangedTime; e.v = new Float32Array(m.vertices); e.i = new Uint32Array(m.indices); meshWire(e); metaSurf.dirty = true; }
     }
-    for (const [m, e] of meshes) if (!dm.has(m)) { layout.remove(e.obj); meshes.delete(m); }
+    for (const [m, e] of meshes) if (!dm.has(m)) { meshes.delete(m); metaSurf.dirty = true; }
   }
   let fy = Infinity; for (const e of planes.values()) if (e.label === 'floor') fy = Math.min(fy, e.m.elements[13]);
   if (isFinite(fy)) pmat.uniforms.floorY.value = fy;
@@ -534,7 +546,7 @@ function metaAgreement(M, raws, cfg, f, step) {
     const z = f(raws[y * DW + x]); if (!(z > .3 && z < 4)) continue; tot++;
     backproject(M, cfg, x, y, z, p);
     const ix = Math.floor(p.x / MG), iy = Math.floor(p.y / MG), iz = Math.floor(p.z / MG);
-    if (metaSurf.set.has(ix + ',' + iy + ',' + iz) || metaSurf.set.has(ix + ',' + (iy + 1) + ',' + iz) || metaSurf.set.has(ix + ',' + (iy - 1) + ',' + iz) || metaSurf.set.has((ix + 1) + ',' + iy + ',' + iz) || metaSurf.set.has((ix - 1) + ',' + iy + ',' + iz) || metaSurf.set.has(ix + ',' + iy + ',' + (iz + 1)) || metaSurf.set.has(ix + ',' + iy + ',' + (iz - 1))) hit++;
+    if (metaNear(ix, iy, iz)) hit++;
   }
   return tot > 40 ? hit / tot : -1;
 }
@@ -658,7 +670,8 @@ function integrateDepth() {
 
 /* ================= the integration worker: all per-pixel maths off the main thread ================= */
 const INTEG_SRC = `
-let zs = null, FR = 0;
+let zs = null, FR = 0, MS = new Set();
+const ME = new Map(), MA = new Map();          // per layout cell: [frames seen through, frames seen as surface]; per new cell: frames seen as surface
 /* every voxel the map holds, mirrored here as an open-addressing hash so rays can be tested against it without the main thread */
 const HB = 1 << 22, HK = new Float64Array(HB); let hN = 0;
 function hIdx(k) { const lo = k % 4294967296, hi = (k - lo) / 4294967296; let h = Math.imul((lo | 0) ^ Math.imul(hi | 0, 0x9E3779B1), 0x85EBCA6B); h ^= h >>> 13; h = Math.imul(h, 0xC2B2AE35); return (h >>> 10) & (HB - 1); }
@@ -694,6 +707,7 @@ onmessage = e => {
   const d = e.data;
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
   if (d.resetKnown) { HK.fill(0); hN = 0; return; }
+  if (d.metaSet) { MS = new Set(d.metaSet); ME.clear(); MA.clear(); return; }
   if (d.known) { for (const k of d.known) hAdd(k); return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
   if (!zs || zs.length !== n) zs = new Float32Array(n);
   const near = d.near, far = d.far, r2m = d.r2m, rvm = d.rvm, lumA = d.lumA, mode = d.mode, fin = isFinite(far);
@@ -742,14 +756,25 @@ onmessage = e => {
     if ((x + fo) % 2 === 0 && (y + go) % 2 === 0 && nr * 4 + 4 <= n) { rays[nr * 4] = wx; rays[nr * 4 + 1] = wy; rays[nr * 4 + 2] = wz; rays[nr * 4 + 3] = z; nr++; }   // a quarter of pixels per frame, rotating
   }
   /* free space: walk each ray from the eye to just short of the surface it hit; any stored point it passes through is no longer there */
-  const OX = X[12], OY = X[13], OZ = X[14];
+  const OX = X[12], OY = X[13], OZ = X[14], MG = d.MG, edit = d.metaEdit && MS.size > 0, mk = (x, y, z) => ((Math.floor(x / MG) + 8192) * 16384 + (Math.floor(y / MG) + 8192)) * 16384 + (Math.floor(z / MG) + 8192);
+  const mSurf = new Set(), mMiss = new Set();
+  if (edit) for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; mSurf.add(mk(out[o] / w, out[o + 1] / w, out[o + 2] / w)); }
   for (let r = 0; r < nr; r++) {
     const ex = rays[r * 4], ey = rays[r * 4 + 1], ez = rays[r * 4 + 2], z = rays[r * 4 + 3], Dx = ex - OX, Dy = ey - OY, Dz = ez - OZ, L = Math.sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
-    const s1 = 1 - Math.max(.06, .035 * z) / L, ds = .9 * VS / L; let last = -1;
+    const s1 = 1 - Math.max(.06, .035 * z) / L, s1m = 1 - Math.max(.12, .05 * z) / L, ds = .9 * VS / L; let last = -1, lastM = -1;
     for (let t = .2 / L; t < s1; t += ds) {
       const qx = OX + Dx * t, qy = OY + Dy * t, qz = OZ + Dz * t, k = key(qx, qy, qz); if (k === last) continue; last = k;
       if (hHas(k) && !vox.has(k) && !car.has(k)) car.set(k, [qx, qy, qz, Dx / L, Dy / L, Dz / L]);
+      if (edit && t < s1m) { const m = mk(qx, qy, qz); if (m !== lastM) { lastM = m; if (MS.has(m) && !mSurf.has(m)) mMiss.add(m); } }
     }
+  }
+  /* evidence, frame by frame: a layout cell that is repeatedly seen through and almost never seen as surface is gone;
+     a surface the layout lacks, seen in several frames, is new */
+  const rem = [], add = [];
+  if (edit) {
+    for (const m of mMiss) { const e = ME.get(m) || [0, 0]; e[0]++; ME.set(m, e); if (e[0] >= 6 && e[0] > 3 * e[1]) { rem.push(m); MS.delete(m); ME.delete(m); } }
+    for (const m of mSurf) { if (MS.has(m)) { const e = ME.get(m); if (e) e[1]++; continue; } const c = (MA.get(m) || 0) + 1; if (c >= 4) { add.push(m); MS.add(m); MA.delete(m); } else MA.set(m, c); }
+    if (MA.size > 400000) MA.clear();                                   // bounded memory on very long scans
   }
   for (const k of vox.keys()) hAdd(k);
   for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; out[o] /= w; out[o + 1] /= w; out[o + 2] /= w; out[o + 3] = Math.min(1.6, w);   // one frame alone can't confirm a voxel: noise needs a second look
@@ -758,7 +783,7 @@ onmessage = e => {
   let align = null;
   if (cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align }, [P.buffer, C.buffer]);
+  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add }, [P.buffer, C.buffer]);
 };`;
 let integ = null; const applyQ = [];
 function camAligned(a) {                                                       // the worker found how the camera image lines up with the depth
@@ -770,7 +795,7 @@ function camAligned(a) {                                                       /
 function integWorker() {
   if (integ) return integ;
   integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
+  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
   integ.onerror = ev => { depth.wBusy = false; depth.noWorker = true; scanErr = 'worker: ' + (ev.message || 'failed'); };
   return integ;
 }
@@ -779,7 +804,7 @@ function postIntegration(M) {                                       // hand a de
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
   if (M.cam && M.cam.data) { cam = { data: M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; colorCam.data = null; colorCam.t = 0; }   // hand the frame over; grab a fresh one next time
-  const msg = { DW, DH, VS, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
+  const msg = { DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow };
   depth.wBusy = true; depth.postT = performance.now();
@@ -810,10 +835,8 @@ function applyIntegration(budget) {                                // spread eac
     if (performance.now() > end) return;
   }
 }
-function metaHas(x, y, z) {
-  const ix = Math.floor(x / MG), iy = Math.floor(y / MG), iz = Math.floor(z / MG), S = metaSurf.set;
-  return S.has(ix + ',' + iy + ',' + iz) || S.has(ix + ',' + (iy + 1) + ',' + iz) || S.has(ix + ',' + (iy - 1) + ',' + iz) || S.has((ix + 1) + ',' + iy + ',' + iz) || S.has((ix - 1) + ',' + iy + ',' + iz) || S.has(ix + ',' + iy + ',' + (iz + 1)) || S.has(ix + ',' + iy + ',' + (iz - 1));
-}
+function metaNear(ix, iy, iz) { const S = metaSurf.set; for (const [a, b, c] of NB7) if (S.has(keyOf(ix + a, iy + b, iz + c))) return true; return false; }
+function metaHas(x, y, z) { return metaNear(Math.floor(x / MG), Math.floor(y / MG), Math.floor(z / MG)); }
 
 /* ================= self-cleaning: stray points with no neighbours fade out, a slice per frame ================= */
 let cleanAt = 0, cleaned = 0;
@@ -830,27 +853,16 @@ function cleanSlice(budget) {
   cleanAt = end >= N ? 0 : end;
 }
 
-/* ================= coverage of the Meta scan: what's left to look at ================= */
-const cov = { idx: new Map(), n: 0, covered: 0, flags: null, geo: null, pts: null, dirty: false };
-const covMat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false, uniforms: { time: { value: 0 } },
-  vertexShader: `attribute float done; uniform float time; varying float a; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv; a = (1.0 - done) * step(.4, -mv.z); gl_PointSize = a * clamp(900.0 * .03 / -mv.z, 1.5, 4.0); }`,
-  fragmentShader: `uniform float time; varying float a; void main(){ if (a < .5) discard; vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; gl_FragColor = vec4(.78, .92, 1.0, .15 + .06 * sin(time * 1.6)); }` });
-function covRebuild() {
-  if (cov.pts) { scene.remove(cov.pts); cov.geo.dispose(); }
-  const keys = [...metaSurf.set], P = new Float32Array(keys.length * 3); cov.idx = new Map(); cov.flags = new Float32Array(keys.length);
-  keys.forEach((k, i) => { const [a, b, c] = k.split(',').map(Number); P[i * 3] = (a + .5) * MG; P[i * 3 + 1] = (b + .5) * MG; P[i * 3 + 2] = (c + .5) * MG; cov.idx.set(k, i); });
-  cov.n = keys.length; cov.covered = 0;
-  cov.geo = new THREE.BufferGeometry(); cov.geo.setAttribute('position', new THREE.BufferAttribute(P, 3)); cov.geo.setAttribute('done', new THREE.BufferAttribute(cov.flags, 1));
-  cov.pts = new THREE.Points(cov.geo, covMat); cov.pts.frustumCulled = false; scene.add(cov.pts);
-  for (let id = 0; id < N; id++) if (cnt[id] >= CONF) covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]);
-}
+/* ================= coverage of the (corrected) room layout: how much of it live depth has confirmed ================= */
+const cov = { done: new Set() };
+function covRebuild() { const S = metaSurf.set; for (const k of cov.done) if (!S.has(k)) cov.done.delete(k); for (let id = 0; id < N; id++) if (cnt[id] >= CONF) covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]); }
 function covMark(x, y, z) {
-  if (!cov.n) return;
+  if (!metaSurf.n) return; const S = metaSurf.set;
   const ix = Math.floor(x / MG), iy = Math.floor(y / MG), iz = Math.floor(z / MG);   // a cell counts as seen when live depth lands in it or right beside it
-  for (const [a, b, c] of NB7) { const i = cov.idx.get((ix + a) + ',' + (iy + b) + ',' + (iz + c)); if (i !== undefined && !cov.flags[i]) { cov.flags[i] = 1; cov.covered++; cov.dirty = true; } }
+  for (const [a, b, c] of NB7) { const k = keyOf(ix + a, iy + b, iz + c); if (S.has(k)) cov.done.add(k); }
 }
 const NB7 = [[0, 0, 0]].concat(NB6);
-const coverage = () => cov.n ? cov.covered / cov.n : null;
+const coverage = () => metaSurf.n > 3000 && !depth.metaStale ? Math.min(1, cov.done.size / metaSurf.n) : null;
 
 /* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
 const DB = (() => {
@@ -877,7 +889,7 @@ function snapshot() {
     voxelSize: VS, points: P, counts: Cn, masks: Mk, colors: Cl, normals: Nr, understanding,
     planes: [...planes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), poly: e.poly })),
     meshes: [...meshes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), v: e.v, i: e.i })),
-    floorY: pmat.uniforms.floorY.value
+    floorY: pmat.uniforms.floorY.value, layoutEdits: layoutEditsOut()
   };
 }
 async function saveScan(frame) {
@@ -907,7 +919,7 @@ async function loadIntoSession(rec) {
 function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
-  flushGeo(); if (!viewer.on) integWorker().postMessage({ known: Float64Array.from(vmap.keys()) });     // so the live scan can erase what has changed since
+  flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
   toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
 }
 
@@ -967,7 +979,8 @@ async function download(name, blob) {
 function exportJSON(rec) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
-    masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null };
+    masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
+    layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
 function exportPLY(rec) { download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', plyBlob(rec)); }
@@ -1006,7 +1019,7 @@ function exportGLB(rec) {
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
 }
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, understanding: o.understanding || null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
 }
 
@@ -1255,7 +1268,7 @@ const BTN = () => page === 0 ? [
 ] : [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
   { id: 'view', label: ['Points: dots', 'Points: solid', 'Points: hidden'][showMode] },
-  { id: 'meta', label: useMeta ? 'Meta layout ✓' : 'Meta layout', on: useMeta },
+  { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
   { id: 'clear', label: 'Clear map' },
@@ -1277,7 +1290,7 @@ function scanPhase() {
     const k = depth.cal ? Math.min(1, (depth.cal.pairs || 0) / (metaSurf.n > 3000 ? 24 : 16)) : 0;
     return { title: 'Getting ready', sub: depth.steady === false ? 'Hold still a moment…' : 'Look around slowly at walls and floor', p: k, cal: true };
   }
-  const c = coverage(), hint = depth.steady === false ? 'Slow down a little' : c == null ? 'Look around slowly' : c < .98 ? 'Look at the glowing spots' : 'Walk to the next room';
+  const c = coverage(), hint = depth.steady === false ? 'Slow down a little' : c == null ? 'Look around slowly' : c < .98 ? 'Look at every surface from 0.5–3 m' : 'Walk to the next room';
   return { title: 'Scanning', sub: (c != null ? Math.round(c * 100) + '% of this room · ' : '') + area().toFixed(1) + ' m² · ' + hint, p: c };
 }
 const area = () => confirmed * VS * VS;
@@ -1332,7 +1345,7 @@ function drawPanel() {
     g.font = '17px monospace'; g.fillStyle = '#8fc4ce';
     const diag = [
       'depth   ' + (depth.steady === false ? 'paused: turning' : depth.status),
-      'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · ' + planes.size + ' planes · cover ' + cov.covered + '/' + cov.n,
+      'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · cover ' + cov.done.size + '/' + metaSurf.n + ' · edits −' + lay.removed.size + ' +' + lay.added.size,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
       'clean   ' + cleaned.toLocaleString() + ' strays · ' + erased.toLocaleString() + ' moved-away erased · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
       'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') : ''),
@@ -1520,8 +1533,6 @@ renderer.setAnimationLoop((t, frame) => {
     tileSlice(fps < 65 ? .8 : 1.6); tileFlush();
     tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
     if (scanning && N) cleanSlice(4000);
-    if (cov.dirty && cov.geo && Math.floor(clockT * 3) !== Math.floor((clockT - dt) * 3)) { cov.geo.attributes.done.needsUpdate = true; cov.dirty = false; }
-    covMat.uniforms.time.value = clockT; if (cov.pts) cov.pts.visible = scanning && !replayMode && useMeta && depth.cal && depth.cal.locked && depth.agree != null && depth.agree > .45;   // only guide by the Meta scan when it matches this room
     if (clockT - depth.lastT > depth.rate || depth.steady === false) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
     { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
     if (underOn && scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
