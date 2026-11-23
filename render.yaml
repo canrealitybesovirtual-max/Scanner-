@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: house-scanner
+    runtime: static
+    buildCommand: echo "static site, nothing to build"
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: Permissions-Policy
+        value: xr-spatial-tracking=(self)
+      - path: /*
+        name: Cache-Control
+        value: no-cache

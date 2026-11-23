@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>House Scanner</title>
+<style>
+:root{
+  --bg:#0c0d0e; --card:#16181a; --ink:#e3e1db; --muted:#8c8981; --rule:#2c2f32; --accent:#59c7d9; --accent-ink:#071114;
+  color-scheme:dark;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){ --bg:#ebe9e4; --card:#f7f6f2; --ink:#1c1c1a; --muted:#69665f; --rule:#d3cfc6; --accent:#1d7f90; --accent-ink:#f4fbfc; color-scheme:light; }
+}
+:root[data-theme="light"]{ --bg:#ebe9e4; --card:#f7f6f2; --ink:#1c1c1a; --muted:#69665f; --rule:#d3cfc6; --accent:#1d7f90; --accent-ink:#f4fbfc; color-scheme:light; }
+:root[data-theme="dark"]{ --bg:#0c0d0e; --card:#16181a; --ink:#e3e1db; --muted:#8c8981; --rule:#2c2f32; --accent:#59c7d9; --accent-ink:#071114; color-scheme:dark; }
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 ui-monospace,"SF Mono",Menlo,Consolas,monospace;overflow:hidden}
+canvas#gl{display:block;position:fixed;inset:0;width:100%;height:100%;touch-action:none}
+#ui{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;z-index:5;overflow:auto}
+#ui.hide{display:none}
+.card{background:var(--card);border:1px solid var(--rule);max-width:32em;width:100%;padding:24px 22px 20px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+h1{margin:0 0 2px;font-size:24px;letter-spacing:.05em;font-weight:600}
+.sub{margin:0 0 14px;color:var(--muted);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
+p{margin:0 0 10px}
+ul{margin:0 0 14px;padding-left:18px;color:var(--muted);font-size:13px}
+.btns{display:flex;flex-direction:column;gap:8px}
+button,label.btn{font:inherit;cursor:pointer;border:1px solid var(--rule);background:transparent;color:var(--ink);padding:11px 14px;text-align:center}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+#st{margin-top:12px;font-size:12px;color:var(--muted);min-height:1.4em}
+#scans{margin:14px 0 0;display:flex;flex-direction:column;gap:6px}
+.scan{display:flex;gap:6px;align-items:stretch;flex-wrap:wrap;border-top:1px solid var(--rule);padding-top:8px}
+.scan .n{flex:1 1 100%;padding:2px 0 4px;font-size:13px}
+.scan .n small{display:block;color:var(--muted);font-size:11px}
+.scan button{padding:6px 10px;font-size:12px}
+#vbar{position:fixed;left:12px;right:12px;top:10px;display:none;gap:8px;z-index:4;align-items:center;flex-wrap:wrap}
+#vbar.on{display:flex}
+#vbar span{color:#ddd;text-shadow:0 1px 3px #000;font-size:13px}
+#vbar button{background:rgba(20,22,24,.8);color:#eee;border-color:#444;padding:7px 12px;font-size:13px}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="ui"><div class="card">
+  <h1>HOUSE SCANNER</h1>
+  <p class="sub">WebXR · Quest 3 / 3S</p>
+  <p>Walk your whole house in passthrough and it builds a 2&nbsp;cm 3D point map of every surface from the headset's depth sensor. It adds the room layout from Space Setup (walls, floor, furniture and room mesh) and saves it all so you can continue later.</p>
+  <ul>
+    <li>Walk slowly. Look at every surface from 0.5–3 m away, including floors, ceilings, under tables and behind doors.</li>
+    <li>New detail flashes cyan as it's captured. Surfaces that stay grey-blue need another look.</li>
+    <li>Left hand holds the control panel. Point and pull the right trigger to press a button.</li>
+    <li>Saves stay in this browser on the headset. Export a file to keep a copy.</li>
+  </ul>
+  <div class="btns">
+    <button id="bAR" class="primary" type="button" disabled>Checking headset…</button>
+    <label class="btn" for="fOpen">Open an exported scan file</label>
+  </div>
+  <input id="fOpen" type="file" accept=".json,application/json">
+  <div id="scans"></div>
+  <div id="st"></div>
+</div></div>
+<div id="vbar"><button id="vBack" type="button">← Back</button><span id="vInfo"></span></div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+const $ = id => document.getElementById(id);
+const M4 = THREE.Matrix4, V3 = THREE.Vector3;
+
+/* ================= renderer (transparent: the headset shows your real house through it) ================= */
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWidth, innerHeight); renderer.setClearColor(0, 0);
+renderer.xr.enabled = true;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, .02, 400); camera.position.set(0, 1.6, 0); scene.add(camera);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+/* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
+const VS = .02, CONF = 3, MAX = 3000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
+const vmap = new Map();
+const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX);
+let N = 0, confirmed = 0, dLo = Infinity, dHi = -1;
+const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
+function addSighting(x, y, z, t, w = 1) {
+  const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
+  if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return;
+  const k = keyOf(ix, iy, iz); let id = vmap.get(k);
+  if (id === undefined) { if (N >= MAX) return; id = N++; vmap.set(k, id); pos[id * 3] = (ix + .5) * VS; pos[id * 3 + 1] = (iy + .5) * VS; pos[id * 3 + 2] = (iz + .5) * VS; cnt[id] = 0; }
+  const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
+  if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; }
+  if (id < dLo) dLo = id; if (id > dHi) dHi = id;
+}
+function clearMap() { vmap.clear(); N = 0; confirmed = 0; dLo = Infinity; dHi = -1; pg.setDrawRange(0, 0); }
+const pg = new THREE.BufferGeometry();
+pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('born', new THREE.BufferAttribute(born, 1).setUsage(THREE.DynamicDrawUsage));
+pg.setDrawRange(0, 0);
+const pmat = new THREE.ShaderMaterial({
+  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: CONF }, floorY: { value: 0 } },
+  vertexShader: `attribute float cnt; attribute float born; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
+    void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
+      ok = step(minC, cnt); gl_PointSize = ok * clamp(size * scale / max(.05, -mv.z), 1.0, 24.0);
+      float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
+      vec3 base = mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));                 // floor warm, walls cool
+      base *= .75 + .25 * clamp(cnt / 24.0, 0.0, 1.0);                                                    // well-seen surfaces brighter
+      float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh); }`,
+  fragmentShader: `varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; gl_FragColor = vec4(vC, 1.0); }`
+});
+const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
+function flushGeo() {
+  if (dHi < dLo) return;
+  for (const n of ['position', 'cnt', 'born']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
+  pg.setDrawRange(0, N); dLo = Infinity; dHi = -1;
+}
+
+/* ================= room layout from Space Setup: planes and the room mesh ================= */
+const LABEL_COL = { wall: 0x8fb6c9, floor: 0xb8956a, ceiling: 0xcfcfcf, table: 0xd9a54a, couch: 0xa070c0, door: 0x60c080, window: 0x70a8ff, bed: 0xc07070, storage: 0xb0b060, screen: 0x50d0d0, other: 0x9a9a9a };
+const layout = new THREE.Group(); scene.add(layout);
+const planes = new Map(), meshes = new Map();
+let showMode = 0;                                          // 0 points + layout, 1 points only, 2 layout only
+function planeLine(e) {
+  if (e.obj) { layout.remove(e.obj); e.obj.geometry.dispose(); }
+  const pts = e.poly.map(p => new V3(p.x, 0, p.z)); pts.push(pts[0].clone());
+  e.obj = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[e.label] || LABEL_COL.other, transparent: true, opacity: .9 }));
+  e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
+}
+function meshWire(e) {
+  if (e.obj) { layout.remove(e.obj); e.obj.geometry.dispose(); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(e.v, 3)); g.setIndex(new THREE.BufferAttribute(e.i, 1));
+  e.obj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: LABEL_COL[e.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .28, depthWrite: false }));
+  e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
+}
+function syncLayout(frame, ref) {
+  const dp = frame.detectedPlanes;
+  if (dp) {
+    for (const p of dp) {
+      const pose = frame.getPose(p.planeSpace, ref); if (!pose) continue;
+      let e = planes.get(p); if (!e) { e = { label: p.semanticLabel || 'other', m: new M4(), t: -1, poly: [], obj: null }; planes.set(p, e); }
+      e.m.fromArray(pose.transform.matrix);
+      if (e.t !== p.lastChangedTime) { e.t = p.lastChangedTime; e.poly = p.polygon.map(q => ({ x: q.x, z: q.z })); planeLine(e); } else e.obj.matrix.copy(e.m);
+    }
+    for (const [p, e] of planes) if (!dp.has(p)) { layout.remove(e.obj); planes.delete(p); }
+  }
+  const dm = frame.detectedMeshes;
+  if (dm) {
+    for (const m of dm) {
+      const pose = frame.getPose(m.meshSpace, ref); if (!pose) continue;
+      let e = meshes.get(m); if (!e) { e = { label: m.semanticLabel || 'mesh', m: new M4(), t: -1, obj: null }; meshes.set(m, e); }
+      e.m.fromArray(pose.transform.matrix);
+      if (e.t !== m.lastChangedTime) { e.t = m.lastChangedTime; e.v = new Float32Array(m.vertices); e.i = new Uint32Array(m.indices); meshWire(e); } else e.obj.matrix.copy(e.m);
+    }
+    for (const [m, e] of meshes) if (!dm.has(m)) { layout.remove(e.obj); meshes.delete(m); }
+  }
+  let fy = Infinity; for (const e of planes.values()) if (e.label === 'floor') fy = Math.min(fy, e.m.elements[13]);
+  if (isFinite(fy)) pmat.uniforms.floorY.value = fy;
+}
+
+/* ================= depth sensing: read the headset's depth map, back-project it into the house ================= */
+const DW = 96, DH = 96;
+const depthRT = new THREE.WebGLRenderTarget(DW, DH, { type: THREE.FloatType, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+const depthBuf = new Float32Array(DW * DH * 4);
+const extArr = new THREE.DataArrayTexture(), ext2D = new THREE.Texture();
+const dMat = new THREE.ShaderMaterial({
+  glslVersion: THREE.GLSL3,
+  uniforms: { tArr: { value: extArr }, t2D: { value: ext2D }, isArr: { value: 1 }, layer: { value: 0 }, jit: { value: new THREE.Vector2() } },
+  vertexShader: `out vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `precision highp float; precision highp sampler2DArray; uniform sampler2DArray tArr; uniform sampler2D t2D; uniform int isArr; uniform int layer; uniform vec2 jit;
+    in vec2 vUv; out vec4 o;
+    void main(){ ivec2 sz = isArr == 1 ? textureSize(tArr, 0).xy : textureSize(t2D, 0);
+      vec2 uv = clamp(vUv + jit, 0.0, .9999); ivec2 c = ivec2(uv * vec2(sz));
+      o = isArr == 1 ? texelFetch(tArr, ivec3(c, layer), 0) : texelFetch(t2D, c, 0); }`
+});
+const qScene = new THREE.Scene(), qCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+{ const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), dMat); q.frustumCulled = false; qScene.add(q); }
+const depth = { binding: null, status: 'off', flipY: false, lastT: 0, rate: .2, zs: new Float32Array(DW * DH) };
+const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4();
+function sampleDepth(frame, ref, session, tNow) {
+  if (!depth.binding || !scanning) return;
+  const vp = frame.getViewerPose(ref); if (!vp) return;
+  const view = vp.views[0]; let info = null;
+  try { info = depth.binding.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
+  if (!info || !info.texture) { depth.status = 'waiting'; return; }
+  const isArr = info.textureType === 'texture-array';
+  const props = renderer.properties.get(isArr ? extArr : ext2D); props.__webglTexture = info.texture; props.__webglInit = true;
+  dMat.uniforms.isArr.value = isArr ? 1 : 0; dMat.uniforms.layer.value = info.imageIndex ?? 0;
+  dMat.uniforms.jit.value.set(Math.random() / DW, Math.random() / DH);               // sub-pixel jitter: over time every depth pixel gets read
+  const xrOn = renderer.xr.enabled; renderer.xr.enabled = false;
+  renderer.setRenderTarget(depthRT); renderer.render(qScene, qCam); renderer.setRenderTarget(null); renderer.xr.enabled = xrOn;
+  renderer.readRenderTargetPixels(depthRT, 0, 0, DW, DH, depthBuf);
+  /* depth values → metres. Quest gives normalised depth with near/far; other devices give raw units × rawValueToMeters */
+  _inv.fromArray(info.projectionMatrix || view.projectionMatrix).invert();
+  _xf.fromArray((info.transform || view.transform).matrix);
+  if (info.normDepthBufferFromNormView) _nd.fromArray(info.normDepthBufferFromNormView.matrix).invert(); else _nd.identity();
+  const near = info.depthNear ?? session.renderState.depthNear, far = info.depthFar ?? session.renderState.depthFar;
+  const lumA = session.depthDataFormat === 'luminance-alpha', r2m = info.rawValueToMeters || .001;
+  let maxRaw = 0; for (let k = 0; k < DW * DH; k++) if (depthBuf[k * 4] > maxRaw) maxRaw = depthBuf[k * 4];
+  const linear = !lumA && maxRaw > 1.001;                    // already metres
+  const zs = depth.zs, j = dMat.uniforms.jit.value;
+  for (let k = 0; k < DW * DH; k++) {
+    const r = depthBuf[k * 4]; let z;
+    if (lumA) z = (r * 255 + depthBuf[k * 4 + 3] * 255 * 256) * r2m;
+    else if (linear) z = r * (info.rawValueToMeters || 1);
+    else { if (r <= 0 || r >= 1) { zs[k] = 0; continue; } z = isFinite(far) ? 2 * near * far / (far + near - (r * 2 - 1) * (far - near)) : near / (1 - r); }
+    zs[k] = z;
+  }
+  const n = _nd.elements; let added = 0;
+  for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
+    const k = y * DW + x, z = zs[k];
+    if (!(z > .25 && z < 4.2)) continue;
+    const tol = .035 * z;                                           // drop "flying pixels" on depth edges
+    if (Math.abs(zs[k - 1] - z) > tol || Math.abs(zs[k + 1] - z) > tol || Math.abs(zs[k - DW] - z) > tol || Math.abs(zs[k + DW] - z) > tol) continue;
+    const u = (x + .5) / DW + j.x, v = (y + .5) / DH + j.y;
+    let vu = n[0] * u + n[4] * v + n[12], vv = n[1] * u + n[5] * v + n[13];
+    if (depth.flipY) vv = 1 - vv;
+    _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(_inv); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
+    _p.multiplyScalar(z / -_p.z).applyMatrix4(_xf);
+    addSighting(_p.x, _p.y, _p.z, tNow, z < 1.5 ? 1 : z < 2.5 ? .7 : .45);           // close looks count for more
+    added++;
+  }
+  depth.status = 'live · ' + added + ' pts/frame';
+}
+
+/* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
+const DB = (() => {
+  let db = null;
+  const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => { const r = indexedDB.open('house-scanner', 1); r.onupgradeneeded = () => r.result.createObjectStore('scans', { keyPath: 'id' }); r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error); });
+  const tx = (mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction('scans', mode), s = t.objectStore('scans'), q = fn(s); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
+  return { put: o => tx('readwrite', s => s.put(o)), all: () => tx('readonly', s => s.getAll()), get: id => tx('readonly', s => s.get(id)), del: id => tx('readwrite', s => s.delete(id)) };
+})();
+let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null;
+function snapshot() {
+  const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF) keep.push(i);
+  const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length);
+  keep.forEach((id, k) => { P[k * 3] = pos[id * 3]; P[k * 3 + 1] = pos[id * 3 + 1]; P[k * 3 + 2] = pos[id * 3 + 2]; Cn[k] = Math.min(65535, Math.round(cnt[id])); });
+  return {
+    voxelSize: VS, points: P, counts: Cn,
+    planes: [...planes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), poly: e.poly })),
+    meshes: [...meshes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), v: e.v, i: e.i })),
+    floorY: pmat.uniforms.floorY.value
+  };
+}
+async function saveScan(frame) {
+  const s = snapshot(); if (!s.points.length) { toast('Nothing captured yet'); return; }
+  const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
+  if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
+  /* a persistent anchor at the scan origin: next time, the headset relocates it and the scan snaps back into place */
+  if (originAnchor && originAnchor.requestPersistentHandle) {
+    try {
+      if (!anchorUUID) anchorUUID = await originAnchor.requestPersistentHandle();
+      const ap = frame && frame.getPose(originAnchor.anchorSpace, refSpace);
+      rec.anchor = { uuid: anchorUUID, m: ap ? Array.from(ap.transform.matrix) : null };
+    } catch (e) { rec.anchor = null; }
+  }
+  await DB.put(rec); currentId = rec.id; lastSave = Date.now();
+  toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
+}
+let pendingLoad = null;                                     // waits for the anchor to be found again
+async function loadIntoSession(rec) {
+  currentId = rec.id; let T = new M4();
+  if (rec.anchor && rec.anchor.uuid && rec.anchor.m && xrSession.restorePersistentAnchor) {
+    try { const a = await xrSession.restorePersistentAnchor(rec.anchor.uuid); originAnchor = a; anchorUUID = rec.anchor.uuid; pendingLoad = { rec, anchor: a, tries: 0 }; toast('Finding where this scan was taken…'); return; }
+    catch (e) { toast('Anchor not found here: loaded at the session origin'); }
+  } else toast('Loaded (no anchor: alignment is from the session origin)');
+  mergeRecord(rec, T);
+}
+function mergeRecord(rec, T) {
+  const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
+  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF); }
+  flushGeo(); toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
+}
+
+/* ================= exporting files: .json (everything) and .ply (points, opens in Blender / MeshLab / CloudCompare) ================= */
+const b64 = a => { const u = new Uint8Array(a.buffer, a.byteOffset, a.byteLength); let s = ''; for (let i = 0; i < u.length; i += 32768) s += String.fromCharCode.apply(null, u.subarray(i, i + 32768)); return btoa(s); };
+const unb64 = (s, T) => { const bin = atob(s), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new T(u.buffer); };
+/* saving a file: through the artifact viewer's download prompt when embedded there, else a normal browser download */
+let dlP = null; const dlCap = () => dlP || (dlP = (window.claude && window.claude.use) ? window.claude.use('downloads').catch(() => null) : Promise.resolve(null));
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return u => { let c = ~0; for (let i = 0; i < u.length; i++) c = t[(c ^ u[i]) & 255] ^ (c >>> 8); return ~c >>> 0; }; })();
+async function zipOne(name, blob) {                                   // a single stored (uncompressed) entry
+  const data = new Uint8Array(await blob.arrayBuffer()), nm = new TextEncoder().encode(name), crc = CRC(data);
+  const lh = new DataView(new ArrayBuffer(30)); lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true);
+  const ch = new DataView(new ArrayBuffer(46)); ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true);
+  const off = 30 + nm.length + data.length, cl = 46 + nm.length;
+  const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, 1, true); end.setUint16(10, 1, true); end.setUint32(12, cl, true); end.setUint32(16, off, true);
+  return new Blob([lh.buffer, nm, data, ch.buffer, nm, end.buffer]);
+}
+async function download(name, blob) {
+  const d = await dlCap();
+  if (d) {
+    try { if (!/\.(json|txt|csv|zip)$/i.test(name)) { blob = await zipOne(name, blob); name = name.replace(/\.\w+$/, '') + '.zip'; } await d.save({ filename: name, data: blob }); $('st').textContent = 'Saved ' + name; }
+    catch (e) { $('st').textContent = e && e.code === 'declined' ? 'Download cancelled.' : 'Download unavailable here (' + (e && e.code || e) + ').'; }
+    return;
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
+}
+function exportJSON(rec) {
+  const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
+    planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null };
+  download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
+}
+function exportPLY(rec) {
+  const n = rec.points.length / 3, head = 'ply\nformat binary_little_endian 1.0\ncomment house-scanner voxel ' + rec.voxelSize + ' m\nelement vertex ' + n + '\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
+  const body = new DataView(new ArrayBuffer(n * 15));
+  for (let k = 0; k < n; k++) {
+    const y = rec.points[k * 3 + 1], h = Math.max(0, Math.min(1, (y - (rec.floorY || 0)) / 2.7)), o = k * 15;
+    body.setFloat32(o, rec.points[k * 3], true); body.setFloat32(o + 4, y, true); body.setFloat32(o + 8, rec.points[k * 3 + 2], true);
+    body.setUint8(o + 12, 160 + 40 * h | 0); body.setUint8(o + 13, 130 + 85 * h | 0); body.setUint8(o + 14, 100 + 130 * h | 0);
+  }
+  download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', new Blob([head, body.buffer], { type: 'application/octet-stream' }));
+}
+function parseJSON(o) {
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null,
+    planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
+}
+
+/* ================= in-headset control panel (left hand) and pointer (right hand) ================= */
+const panel = (() => {
+  const c = document.createElement('canvas'); c.width = 640; c.height = 480; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .18), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
+  mesh.position.set(.0, .07, -.04); mesh.rotation.set(-.85, 0, 0);
+  return { c, g: c.getContext('2d'), t, mesh, hover: -1, buttons: [] };
+})();
+let scanning = true, lastSave = 0, toastMsg = '', toastT = 0, clockT = 0, fps = 72, fpsAcc = 0, fpsN = 0;
+const BTN = () => [
+  { id: 'scan', label: scanning ? 'Scanning: ON' : 'Scanning: PAUSED', on: scanning },
+  { id: 'room', label: 'Room setup' },
+  { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
+  { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
+  { id: 'save', label: 'Save scan' },
+  { id: 'clear', label: 'Clear map' },
+  { id: 'exit', label: 'Exit' }
+];
+function toast(m) { toastMsg = m; toastT = 4; }
+function drawPanel() {
+  const g = panel.g, W = 640, H = 480; g.clearRect(0, 0, W, H);
+  g.fillStyle = 'rgba(14,16,18,.92)'; g.fillRect(0, 0, W, H); g.strokeStyle = '#2f3438'; g.lineWidth = 2; g.strokeRect(1, 1, W - 2, H - 2);
+  g.fillStyle = '#e8e6df'; g.font = '600 28px monospace'; g.fillText('HOUSE SCANNER', 22, 44);
+  g.font = '19px monospace'; g.fillStyle = '#9ad8e4';
+  const area = confirmed * VS * VS;
+  const lines = [
+    'surface points  ' + confirmed.toLocaleString() + '  (~' + area.toFixed(1) + ' m²)',
+    'room layout     ' + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
+    'depth           ' + depth.status,
+    'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
+    'fps             ' + Math.round(fps)
+  ];
+  lines.forEach((l, i) => g.fillText(l, 22, 84 + i * 26));
+  panel.buttons = []; const bs = BTN(), bw = 290, bh = 50;
+  bs.forEach((b, i) => {
+    const x = 22 + (i % 2) * (bw + 16), y = 222 + Math.floor(i / 2) * (bh + 10);
+    panel.buttons.push({ ...b, x, y, w: bw, h: bh });
+    g.fillStyle = panel.hover === i ? '#2b6f7c' : b.on ? '#1d4a53' : '#24282c'; g.fillRect(x, y, bw, bh);
+    g.fillStyle = '#eef'; g.font = '20px monospace'; g.fillText(b.label, x + 14, y + 32);
+  });
+  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 466); }
+  panel.t.needsUpdate = true;
+}
+async function press(id, frame) {
+  if (id === 'scan') { scanning = !scanning; }
+  if (id === 'room') { if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
+  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; layout.visible = showMode !== 1; }
+  if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
+  if (id === 'save') saveScan(frame);
+  if (id === 'clear') { clearMap(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'exit') xrSession && xrSession.end();
+}
+const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
+laser.scale.z = 2;
+let lastFrame = null;
+for (const i of [0, 1]) {
+  const c = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i); scene.add(c, grip);
+  c.addEventListener('connected', ev => {
+    c.userData.hand = ev.data.handedness;
+    if (ev.data.handedness === 'left') grip.add(panel.mesh); else { rightCtl.c = c; c.add(laser); }
+  });
+  c.addEventListener('selectstart', () => { if (c.userData.hand !== 'left' && panel.hover >= 0) press(panel.buttons[panel.hover].id, lastFrame); });
+}
+function updatePointer() {
+  panel.hover = -1; if (!rightCtl.c || !panel.mesh.parent) return;
+  const c = rightCtl.c; pointerRay.ray.origin.setFromMatrixPosition(c.matrixWorld); pointerRay.ray.direction.set(0, 0, -1).transformDirection(c.matrixWorld);
+  const h = pointerRay.intersectObject(panel.mesh)[0];
+  laser.scale.z = h ? h.distance : 2;
+  if (!h) return;
+  const px = h.uv.x * 640, py = (1 - h.uv.y) * 480;
+  panel.hover = panel.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
+}
+
+/* ================= entering the headset ================= */
+async function checkXR() {
+  const b = $('bAR');
+  if (!navigator.xr) { b.textContent = 'Open this page on your Quest'; $('st').textContent = 'This browser has no WebXR. Saved scans can still be viewed below.'; return; }
+  let ok = false; try { ok = await navigator.xr.isSessionSupported('immersive-ar'); } catch (e) {}
+  if (ok) { b.disabled = false; b.textContent = 'Start scanning'; }
+  else { b.textContent = 'Mixed reality not available here'; $('st').textContent = 'Needs the Quest browser. If you are on the Quest and still see this, open the page on its own instead of the embedded view.'; }
+}
+$('bAR').addEventListener('click', async () => {
+  try {
+    const s = await navigator.xr.requestSession('immersive-ar', {
+      optionalFeatures: ['local-floor', 'unbounded', 'plane-detection', 'mesh-detection', 'depth-sensing', 'anchors', 'hand-tracking'],
+      depthSensing: { usagePreference: ['gpu-optimized'], dataFormatPreference: ['float32', 'luminance-alpha'] }
+    });
+    const feats = s.enabledFeatures || [];
+    renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
+    await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
+    depth.binding = null; depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
+    if (s.depthUsage === 'gpu-optimized' || (feats.includes('depth-sensing') && !s.depthUsage)) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed'; } }
+    else if (s.depthUsage) depth.status = 'cpu depth (unsupported here)';
+    $('ui').classList.add('hide');
+    s.addEventListener('end', () => { xrSession = null; $('ui').classList.remove('hide'); listScans(); });
+    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; setTimeout(() => loadIntoSession(r), 1500); }
+  } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
+});
+let pendingOpen = null;
+
+/* ================= 2D: saved scans, viewing them on a flat screen ================= */
+const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
+async function listScans() {
+  const el = $('scans'); el.innerHTML = '';
+  let all = []; try { all = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
+  if (!all.length) return;
+  const h = document.createElement('div'); h.className = 'sub'; h.style.margin = '6px 0 0'; h.textContent = 'Saved on this device'; el.appendChild(h);
+  for (const r of all) {
+    const row = document.createElement('div'); row.className = 'scan';
+    const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
+    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : ''); n.appendChild(sm); row.appendChild(n);
+    const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
+    mk('Continue', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
+    mk('View', () => openViewer(r));
+    mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r));
+    mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
+    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); listScans(); } });
+    el.appendChild(row);
+  }
+}
+function openViewer(rec) {
+  closeViewer(); viewer.on = true; renderer.setClearColor(0x111315, 1);
+  const g = new THREE.Group(); viewer.group = g; scene.add(g);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3));
+  const n = rec.points.length / 3, cols = new Float32Array(n * 3);
+  for (let k = 0; k < n; k++) { const h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7)); cols[k * 3] = .62 + .16 * h; cols[k * 3 + 1] = .5 + .34 * h; cols[k * 3 + 2] = .38 + .52 * h; }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3)); geo.computeBoundingBox();
+  g.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: rec.voxelSize * 1.2, vertexColors: true, sizeAttenuation: true })));
+  for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .25 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
+  for (const p of rec.planes) { const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
+  const bb = geo.boundingBox; if (bb && isFinite(bb.min.x)) { bb.getCenter(viewer.target); viewer.dist = Math.max(3, bb.getSize(new V3()).length() * .8); }
+  cloud.visible = false; layout.visible = false;
+  $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
+}
+function closeViewer() { if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = true; }
+$('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
+const cv = renderer.domElement, ptrs = new Map();
+cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => {
+  if (!viewer.on || !ptrs.has(e.pointerId)) return; const p = ptrs.get(e.pointerId);
+  if (ptrs.size === 1) { viewer.yaw -= (e.clientX - p.x) * .006; viewer.pitch = Math.max(-1.4, Math.min(1.4, viewer.pitch + (e.clientY - p.y) * .006)); }
+  else if (ptrs.size === 2) { const [a, b] = [...ptrs.values()], d0 = Math.hypot(a.x - b.x, a.y - b.y); p.x = e.clientX; p.y = e.clientY; const [c, d] = [...ptrs.values()], d1 = Math.hypot(c.x - d.x, c.y - d.y); viewer.dist = Math.max(.5, viewer.dist * d0 / Math.max(1, d1)); return; }
+  p.x = e.clientX; p.y = e.clientY;
+});
+const up = e => ptrs.delete(e.pointerId); cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+cv.addEventListener('wheel', e => { if (viewer.on) { viewer.dist = Math.max(.5, viewer.dist * Math.exp(e.deltaY * .001)); e.preventDefault(); } }, { passive: false });
+$('fOpen').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { const rec = parseJSON(JSON.parse(await f.text())); if (confirm('Keep "' + rec.name + '" on this device too?')) { await DB.put(rec); listScans(); } openViewer(rec); }
+  catch (err) { $('st').textContent = 'Not a scan file: ' + err.message; }
+  e.target.value = '';
+});
+
+/* ================= loop ================= */
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((t, frame) => {
+  const dt = Math.min(.1, clock.getDelta()); clockT += dt; pmat.uniforms.time.value = clockT;
+  fpsAcc += dt; fpsN++; if (fpsAcc > .5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+  if (frame) {
+    lastFrame = frame;
+    if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
+    if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
+    if (originAnchor === 'pending') { /* waiting */ }
+    syncLayout(frame, refSpace);
+    if (pendingLoad) {                                       // the saved anchor has been found: map old coordinates into this session's
+      const ap = frame.getPose(pendingLoad.anchor.anchorSpace, refSpace);
+      if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m); mergeRecord(pendingLoad.rec, now.multiply(then.invert())); pendingLoad = null; }
+      else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
+    }
+    if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
+    flushGeo();
+    updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
+  } else if (viewer.on) {
+    camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
+    camera.lookAt(viewer.target);
+  }
+  renderer.render(scene, camera);
+});
+checkXR(); listScans();
+</script>
+</body>
+</html>
