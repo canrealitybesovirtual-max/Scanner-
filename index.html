@@ -898,7 +898,7 @@ function integrateDepth() {
 
 /* ================= the integration worker: all per-pixel maths off the main thread ================= */
 const INTEG_SRC = `
-let HMK = null, HPX = 0;                                                    // hand/arm pixel mask, reused
+let HMK = null, HPX = 0, SETTLE = true;                                                    // hand/arm pixel mask, reused
 let zs = null, zf = null, FR = 0, MS = new Set(); const FK = new Set();      // FK: every 5 mm detail voxel
 const ME = new Map(), MA = new Map();          // per layout cell: [frames seen through, frames seen as surface]; per new cell: frames seen as surface
 /* every voxel the map holds, mirrored here as an open-addressing hash so rays can be tested against it without the main thread */
@@ -961,6 +961,7 @@ function tsdfIntegrate(c) {
   }
   const P = c.PRJ, N = c.NDI, R0 = c.R0, DW = c.DW, DH = c.DH, zf = c.zf, cam = c.cam, V = c.V, wm = c.moving ? .6 : 1;
   for (const b of touched) {
+    if (c.live && SETTLE && b.sat && (FR + b.i + b.j * 3 + b.k * 5) % 3) continue;   // settled surface (mostly walls, floors, ceilings): refresh 1 frame in 3
     let changed = false;
     for (let v = 0; v < B3; v++) {
       const wx = (b.i * BS + (v & 7) + .5) * TV, wy = (b.j * BS + ((v >> 3) & 7) + .5) * TV, wz = (b.k * BS + (v >> 6) + .5) * TV, ax = wx - OX, ay = wy - OY, az = wz - OZ;
@@ -982,6 +983,7 @@ function tsdfIntegrate(c) {
               b.cw[v] = Math.min(240, Math.max(1, Math.round(k2 * 8))); } } }
       }
     }
+    b.up = (b.up || 0) + 1; if (changed && (b.up & 7) === 0) { let ns = 0, nf = 0; for (let v = 0; v < B3; v++) { if (!b.w[v]) continue; ns++; if (b.w[v] >= WMAX * 4) nf++; } b.sat = ns > 8 && nf > ns * .85; }   // surface and the free air in front of it, both well observed
     b.t = now; if (changed) dirtyB(b.i, b.j, b.k, now);
   }
   return touched.size;
@@ -1325,6 +1327,7 @@ onmessage = e => {
   }
   const VS = F ? d.VSF : d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
   const vox = new Map(), car = new Map(), out = new Float32Array(n * 11), rays = new Float32Array(n); let np = 0, nr = 0; FR++; const fo = FR % 2, go = ((FR / 2) | 0) % 2;
+  let slk = -1, sls = false, skipped = 0;                            // settled-surface lookup cache
   const TR = F ? .25 : .42, TT = F ? -.3 : .25, HR = F ? .01 : .0256;   // close-up work: a slimmer body/hand exclusion so near objects survive
   const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < TR && y < H[1] + TT && y > H[1] - 1.95) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < HR) return true; } return false; };
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
@@ -1352,6 +1355,8 @@ onmessage = e => {
         if (cu > .01 && cu < .99 && cvv > .01 && cvv < .99) { const pi = ((cvv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4; R = cam.data[pi] / 255; G = cam.data[pi + 1] / 255; Bl = cam.data[pi + 2] / 255;
           const a = cu * 2 - 1, b = cvv * 2 - 1; cq = q * (1 - .75 * Math.min(1, (a * a + b * b) * .5)); } }      // lens centre is sharpest and truest
     }
+    if (!F && SETTLE && !d.ph && FR % 3) { const sbi = Math.floor(wx / (BS * TV)), sbj = Math.floor(wy / (BS * TV)), sbk = Math.floor(wz / (BS * TV)), sk = bk3(sbi, sbj, sbk); if (sk !== slk) { slk = sk; const sb = TB.get(sk); sls = !!(sb && sb.sat); }
+      if (sls) { if ((x + fo) % 2 === 0 && (y + go) % 2 === 0 && nr * 4 + 4 <= n) { rays[nr * 4] = wx; rays[nr * 4 + 1] = wy; rays[nr * 4 + 2] = wz; rays[nr * 4 + 3] = z; nr++; } skipped++; continue; } }
     const vk = key(wx, wy, wz); let o = vox.get(vk);                  // several pixels in one voxel: one averaged sighting
     if (o === undefined) { o = np++ * 11; vox.set(vk, o); for (let i = 0; i < 11; i++) out[o + i] = 0; out[o + 7] = -1; }
     out[o] += wx * w; out[o + 1] += wy * w; out[o + 2] += wz * w; out[o + 3] += w; out[o + 4] += nx * w; out[o + 5] += ny * w; out[o + 6] += nz * w;
@@ -1393,14 +1398,14 @@ onmessage = e => {
     raw = { tCap: d.tCap, mm, DW, DH, INV: I, PRJ: d.PRJ, NDI: d.NDI, ND, flip, R0, jx: d.jx, jy: d.jy, X: Array.from(X) }; }
   if (!F && d.tsdf && d.PRJ) {
     const t0 = performance.now(), now = t0;
-    tsdfBlocks = tsdfIntegrate({ X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
+    tsdfBlocks = tsdfIntegrate({ live: true, X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
     if (now - (tsdfPrune.t || 0) > 5000) { tsdfPrune.t = now; tsdfPrune(now); }
     const due = []; for (const [rk, t] of tDirty) if (now - (tMeshed.get(rk) || -1e9) > 600) due.push(rk);
     due.sort((a, b) => tDirty.get(b) - tDirty.get(a)); const pick = due.slice(0, 3);
     if (pick.length) { meshes = meshRegions(pick, d.zones || [], d.floorY || 0); for (const rk of pick) { tMeshed.set(rk, now); tDirty.delete(rk); } }
     tms = performance.now() - t0;
   }
-  postMessage({ ph: d.ph || 0, handPx: HPX, P, C, np, nc, valid, meshes, tsdfBlocks, tms, regions: TREG.size, track, raw, corr: track && track.ok ? mul4(X, inv4r(d.xf)) : null, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer].concat(raw ? [raw.mm.buffer] : [], meshes ? meshes.flatMap(m => [m.P.buffer, m.N.buffer, m.C.buffer, m.I.buffer]) : []));
+  postMessage({ settledPx: skipped, ph: d.ph || 0, handPx: HPX, P, C, np, nc, valid, meshes, tsdfBlocks, tms, regions: TREG.size, track, raw, corr: track && track.ok ? mul4(X, inv4r(d.xf)) : null, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer].concat(raw ? [raw.mm.buffer] : [], meshes ? meshes.flatMap(m => [m.P.buffer, m.N.buffer, m.C.buffer, m.I.buffer]) : []));
 };`;
 let integ = null; const applyQ = [], wReq = new Map(); let wReqN = 0, tsdfOn = true;
 function workerAsk(w, msg, key) { return new Promise(res => { const id = ++wReqN; wReq.set(id, res); msg[key] = id; w.postMessage(msg); }); }
@@ -1443,7 +1448,7 @@ function integWorker() {
     depth.wBusy = false; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
     if (d.gen !== (depth.gen || 0)) return; if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add);
     if (d.corr) { setD(rigidify(new M4().fromArray(d.corr)).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
-    if (d.handPx != null) depth.handPx = d.handPx;
+    if (d.handPx != null) depth.handPx = d.handPx; if (d.settledPx != null) depth.settledPx = d.settledPx;
     if (d.track) { depth.track = d.track; depth.trackOK = (depth.trackOK || 0) * .9 + (d.track.ok ? .1 : 0); }
     if (d.raw && scanning && !replayMode) { const sc = scanId(); DB.putDepth(Object.assign(d.raw, { scan: sc, k: sc + '/d' + d.raw.tCap, t: d.raw.tCap })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
     if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
@@ -2815,7 +2820,7 @@ const diag = { log: [], fpsH: [] };
 function diagLog(kind, msg) { diag.log.push([Math.round(performance.now()), kind, String(msg).slice(0, 160)]); if (diag.log.length > 80) diag.log.shift(); }
 function diagSnapshot() {
   const fh = diag.fpsH.slice().sort((a, b) => a - b);
-  return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps), fpsMedian: fh.length ? fh[fh.length >> 1] : null, fpsLow10: fh.length ? fh[Math.floor(fh.length * .1)] : null, liveShown: depth.liveShown || null, ibrPhotos: ibr.k || null, hands: { tracked: hcapState.hands, capsules: hcapState.n, maskedPx: depth.handPx || 0 },
+  return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps), fpsMedian: fh.length ? fh[fh.length >> 1] : null, fpsLow10: fh.length ? fh[Math.floor(fh.length * .1)] : null, liveShown: depth.liveShown || null, ibrPhotos: ibr.k || null, hands: { tracked: hcapState.hands, capsules: hcapState.n, maskedPx: depth.handPx || 0 }, settledPx: depth.settledPx || 0, photoCoverage: pcov.f,
     session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
