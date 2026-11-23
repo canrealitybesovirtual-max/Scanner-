@@ -80,7 +80,7 @@ addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); ca
 /* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
 const VS = .02, CONF = 3, MAX = 2000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
-const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX), nrm = new Float32Array(MAX * 3);   // dirs: which of 26 directions each voxel was seen from
+const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX), nrm = new Float32Array(MAX * 3), tl = new Uint8Array(MAX);   // tl: covered by a flat tile. dirs: which of 26 directions each voxel was seen from
 let N = 0, confirmed = 0, newLo = 0;
 const dmark = new Uint8Array(MAX); let dlist = [];
 const markDirty = id => { if (!dmark[id]) { dmark[id] = 1; dlist.push(id); } };
@@ -89,13 +89,14 @@ function addSighting(x, y, z, t, w = 1, cam = null, mask = 0, nx = 0, ny = 0, nz
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
   if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return -1;
   const k = keyOf(ix, iy, iz); let id = vmap.get(k);
-  if (id === undefined) { if (N >= MAX) return -1; id = N++; vmap.set(k, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
+  if (id === undefined) { if (N >= MAX) return -1; id = N++; vmap.set(k, id); tl[id] = 0; cellAdd(ix, iy, iz, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
   else { const a = w / (Math.min(cnt[id], 30) + w); pos[id * 3] += (x - pos[id * 3]) * a; pos[id * 3 + 1] += (y - pos[id * 3 + 1]) * a; pos[id * 3 + 2] += (z - pos[id * 3 + 2]) * a; }   // the true surface point, not the grid corner
   if (nx || ny || nz) { nrm[id * 3] += nx * w; nrm[id * 3 + 1] += ny * w; nrm[id * 3 + 2] += nz * w; }
   if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
   if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
   const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
-  if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]); }
+  if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]); cellDirty(ix, iy, iz); }
+  else if (before < 12 && cnt[id] >= 12) cellDirty(ix, iy, iz);          // settled: refit its tile
   markDirty(id);
   return id;
 }
@@ -103,13 +104,13 @@ function carve(x, y, z, amt) {                             // seen *through*: th
   const id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)));
   if (id === undefined || cnt[id] <= 0) return;
   const before = cnt[id]; cnt[id] = Math.max(0, before - amt);
-  if (before >= CONF && cnt[id] < CONF) confirmed--;
+  if (before >= CONF && cnt[id] < CONF) { confirmed--; cellDirty(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)); }
   markDirty(id);
 }
 function tint(id, r, g, b, w) {                            // running average of camera colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -118,15 +119,16 @@ pg.setAttribute('ang', new THREE.BufferAttribute(ang, 1).setUsage(THREE.DynamicD
 pg.setAttribute('col', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cw', new THREE.BufferAttribute(cw, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('nrm', new THREE.BufferAttribute(nrm, 3).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('tl', new THREE.BufferAttribute(tl, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setDrawRange(0, 0);
 /* point styles: 0 = scan dots (small, see-through, your real room stays visible), 1 = solid 2 cm tiles, 2 = photo walk-through */
 const pmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false,
   uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; attribute float tl; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       float d = -mv.z, fresh = exp(-(time - born) * 1.6);
-      ok = step(style < .5 ? 3.0 : minC, cnt) * step(.35, d);                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
+      ok = step(style < .5 ? 3.0 : minC, cnt) * step(.35, d) * (photo > .5 ? 1.0 : 1.0 - tl);                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
       float px = size * scale / max(.05, d);
       gl_PointSize = ok * (style < .5 ? clamp(px * .45, 1.4, 5.0) * (1.0 + fresh * .5) : clamp(px * (1.0 + photo * .8), 1.0, 40.0));
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
@@ -151,11 +153,90 @@ function flushGeo() {
     dlist.sort((x, y) => x - y);
     let gap = 48, ranges = [];
     for (;;) { ranges = []; let a = dlist[0], b = a; for (let i = 1; i < dlist.length; i++) { const v = dlist[i]; if (v - b <= gap) b = v; else { ranges.push([a, b]); a = b = v; } } ranges.push([a, b]); if (ranges.length <= 256) break; gap *= 4; }
-    for (const n of ['cnt', 'born', 'ang', 'col', 'cw', 'nrm']) { const at = pg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); for (const [a, b] of ranges) at.addUpdateRange(a * k, (b - a + 1) * k); at.needsUpdate = true; }
+    for (const n of ['cnt', 'born', 'ang', 'col', 'cw', 'nrm', 'tl']) { const at = pg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); for (const [a, b] of ranges) at.addUpdateRange(a * k, (b - a + 1) * k); at.needsUpdate = true; }
     for (const [a, b] of ranges) pa.addUpdateRange(a * 3, (b - a + 1) * 3); pa.needsUpdate = true;
     for (const id of dlist) dmark[id] = 0; dlist = [];
   }
   pg.setDrawRange(0, N); newLo = N;
+}
+
+/* ================= flat surfaces become tiles: 12 cm cells whose points lie on one plane are drawn as a single quad ================= */
+const TC = 6, TS = TC * VS, TMAX = 120000;
+const cells = new Map(), cellQ = new Set();
+const ckey = (ix, iy, iz) => keyOf(Math.floor(ix / TC), Math.floor(iy / TC), Math.floor(iz / TC));
+function cellAdd(ix, iy, iz, id) { const k = ckey(ix, iy, iz); let c = cells.get(k); if (!c) { c = { ids: [], slot: -1 }; cells.set(k, c); } c.ids.push(id); }
+function cellDirty(ix, iy, iz) { const c = cells.get(ckey(ix, iy, iz)); if (c) cellQ.add(c); }
+const tileGeo = new THREE.PlaneGeometry(1, 1), tileCol = new Float32Array(TMAX * 4), tileBorn = new Float32Array(TMAX);
+tileGeo.setAttribute('iCol', new THREE.InstancedBufferAttribute(tileCol, 4).setUsage(THREE.DynamicDrawUsage));
+tileGeo.setAttribute('iBorn', new THREE.InstancedBufferAttribute(tileBorn, 1).setUsage(THREE.DynamicDrawUsage));
+const tmat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  uniforms: { time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
+  vertexShader: `attribute vec4 iCol; attribute float iBorn; uniform float time, floorY, photo, style; varying vec3 vC; varying vec2 vUv, vSz; varying float va;
+    void main(){ vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * viewMatrix * wp;
+      vec3 n = normalize(mat3(instanceMatrix)[2]); vSz = vec2(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz)); vUv = uv;
+      float h = clamp((wp.y - floorY) / 2.7, 0.0, 1.0), fresh = exp(-(time - iBorn) * 1.4);
+      vec3 base = style < .5 && photo < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
+      if (iCol.a > .5 && style > .5 || photo > .5) base = iCol.a > .5 ? iCol.rgb : base * .7;
+      if (photo < .5) base *= .62 + .38 * abs(dot(n, normalize(vec3(.35, .9, .45))));
+      vC = mix(base, vec3(.25, .95, 1.0), fresh * .8);
+      va = photo > .5 || style > .5 ? 1.0 : .16 + .3 * fresh; }`,
+  fragmentShader: `uniform float alpha, photo, style; varying vec3 vC; varying vec2 vUv, vSz; varying float va;
+    void main(){ vec2 e = min(vUv, 1.0 - vUv) * vSz; float edge = 1.0 - smoothstep(.0025, .006, min(e.x, e.y));     // thin seams so it reads as a mesh
+      vec3 c = vC * (1.0 - (photo > .5 ? 0.0 : .25) * edge); float a = va + (style < .5 && photo < .5 ? edge * .22 : 0.0);
+      gl_FragColor = vec4(c, alpha * a); }`
+});
+const tiles = new THREE.InstancedMesh(tileGeo, tmat, TMAX); tiles.count = 0; tiles.frustumCulled = false; tiles.renderOrder = -1;
+tiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage); scene.add(tiles);
+const tFree = []; let tLo = Infinity, tHi = -1, tileN = 0;
+const _tm = new M4(), _tn = new V3(), _tu = new V3(), _tv = new V3(), _tc = new V3(), UPV = new V3(0, 1, 0), XV = new V3(1, 0, 0);
+function tileSet(c, m, rgba) {
+  if (c.slot < 0) { if (!tFree.length && tiles.count >= TMAX) return false; c.slot = tFree.length ? tFree.pop() : tiles.count++; tileN++; tileBorn[c.slot] = clockT; }
+  m.toArray(tiles.instanceMatrix.array, c.slot * 16); tileCol.set(rgba, c.slot * 4);
+  tLo = Math.min(tLo, c.slot); tHi = Math.max(tHi, c.slot); return true;
+}
+function tileDrop(c) {
+  if (c.slot < 0) return; _tm.makeScale(0, 0, 0).toArray(tiles.instanceMatrix.array, c.slot * 16);
+  tLo = Math.min(tLo, c.slot); tHi = Math.max(tHi, c.slot); tFree.push(c.slot); c.slot = -1; tileN--;
+  for (const id of c.ids) if (tl[id]) { tl[id] = 0; markDirty(id); }
+}
+function tilesClear() { cells.clear(); cellQ.clear(); tFree.length = 0; tiles.count = 0; tileN = 0; tLo = Infinity; tHi = -1; tl.fill(0); }
+function fitCell(c) {
+  const ids = c.ids; let n = 0, mx = 0, my = 0, mz = 0, sx = 0, sy = 0, sz = 0, cr = 0, cg = 0, cb = 0, cwt = 0;
+  for (const id of ids) { if (cnt[id] < CONF) continue; n++; mx += pos[id * 3]; my += pos[id * 3 + 1]; mz += pos[id * 3 + 2]; sx += nrm[id * 3]; sy += nrm[id * 3 + 1]; sz += nrm[id * 3 + 2];
+    const w = cw[id]; if (w > .01) { cr += col[id * 3] * w; cg += col[id * 3 + 1] * w; cb += col[id * 3 + 2] * w; cwt += w; } }
+  if (n < 20) return tileDrop(c);
+  mx /= n; my /= n; mz /= n;
+  let xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+  for (const id of ids) { if (cnt[id] < CONF) continue; const a = pos[id * 3] - mx, b = pos[id * 3 + 1] - my, d = pos[id * 3 + 2] - mz; xx += a * a; xy += a * b; xz += a * d; yy += b * b; yz += b * d; zz += d * d; }
+  const dx = yy * zz - yz * yz, dy = xx * zz - xz * xz, dz = xx * yy - xy * xy, dm = Math.max(dx, dy, dz);     // plane normal from the covariance
+  if (dm <= 1e-12) return tileDrop(c);
+  if (dm === dx) _tn.set(dx, xz * yz - xy * zz, xy * yz - xz * yy); else if (dm === dy) _tn.set(xz * yz - xy * zz, dy, xy * xz - yz * xx); else _tn.set(xy * yz - xz * yy, xy * xz - yz * xx, dz);
+  _tn.normalize(); if (_tn.x * sx + _tn.y * sy + _tn.z * sz < 0) _tn.negate();                                // face the side it was seen from
+  if (Math.abs(_tn.y) > .97) _tn.set(0, Math.sign(_tn.y), 0);                                                 // floors and tables: exactly level
+  else if (Math.abs(_tn.y) < .06) { _tn.y = 0; _tn.normalize(); }                                             // walls: exactly upright
+  if (Math.abs(_tn.y) < .7) _tu.crossVectors(UPV, _tn).normalize(); else _tu.crossVectors(_tn, XV).normalize(); _tv.crossVectors(_tn, _tu);
+  let e2 = 0, emax = 0, u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+  for (const id of ids) { if (cnt[id] < CONF) continue; const a = pos[id * 3] - mx, b = pos[id * 3 + 1] - my, d = pos[id * 3 + 2] - mz, e = Math.abs(a * _tn.x + b * _tn.y + d * _tn.z);
+    e2 += e * e; if (e > emax) emax = e; const u = a * _tu.x + b * _tu.y + d * _tu.z, v = a * _tv.x + b * _tv.y + d * _tv.z; if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v; }
+  const su = u1 - u0 + VS, sv = v1 - v0 + VS;
+  if (Math.sqrt(e2 / n) > .007 || emax > .022 || n * VS * VS < .55 * su * sv) return tileDrop(c);     // not flat, or too holey: keep the dots
+  _tc.set(mx, my, mz).addScaledVector(_tu, (u0 + u1) / 2).addScaledVector(_tv, (v0 + v1) / 2);
+  _tm.set(_tu.x * su, _tv.x * sv, _tn.x, _tc.x, _tu.y * su, _tv.y * sv, _tn.y, _tc.y, _tu.z * su, _tv.z * sv, _tn.z, _tc.z, 0, 0, 0, 1);
+  if (!tileSet(c, _tm, cwt > .5 ? [cr / cwt, cg / cwt, cb / cwt, 1] : [0, 0, 0, 0])) return;
+  for (const id of ids) { const on = cnt[id] >= CONF && Math.abs((pos[id * 3] - _tc.x) * _tn.x + (pos[id * 3 + 1] - _tc.y) * _tn.y + (pos[id * 3 + 2] - _tc.z) * _tn.z) < .016 ? 1 : 0;
+    if (tl[id] !== on) { tl[id] = on; markDirty(id); } }                      // points off the plane (a cup on a table) stay as dots
+}
+function tileSlice(ms) {
+  if (!cellQ.size) return; const t0 = performance.now(); let k = 0;
+  for (const c of cellQ) { cellQ.delete(c); fitCell(c); if ((++k & 7) === 0 && performance.now() - t0 > ms) break; }
+}
+function tileFlush() {
+  if (tHi < 0) return; const im = tiles.instanceMatrix, ic = tileGeo.attributes.iCol, ib = tileGeo.attributes.iBorn;
+  im.clearUpdateRanges(); im.addUpdateRange(tLo * 16, (tHi - tLo + 1) * 16); im.needsUpdate = true;
+  ic.clearUpdateRanges(); ic.addUpdateRange(tLo * 4, (tHi - tLo + 1) * 4); ic.needsUpdate = true;
+  ib.clearUpdateRanges(); ib.addUpdateRange(tLo, tHi - tLo + 1); ib.needsUpdate = true;
+  tLo = Infinity; tHi = -1;
 }
 
 /* ================= room layout from Space Setup: planes and the room mesh ================= */
@@ -328,7 +409,7 @@ function camFrame(vp) {
   return { data: c.data, w: 512, h: 288, f: c.f, asp: 512 / 288, cy: c.cy };
 }
 function sampleDepth(frame, ref, session, tNow) {
-  if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta || depth.wBusy) return;
+  if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
   /* the depth image trails the head slightly: integrating while you turn smears surfaces into streaks, so only take it when you're steady */
   { const m = vp.transform.matrix, q = new THREE.Quaternion().setFromRotationMatrix(new M4().fromArray(m)), pos = new V3(m[12], m[13], m[14]), mo = depth.motion || (depth.motion = { q: q.clone(), p: pos.clone(), t: tNow, spin: 0, lin: 0 });
@@ -541,7 +622,8 @@ onmessage = e => {
     zs[k] = z; if (z > .2 && z < 4.5) valid++;
   }
   const I = d.inv, X = d.xf, ND = d.nd, flip = d.flip, fpx = 2 / (d.P0 * DW), fpy = 2 / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
-  const out = new Float32Array(n * 11), cv = new Float32Array(n * 12); let np = 0, nc = 0;
+  const VS = d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
+  const vox = new Map(), car = new Map(), out = new Float32Array(n * 11); let np = 0;
   const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < .35 && y < H[1] + .25 && y > H[1] - 1.75) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < .0256) return true; } return false; };
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
     const k = y * DW + x, z = zs[k]; if (!(z > .2 && z < 4.5)) continue;
@@ -566,19 +648,26 @@ onmessage = e => {
       if (ez < -.1) { const cu = .5 + .5 * cam.f * ex / -ez, cvv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
         if (cu > 0 && cu < 1 && cvv > 0 && cvv < 1) { const pi = ((cvv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4; R = cam.data[pi] / 255; G = cam.data[pi + 1] / 255; Bl = cam.data[pi + 2] / 255; } }
     }
-    const o = np * 11; out[o] = wx; out[o + 1] = wy; out[o + 2] = wz; out[o + 3] = w; out[o + 4] = nx; out[o + 5] = ny; out[o + 6] = nz; out[o + 7] = R; out[o + 8] = G; out[o + 9] = Bl; out[o + 10] = q; np++;
+    const vk = key(wx, wy, wz); let o = vox.get(vk);                  // several pixels in one voxel: one averaged sighting
+    if (o === undefined) { o = np++ * 11; vox.set(vk, o); for (let i = 0; i < 11; i++) out[o + i] = 0; out[o + 7] = -1; }
+    out[o] += wx * w; out[o + 1] += wy * w; out[o + 2] += wz * w; out[o + 3] += w; out[o + 4] += nx * w; out[o + 5] += ny * w; out[o + 6] += nz * w;
+    if (R >= 0) { if (out[o + 7] < 0) out[o + 7] = out[o + 8] = out[o + 9] = 0; out[o + 7] += R * q; out[o + 8] += G * q; out[o + 9] += Bl * q; out[o + 10] += q; }
+    if ((x + y) & 1) continue;                                          // free-space carving on half the pixels is plenty
     for (const f of [.45, .7, .88]) { if (z - f * z < .08) continue; const ax = px * f, ay = py * f, az = pz * f;
       const cxw = X[0] * ax + X[4] * ay + X[8] * az + X[12], cyw = X[1] * ax + X[5] * ay + X[9] * az + X[13], czw = X[2] * ax + X[6] * ay + X[10] * az + X[14];
-      if (inBody(cxw, cyw, czw)) continue; const co = nc * 4; cv[co] = cxw; cv[co + 1] = cyw; cv[co + 2] = czw; cv[co + 3] = .35 * w; nc++; }
+      if (inBody(cxw, cyw, czw)) continue; const ck = key(cxw, cyw, czw), e = car.get(ck); if (e) e[3] = Math.min(.8, e[3] + .7 * w); else car.set(ck, [cxw, cyw, czw, Math.min(.8, .7 * w)]); }
   }
-  const P = out.slice(0, np * 11), C = cv.slice(0, nc * 4);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t }, [P.buffer, C.buffer]);
+  for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; out[o] /= w; out[o + 1] /= w; out[o + 2] /= w; out[o + 3] = Math.min(1.6, w);   // one frame alone can't confirm a voxel: noise needs a second look
+    if (out[o + 10] > 0) { out[o + 7] /= out[o + 10]; out[o + 8] /= out[o + 10]; out[o + 9] /= out[o + 10]; } }
+  const C = new Float32Array(car.size * 4); let nc = 0; for (const e of car.values()) { if (vox.has(key(e[0], e[1], e[2]))) continue; C.set(e, nc * 4); nc++; }   // never carve a cell this same frame saw as surface
+  const P = out.slice(0, np * 11);
+  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen }, [P.buffer, C.buffer]);
 };`;
-let integ = null;
+let integ = null; const applyQ = [];
 function integWorker() {
   if (integ) return integ;
   integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-  integ.onmessage = e => { try { applyIntegration(e.data); } catch (err) { scanErr = (err.message || String(err)).slice(0, 60); } depth.wBusy = false; };
+  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
   integ.onerror = ev => { depth.wBusy = false; depth.noWorker = true; scanErr = 'worker: ' + (ev.message || 'failed'); };
   return integ;
 }
@@ -587,29 +676,36 @@ function postIntegration(M) {                                       // hand a de
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
   if (M.cam && M.cam.data) { cam = { data: M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cy: M.cam.cy }; colorCam.data = null; colorCam.t = 0; }   // hand the frame over; grab a fresh one next time
-  const msg = { DW, DH, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
+  const msg = { DW, DH, VS, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow };
   depth.wBusy = true; depth.postT = performance.now();
   integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.data.buffer] : []));
 }
 const _camW = new V3();
-function applyIntegration(d) {
-  const t0 = performance.now(), P = d.P, C = d.C, chk = metaSurf.n > 3000; let hit = 0, tot = 0;
-  _camW.set(d.cam[0], d.cam[1], d.cam[2]);
-  for (let i = 0; i < d.np; i++) {
-    const o = i * 11, id = addSighting(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], _camW, 0, P[o + 4], P[o + 5], P[o + 6]);
-    if (id >= 0 && P[o + 7] >= 0) tint(id, P[o + 7], P[o + 8], P[o + 9], P[o + 10]);
-    if (chk && i % 9 === 0) { tot++; if (metaHas(P[o], P[o + 1], P[o + 2])) hit++; }
+function applyIntegration(budget) {                                // spread each depth frame over several display frames: never a dropped frame
+  const t0 = performance.now(), end = t0 + budget;
+  while (applyQ.length) {
+    const d = applyQ[0], P = d.P, C = d.C, chk = metaSurf.n > 3000, gen = depth.gen || 0, ts = performance.now();
+    _camW.set(d.cam[0], d.cam[1], d.cam[2]);
+    while (d.i < d.np) {
+      const o = d.i * 11, id = addSighting(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], _camW, 0, P[o + 4], P[o + 5], P[o + 6]);
+      if (id >= 0 && P[o + 7] >= 0) tint(id, P[o + 7], P[o + 8], P[o + 9], P[o + 10]);
+      if (chk && d.i % 7 === 0) { d.tot++; if (metaHas(P[o], P[o + 1], P[o + 2])) d.hit++; }
+      if ((++d.i & 255) === 0 && performance.now() > end) break;
+    }
+    while (d.i >= d.np && d.j < d.nc) { const o = d.j * 4; carve(C[o], C[o + 1], C[o + 2], C[o + 3]); if ((++d.j & 511) === 0 && performance.now() > end) break; }
+    d.ms += performance.now() - ts;
+    if (d.i < d.np || d.j < d.nc) return;                             // out of time: carry on next frame
+    applyQ.shift();
+    if (chk && d.tot > 40 && gen === (depth.gen || 0)) {              // keep checking against the Meta scan; recalibrate if it drifts
+      const a = d.hit / d.tot; depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
+      if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; }
+    }
+    depth.ms = depth.ms ? depth.ms * .8 + d.ms * .2 : d.ms;
+    depth.status = 'LIVE · ' + d.np + ' vox · ' + d.valid + ' px · ' + depth.ms.toFixed(1) + ' ms · worker ' + (depth.lat || 0).toFixed(0) + ' ms' + (DR.isInt ? ' · int' : '');
+    if (performance.now() > end) return;
   }
-  for (let i = 0; i < d.nc; i++) { const o = i * 4; carve(C[o], C[o + 1], C[o + 2], C[o + 3]); }
-  if (chk && tot > 40) {                                            // keep checking against the Meta scan; recalibrate if it drifts
-    const a = hit / tot; depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
-    if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); }
-  }
-  const ms = performance.now() - t0, lat = performance.now() - depth.postT; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
-  depth.rate = Math.max(.03, depth.ms * 4 / 1000);                  // main-thread share stays under ~25%
-  depth.status = 'LIVE · ' + d.np + ' pts · ' + d.valid + ' px · ' + depth.ms.toFixed(1) + ' ms · worker ' + lat.toFixed(0) + ' ms' + (DR.isInt ? ' · int' : '');
 }
 function metaHas(x, y, z) {
   const ix = Math.floor(x / MG), iy = Math.floor(y / MG), iz = Math.floor(z / MG), S = metaSurf.set;
@@ -626,7 +722,7 @@ function cleanSlice(budget) {
     const ix = Math.floor(pos[id * 3] / VS), iy = Math.floor(pos[id * 3 + 1] / VS), iz = Math.floor(pos[id * 3 + 2] / VS);
     let lonely = true;
     for (const [a, b, c] of NB6) { const j = vmap.get(keyOf(ix + a, iy + b, iz + c)); if (j !== undefined && cnt[j] >= 1) { lonely = false; break; } }
-    if (lonely) { cnt[id] = 0; confirmed--; markDirty(id); cleaned++; }
+    if (lonely) { cnt[id] = 0; confirmed--; markDirty(id); cleaned++; cellDirty(ix, iy, iz); }
   }
   cleanAt = end >= N ? 0 : end;
 }
@@ -635,7 +731,7 @@ function cleanSlice(budget) {
 const cov = { idx: new Map(), n: 0, covered: 0, flags: null, geo: null, pts: null, dirty: false };
 const covMat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false, uniforms: { time: { value: 0 } },
   vertexShader: `attribute float done; uniform float time; varying float a; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv; a = (1.0 - done) * step(.4, -mv.z); gl_PointSize = a * clamp(900.0 * .03 / -mv.z, 1.5, 4.0); }`,
-  fragmentShader: `uniform float time; varying float a; void main(){ if (a < .5) discard; vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; gl_FragColor = vec4(.78, .92, 1.0, .22 + .12 * sin(time * 3.0)); }` });
+  fragmentShader: `uniform float time; varying float a; void main(){ if (a < .5) discard; vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; gl_FragColor = vec4(.78, .92, 1.0, .15 + .06 * sin(time * 1.6)); }` });
 function covRebuild() {
   if (cov.pts) { scene.remove(cov.pts); cov.geo.dispose(); }
   const keys = [...metaSurf.set], P = new Float32Array(keys.length * 3); cov.idx = new Map(); cov.flags = new Float32Array(keys.length);
@@ -1082,10 +1178,19 @@ const area = () => confirmed * VS * VS;
 const hud = (() => {
   const c = document.createElement('canvas'); c.width = 768; c.height = 128; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.36, .06), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false, depthWrite: false }));
-  mesh.renderOrder = 60; mesh.position.set(0, -.2, -.75); mesh.rotation.x = .25; camera.add(mesh); mesh.visible = false;
-  return { c, g: c.getContext('2d'), t, mesh, key: '' };
+  mesh.renderOrder = 60; scene.add(mesh); mesh.visible = false;
+  return { c, g: c.getContext('2d'), t, mesh, key: '', moving: true, want: new V3(), eye: new V3() };
 })();
 function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+function followHud(dt) {                                         // trails your gaze gently and settles, so it never swims with your head
+  const xc = renderer.xr.getCamera(); xc.getWorldPosition(hud.eye); hud.want.set(0, -.22, -.8).applyQuaternion(xc.getWorldQuaternion(_hq)).add(hud.eye);
+  const off = hud.mesh.position.distanceTo(hud.want);
+  if (off > .25 || !hud.placed) hud.moving = true; else if (off < .03) hud.moving = false;
+  if (!hud.placed) { hud.mesh.position.copy(hud.want); hud.placed = true; }
+  if (hud.moving) hud.mesh.position.lerp(hud.want, 1 - Math.exp(-dt * 5));
+  hud.mesh.lookAt(hud.eye);
+}
+const _hq = new THREE.Quaternion();
 function drawHud() {
   const ph = scanPhase(), show = toastT > 0 ? toastMsg : ph.sub, key = ph.title + show + (ph.p == null ? '' : Math.round(ph.p * 200));
   if (key === hud.key) return; hud.key = key;
@@ -1099,7 +1204,9 @@ function drawHud() {
   hud.t.needsUpdate = true;
 }
 function drawPanel() {
-  const g = panel.g, W = 640, H = 800, ph = scanPhase(); g.clearRect(0, 0, W, H);
+  const g = panel.g, W = 640, H = 800, ph = scanPhase();
+  const key = [page, panel.hover, ph.title, ph.sub, ph.p == null ? -1 : Math.round(ph.p * 100), confirmed >> 11, kf.n, lastSave ? Math.round((Date.now() - lastSave) / 5000) : 0, toastT > 0 ? toastMsg : '', scanErr, BTN().map(b => b.label).join(), page ? Math.floor(clockT) : 0].join('|');
+  if (key === panel.key) return; panel.key = key; g.clearRect(0, 0, W, H);
   rr(g, 2, 2, W - 4, H - 4, 34); g.fillStyle = 'rgba(16,18,22,.94)'; g.fill();
   g.font = '600 34px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(ph.title, 32, 62);
   g.font = '23px system-ui, sans-serif'; g.fillStyle = '#b9c6cc'; g.fillText(ph.sub.slice(0, 44), 32, 98);
@@ -1119,7 +1226,7 @@ function drawPanel() {
       'depth   ' + (depth.steady === false ? 'paused: turning' : depth.status),
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · ' + planes.size + ' planes · cover ' + cov.covered + '/' + cov.n,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
-      'clean   ' + cleaned.toLocaleString() + ' strays removed · fps ' + Math.round(fps),
+      'clean   ' + cleaned.toLocaleString() + ' strays removed · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
       'camera  ' + colorCam.status,
       ...understandingLines(understanding).slice(0, 2).map(l => 'rooms   ' + l.slice(0, 44)),
       ...(scanErr ? ['ERROR   ' + scanErr] : [])
@@ -1144,7 +1251,7 @@ async function press(id, frame) {
   if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
-  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; }
+  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; }
   if (id === 'recal') { depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
@@ -1165,7 +1272,7 @@ for (const i of [0, 1]) {
     c.userData.hand = ev.data.handedness;
     c.userData.src = ev.data; if (ev.data.handedness === 'left') grip.add(panel.mesh); else { rightCtl.c = c; c.add(laser); }
   });
-  c.addEventListener('selectstart', () => { if (c.userData.hand !== 'left' && panel.hover >= 0) { buzz(c.userData.src, .5, 30); press(panel.buttons[panel.hover].id, lastFrame).then(drawPanel); } });
+  c.addEventListener('selectstart', () => { if (c.userData.hand !== 'left' && panel.hover >= 0) { buzz(c.userData.src, .5, 30); press(panel.buttons[panel.hover].id, lastFrame).catch(e => toast('Error: ' + e.message)).then(drawPanel); } });
 }
 function updatePointer() {
   panel.hover = -1; if (!rightCtl.c || !panel.mesh.parent) return;
@@ -1295,10 +1402,15 @@ renderer.setAnimationLoop((t, frame) => {
     }
     if (depth.meta && depthReady()) {
       const M = depth.meta;
-      if (!M.cpu && !depth.noWorker && depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15 && !depth.wBusy) { depth.meta = null; postIntegration(M); }
-      else integrateDepth();
+      if (!M.cpu && !depth.noWorker && depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15) {
+        if (depth.wBusy && performance.now() - depth.postT > 1500) depth.wBusy = false;   // worker stalled: drop that frame
+        if (!depth.wBusy && applyQ.length < 2) { depth.meta = null; postIntegration(M); }   // otherwise this frame waits, already captured
+      } else integrateDepth();
     }
-    if (scanning && N) cleanSlice(6000);
+    applyIntegration(fps < 65 ? 1.5 : 3);
+    tileSlice(fps < 65 ? .8 : 1.6); tileFlush();
+    tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
+    if (scanning && N) cleanSlice(4000);
     if (cov.dirty && cov.geo && Math.floor(clockT * 3) !== Math.floor((clockT - dt) * 3)) { cov.geo.attributes.done.needsUpdate = true; cov.dirty = false; }
     covMat.uniforms.time.value = clockT; if (cov.pts) cov.pts.visible = scanning && !replayMode && useMeta && depth.cal && depth.cal.locked;
     if (clockT - depth.lastT > depth.rate || depth.steady === false) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
@@ -1309,9 +1421,10 @@ renderer.setAnimationLoop((t, frame) => {
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
-    hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible && Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud();
+    hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
+    tileSlice(4); tileFlush(); tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
   }
