@@ -193,6 +193,9 @@ const depthBuf = new Uint8Array(DW * DH * 4);
 /* Reads the headset's depth texture with plain WebGL (no three.js texture tricks): a tiny shader samples it into
    an 8-bit RGBA target that every GPU can render to and read back. Normalised depth is packed into 24 bits;
    values already in metres are flagged and scaled; luminance-alpha (millimetre) depth is passed through. */
+/* after raw GL work, three.js must be told its state is unknown, but the reset also forgets the headset's
+   render target: put it back, or the whole view is drawn off-screen (a black headset) */
+function glBack() { const rt = renderer.getRenderTarget(); renderer.resetState(); renderer.setRenderTarget(rt); }
 const DR = { gl: null, prog: null, fbo: null, tex: null, vbo: null, u: {} };
 function depthReaderInit(gl) {
   const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
@@ -226,7 +229,7 @@ function depthReady() {                                    // true once the back
   if (st !== gl.ALREADY_SIGNALED && st !== gl.CONDITION_SATISFIED) return false;
   gl.deleteSync(DR.sync); DR.sync = null;
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, depthBuf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  renderer.resetState(); return true;
+  glBack(); return true;
 }
 function readDepth(info, isArr, layer, lumA, jx, jy) {
   const gl = renderer.getContext();
@@ -246,7 +249,7 @@ function readDepth(info, isArr, layer, lumA, jx, jy) {
   DR.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); gl.flush();             // the GPU copies it out in the background
   gl.disableVertexAttribArray(loc);
   gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
-  renderer.resetState();                                  // hand GL back to three.js in a known state
+  glBack();                                               // hand GL back to three.js, keeping the headset's target
 }
 const depth = { vi: 0, frames: 0, head: new V3(), vinv: new M4(), cam: new V3(), binding: null, status: 'off', flipY: false, lastT: 0, rate: .08, zs: new Float32Array(DW * DH) };
 const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4(), _c = new V3();
@@ -295,7 +298,7 @@ function sampleDepth(frame, ref, session, tNow) {
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
-  try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy); } catch (e) { depth.status = 'read failed: ' + e.message; renderer.resetState(); return; }
+  try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
   depth.meta = {
     isArr, lumA, jx, jy, tNow, fmt: session.depthDataFormat,
@@ -778,6 +781,7 @@ function drawPanel() {
     'Meta layout     ' + (useMeta ? '' : '(off) ') + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
     'depth           ' + depth.status,
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
+    ...(scanErr ? ['ERROR ' + scanErr] : []),
     'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps),
     'photos          ' + kf.n + ' keyframes' + (colorCam.on ? (replayMode ? '' : ' · recording while you scan') : ' · turn camera colour on to record')
   ];
@@ -856,7 +860,7 @@ $('bAR').addEventListener('click', async () => {
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
 });
-let pendingOpen = null, askedRoom = true, useMeta = false;
+let pendingOpen = null, askedRoom = true, useMeta = false, scanErr = '';
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
@@ -922,6 +926,7 @@ renderer.setAnimationLoop((t, frame) => {
   const dt = Math.min(.1, clock.getDelta()); clockT += dt; pmat.uniforms.time.value = clockT;
   fpsAcc += dt; fpsN++; if (fpsAcc > .5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
   if (frame) {
+    try {
     lastFrame = frame;
     if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
@@ -941,6 +946,7 @@ renderer.setAnimationLoop((t, frame) => {
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
+    } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
