@@ -850,9 +850,13 @@ const bk3 = (i, j, k) => ((i + 8192) * 16384 + (j + 8192)) * 16384 + (k + 8192);
 const unbk = k => { const z = k % 16384 - 8192, r = (k - (z + 8192)) / 16384, y = r % 16384 - 8192, x = (r - (y + 8192)) / 16384 - 8192; return [x, y, z]; };
 function tBlock(bi, bj, bk, make) {
   const k = bk3(bi, bj, bk); let b = TB.get(k);
-  if (!b && make) { b = { i: bi, j: bj, k: bk, d: new Float32Array(B3).fill(1), w: new Float32Array(B3), c: new Float32Array(B3 * 3), cw: new Float32Array(B3) }; TB.set(k, b);
+  if (!b && make) { b = { i: bi, j: bj, k: bk, t: 0, d: new Int16Array(B3).fill(32767), w: new Uint8Array(B3), c: new Uint16Array(B3 * 3), cw: new Uint8Array(B3) }; TB.set(k, b);
     const rk = bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)); let s = TREG.get(rk); if (!s) TREG.set(rk, s = new Set()); s.add(k); }
   return b;
+}
+function tsdfPrune(now) {                                          // free-space-only blocks carry no surface: drop them to keep whole-house scans small
+  for (const [k, b] of TB) { if (now - b.t < 4000) continue; let surf = false; for (let v = 0; v < B3; v++) if (b.w[v] && b.d[v] < 32000) { surf = true; break; }
+    if (surf) continue; TB.delete(k); const rk = bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), set = TREG.get(rk); if (set) set.delete(k); tDirty.set(rk, now); }
 }
 function tsdfIntegrate(c) {
   const X = c.X, OX = X[12], OY = X[13], OZ = X[14], R = c.rays, nr = c.nr, touched = new Set(), step = BS * TV * .9, now = c.now;
@@ -873,17 +877,19 @@ function tsdfIntegrate(c) {
       const xi = Math.round(((u - R0[0]) / R0[2] - c.jx) * DW - .5), yi = Math.round(((w2 - R0[1]) / R0[3] - c.jy) * DH - .5); if (xi < 1 || yi < 1 || xi > DW - 2 || yi > DH - 2) continue;
       const zm = zf[yi * DW + xi]; if (!(zm > .2 && zm < 4.5)) continue;
       const sdf = zm - zv; if (sdf < -MU) continue;
-      const t = sdf > MU ? 1 : sdf / MU, w0 = b.w[v]; let wn = Math.max(.2, 1 - zv / 4.6) * wm;
-      if (t === 1 && b.d[v] < .5) wn = Math.max(wn, w0 * .45);                // seen straight through something stored: it moved, forget it fast
-      b.d[v] = (b.d[v] * w0 + t * wn) / (w0 + wn); b.w[v] = Math.min(WMAX, w0 + wn); changed = true;
+      const t = sdf > MU ? 1 : sdf / MU, w0 = b.w[v] / 8, d0 = b.d[v] / 32767; let wn = Math.max(.2, 1 - zv / 4.6) * wm;
+      if (t === 1 && d0 < .5) wn = Math.max(wn, w0 * .45);                  // seen straight through something stored: it moved, forget it fast
+      b.d[v] = Math.round((d0 * w0 + t * wn) / (w0 + wn) * 32767); b.w[v] = Math.max(1, Math.min(WMAX * 8, Math.round((w0 + wn) * 8))); changed = true;
       if (cam && sdf < MU * .5) {                                   // colour from the camera, for voxels right at the surface
         const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
         if (ez < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * ex / -ez, cv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
           if (cu > .01 && cu < .99 && cv > .01 && cv < .99) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, a = cu * 2 - 1, bb = cv * 2 - 1, q = wn * (1 - .75 * Math.min(1, (a * a + bb * bb) * .5)) * (1 - Math.abs(sdf) / MU);
-            const cw0 = b.cw[v], k2 = cw0 + q; if (k2 > 0) { const g = c.gain || 1; b.c[v * 3] += (Math.min(1, cam.data[pi] / 255 * g) - b.c[v * 3]) * q / k2; b.c[v * 3 + 1] += (Math.min(1, cam.data[pi + 1] / 255 * g) - b.c[v * 3 + 1]) * q / k2; b.c[v * 3 + 2] += (Math.min(1, cam.data[pi + 2] / 255 * g) - b.c[v * 3 + 2]) * q / k2; b.cw[v] = Math.min(30, k2); } } }
+            const cw0 = b.cw[v] / 8, k2 = cw0 + q; if (k2 > 0) { const g = c.gain || 1, a2 = q / k2;
+              for (let ch = 0; ch < 3; ch++) { const cur = b.c[v * 3 + ch] / 65535; b.c[v * 3 + ch] = Math.round((cur + (Math.min(1, cam.data[pi + ch] / 255 * g) - cur) * a2) * 65535); }
+              b.cw[v] = Math.min(240, Math.max(1, Math.round(k2 * 8))); } } }
       }
     }
-    if (changed) tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), now);
+    b.t = now; if (changed) tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), now);
   }
   return touched.size;
 }
@@ -908,7 +914,7 @@ function meshRegions(rks, zones, floorY) {
         const gx = dd[1] + dd[3] + dd[5] + dd[7] - dd[0] - dd[2] - dd[4] - dd[6], gy = dd[2] + dd[3] + dd[6] + dd[7] - dd[0] - dd[1] - dd[4] - dd[5], gz = dd[4] + dd[5] + dd[6] + dd[7] - dd[0] - dd[1] - dd[2] - dd[3], gl = Math.hypot(gx, gy, gz) || 1;
         VN.push(gx / gl, gy / gl, gz / gl);
         let r = 0, g = 0, bl = 0, cw = 0; for (let o = 0; o < 8; o++) { const B = bs[o], v = vs[o], w = B.cw[v]; if (w > 0) { r += B.c[v * 3] * w; g += B.c[v * 3 + 1] * w; bl += B.c[v * 3 + 2] * w; cw += w; } }
-        if (cw > .05) VC.push(r / cw, g / cw, bl / cw); else { const h = Math.max(0, Math.min(1, (y - floorY) / 2.7)); VC.push((160 + 40 * h) / 255, (130 + 85 * h) / 255, (100 + 130 * h) / 255); }
+        if (cw > 0) VC.push(r / cw / 65535, g / cw / 65535, bl / cw / 65535); else { const h = Math.max(0, Math.min(1, (y - floorY) / 2.7)); VC.push((160 + 40 * h) / 255, (130 + 85 * h) / 255, (100 + 130 * h) / 255); }
       }
     }
     memo.set(key, id); return id;
@@ -928,20 +934,21 @@ function meshRegions(rks, zones, floorY) {
 }
 function tsdfPack() {
   const n = TB.size, keys = new Float64Array(n), d = new Int8Array(n * B3), w = new Uint8Array(n * B3), c = new Uint8Array(n * B3 * 3); let i = 0;
-  for (const [k, b] of TB) { keys[i] = k; for (let v = 0; v < B3; v++) { const o = i * B3 + v; d[o] = Math.round(Math.max(-1, Math.min(1, b.d[v])) * 127); w[o] = Math.min(255, Math.round(b.w[v] * 6)); c[o * 3] = b.c[v * 3] * 255; c[o * 3 + 1] = b.c[v * 3 + 1] * 255; c[o * 3 + 2] = b.c[v * 3 + 2] * 255; } i++; }
-  return { vs: TV, bs: BS, mu: MU, keys, d, w, c };
+  for (const [k, b] of TB) { keys[i] = k; for (let v = 0; v < B3; v++) { const o = i * B3 + v; d[o] = Math.round(b.d[v] / 32767 * 127); w[o] = b.w[v]; c[o * 3] = b.c[v * 3] >> 8; c[o * 3 + 1] = b.c[v * 3 + 1] >> 8; c[o * 3 + 2] = b.c[v * 3 + 2] >> 8; } i++; }
+  return { vs: TV, bs: BS, mu: MU, wscale: 8, keys, d, w, c };
 }
 function tsdfUnpack(t, Tm) {                                        // load a saved TSDF; with a transform, resample voxel by voxel into this frame
+  const ws = 8 / (t.wscale || 6);
   const ident = !Tm || Tm.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6);
   for (let i = 0; i < t.keys.length; i++) {
     const [bi, bj, bk] = unbk(t.keys[i]);
-    if (ident) { const b = tBlock(bi, bj, bk, true); for (let v = 0; v < B3; v++) { const o = i * B3 + v; b.d[v] = t.d[o] / 127; b.w[v] = t.w[o] / 6; b.c[v * 3] = t.c[o * 3] / 255; b.c[v * 3 + 1] = t.c[o * 3 + 1] / 255; b.c[v * 3 + 2] = t.c[o * 3 + 2] / 255; b.cw[v] = t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0 ? 3 : 0; }
+    if (ident) { const b = tBlock(bi, bj, bk, true); for (let v = 0; v < B3; v++) { const o = i * B3 + v; b.d[v] = Math.round(t.d[o] / 127 * 32767); b.w[v] = Math.min(255, Math.round(t.w[o] * ws)); b.c[v * 3] = t.c[o * 3] * 257; b.c[v * 3 + 1] = t.c[o * 3 + 1] * 257; b.c[v * 3 + 2] = t.c[o * 3 + 2] * 257; b.cw[v] = t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0 ? 24 : 0; }
       tDirty.set(bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)), 0); continue; }
     for (let v = 0; v < B3; v++) { const o = i * B3 + v; if (!t.w[o]) continue;
       const x = (bi * BS + (v & 7) + .5) * TV, y = (bj * BS + ((v >> 3) & 7) + .5) * TV, z = (bk * BS + (v >> 6) + .5) * TV;
       const X = Tm[0] * x + Tm[4] * y + Tm[8] * z + Tm[12], Y = Tm[1] * x + Tm[5] * y + Tm[9] * z + Tm[13], Z = Tm[2] * x + Tm[6] * y + Tm[10] * z + Tm[14];
       const gi = Math.floor(X / TV), gj = Math.floor(Y / TV), gk = Math.floor(Z / TV), b = tBlock(Math.floor(gi / BS), Math.floor(gj / BS), Math.floor(gk / BS), true), u = (gi - b.i * BS) + (gj - b.j * BS) * BS + (gk - b.k * BS) * BS * BS;
-      if (t.w[o] / 6 > b.w[u]) { b.d[u] = t.d[o] / 127; b.w[u] = t.w[o] / 6; b.c[u * 3] = t.c[o * 3] / 255; b.c[u * 3 + 1] = t.c[o * 3 + 1] / 255; b.c[u * 3 + 2] = t.c[o * 3 + 2] / 255; b.cw[u] = 3; }
+      if (t.w[o] * ws > b.w[u]) { b.d[u] = Math.round(t.d[o] / 127 * 32767); b.w[u] = Math.min(255, Math.round(t.w[o] * ws)); b.c[u * 3] = t.c[o * 3] * 257; b.c[u * 3 + 1] = t.c[o * 3 + 1] * 257; b.c[u * 3 + 2] = t.c[o * 3 + 2] * 257; b.cw[u] = 24; }
       tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), 0); }
   }
 }
@@ -957,7 +964,7 @@ function tsdfSample(x, y, z, out) {                               // trilinear d
   const u = x / TV - .5, v = y / TV - .5, w = z / TV - .5, i0 = Math.floor(u), j0 = Math.floor(v), k0 = Math.floor(w), fx = u - i0, fy = v - j0, fz = w - k0;
   const D = [0, 0, 0, 0, 0, 0, 0, 0];
   for (let o = 0; o < 8; o++) { const i = i0 + (o & 1), j = j0 + ((o >> 1) & 1), k = k0 + (o >> 2), bi = Math.floor(i / BS), bj = Math.floor(j / BS), bk = Math.floor(k / BS), b = TB.get(bk3(bi, bj, bk)); if (!b) return null;
-    const vi = (i - bi * BS) + (j - bj * BS) * BS + (k - bk * BS) * BS * BS; if (b.w[vi] < .5) return null; D[o] = b.d[vi] * MU; }
+    const vi = (i - bi * BS) + (j - bj * BS) * BS + (k - bk * BS) * BS * BS; if (b.w[vi] < 4) return null; D[o] = b.d[vi] / 32767 * MU; }
   const c00 = D[0] + (D[1] - D[0]) * fx, c10 = D[2] + (D[3] - D[2]) * fx, c01 = D[4] + (D[5] - D[4]) * fx, c11 = D[6] + (D[7] - D[6]) * fx, c0 = c00 + (c10 - c00) * fy, c1 = c01 + (c11 - c01) * fy;
   out[0] = c0 + (c1 - c0) * fz;
   out[1] = ((D[1] - D[0]) * (1 - fy) * (1 - fz) + (D[3] - D[2]) * fy * (1 - fz) + (D[5] - D[4]) * (1 - fy) * fz + (D[7] - D[6]) * fy * fz) / TV;
@@ -1014,6 +1021,16 @@ function icp(pts, X0, iters, maxT, maxR) {
   }
   const dt = Math.hypot(X[12] - X0[12], X[13] - X0[13], X[14] - X0[14]), dr = Math.acos(Math.min(1, (X[0] * X0[0] + X[1] * X0[1] + X[2] * X0[2] + X[4] * X0[4] + X[5] * X0[5] + X[6] * X0[6] + X[8] * X0[8] + X[9] * X0[9] + X[10] * X0[10] - 1) / 2));
   return { X, ok: used >= 150 && rms < .012 && ratio > 2e-4 && dt < maxT && dr < maxR, used, rms, ratio, dt, dr };
+}
+let relocT = 0;
+function reloc(pts, X) {                                          // coarse search of shifts up to ±12 cm: which one puts the most points on the surface?
+  const n = Math.min(pts.length / 3, 300), s = [0, 0, 0, 0], step = Math.max(1, Math.floor(pts.length / 3 / n));
+  const W = []; for (let q = 0; q < pts.length / 3; q += step) { const a = pts[q * 3], b = pts[q * 3 + 1], c = pts[q * 3 + 2]; W.push(X[0] * a + X[4] * b + X[8] * c + X[12], X[1] * a + X[5] * b + X[9] * c + X[13], X[2] * a + X[6] * b + X[10] * c + X[14]); }
+  const score = (dx, dy, dz) => { let sc = 0; for (let q = 0; q < W.length; q += 3) if (tsdfSample(W[q] + dx, W[q + 1] + dy, W[q + 2] + dz, s)) sc += Math.max(0, 1 - Math.abs(s[0]) / MU); return sc; };
+  const base = score(0, 0, 0); let best = base, bx = 0, by = 0, bz = 0;
+  for (let dx = -.12; dx <= .121; dx += .04) for (let dy = -.12; dy <= .121; dy += .04) for (let dz = -.12; dz <= .121; dz += .04) { const sc = score(dx, dy, dz); if (sc > best) { best = sc; bx = dx; by = dy; bz = dz; } }
+  if (best < base * 1.3 + 5) return null;
+  const Y = X.slice(); Y[12] += bx; Y[13] += by; Y[14] += bz; return Y;
 }
 const mul4 = (A, B) => { const C = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) C[c * 4 + r] = A[r] * B[c * 4] + A[4 + r] * B[c * 4 + 1] + A[8 + r] * B[c * 4 + 2] + A[12 + r] * B[c * 4 + 3]; return C; };
 const inv4r = X => { const R = [X[0], X[4], X[8], 0, X[1], X[5], X[9], 0, X[2], X[6], X[10], 0, 0, 0, 0, 1]; R[12] = -(R[0] * X[12] + R[4] * X[13] + R[8] * X[14]); R[13] = -(R[1] * X[12] + R[5] * X[13] + R[9] * X[14]); R[14] = -(R[2] * X[12] + R[6] * X[13] + R[10] * X[14]); return R; };
@@ -1087,6 +1104,7 @@ onmessage = e => {
   if (!F && d.tsdf && d.icp && TB.size > 150) {                     // align to the surface fused so far: removes drift and leftover lag
     const t0 = performance.now(), r = icp(camPoints(zf, { I, ND, R0, DW, DH, jx: d.jx, jy: d.jy, flip }, 4), X, 6, .04, .035);
     track = { ok: r.ok, used: r.used, rms: r.rms, ratio: r.ratio, dt: r.dt, ms: performance.now() - t0 }; if (r.ok) X = r.X;
+    else if (r.used >= 150 && t0 - (relocT || 0) > 800) { relocT = t0; const rl = reloc(camPoints(zf, { I, ND, R0, DW, DH, jx: d.jx, jy: d.jy, flip }, 6), X); if (rl) { const r2 = icp(camPoints(zf, { I, ND, R0, DW, DH, jx: d.jx, jy: d.jy, flip }, 4), rl, 8, .2, .06); if (r2.ok) { X = r2.X; track.ok = true; track.reloc = r2.dt; } } }
   }
   const VS = F ? d.VSF : d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
   const vox = new Map(), car = new Map(), out = new Float32Array(n * 11), rays = new Float32Array(n); let np = 0, nr = 0; FR++; const fo = FR % 2, go = ((FR / 2) | 0) % 2;
@@ -1159,6 +1177,7 @@ onmessage = e => {
   if (!F && d.tsdf && d.PRJ) {
     const t0 = performance.now(), now = t0;
     tsdfBlocks = tsdfIntegrate({ X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
+    if (now - (tsdfPrune.t || 0) > 5000) { tsdfPrune.t = now; tsdfPrune(now); }
     const due = []; for (const [rk, t] of tDirty) if (now - (tMeshed.get(rk) || -1e9) > 600) due.push(rk);
     due.sort((a, b) => tDirty.get(b) - tDirty.get(a)); const pick = due.slice(0, 3);
     if (pick.length) { meshes = meshRegions(pick, d.zones || [], d.floorY || 0); for (const rk of pick) { tMeshed.set(rk, now); tDirty.delete(rk); } }
@@ -1427,7 +1446,7 @@ function exportJSON(rec) {
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
     layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null,
-    tsdf: rec.tsdf ? { vs: rec.tsdf.vs, bs: rec.tsdf.bs, mu: rec.tsdf.mu, keys: b64(rec.tsdf.keys), d: b64(rec.tsdf.d), w: b64(rec.tsdf.w), c: b64(rec.tsdf.c) } : null,
+    tsdf: rec.tsdf ? { vs: rec.tsdf.vs, bs: rec.tsdf.bs, mu: rec.tsdf.mu, wscale: rec.tsdf.wscale || 6, keys: b64(rec.tsdf.keys), d: b64(rec.tsdf.d), w: b64(rec.tsdf.w), c: b64(rec.tsdf.c) } : null,
     fineVoxel: rec.fineVoxel || null, zones: rec.zones || null, fpoints: rec.fpoints ? b64(rec.fpoints) : null, fcolors: rec.fcolors ? b64(rec.fcolors) : null, fnormals: rec.fnormals ? b64(rec.fnormals) : null, fcounts: rec.fcounts ? b64(rec.fcounts) : null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
@@ -1522,7 +1541,7 @@ async function exportGLBraw(rec) {
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
 }
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, tsdf: o.tsdf ? { vs: o.tsdf.vs, bs: o.tsdf.bs, mu: o.tsdf.mu, keys: unb64(o.tsdf.keys, Float64Array), d: unb64(o.tsdf.d, Int8Array), w: unb64(o.tsdf.w, Uint8Array), c: unb64(o.tsdf.c, Uint8Array) } : null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, tsdf: o.tsdf ? { vs: o.tsdf.vs, bs: o.tsdf.bs, mu: o.tsdf.mu, wscale: o.tsdf.wscale || 6, keys: unb64(o.tsdf.keys, Float64Array), d: unb64(o.tsdf.d, Int8Array), w: unb64(o.tsdf.w, Uint8Array), c: unb64(o.tsdf.c, Uint8Array) } : null,
     fineVoxel: o.fineVoxel || null, zones: o.zones || null, fpoints: o.fpoints ? unb64(o.fpoints, Float32Array) : null, fcolors: o.fcolors ? unb64(o.fcolors, Uint8Array) : null, fnormals: o.fnormals ? unb64(o.fnormals, Int8Array) : null, fcounts: o.fcounts ? unb64(o.fcounts, Uint16Array) : null,
     layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
