@@ -96,7 +96,7 @@ function addSighting(x, y, z, t, w = 1, cam = null, mask = 0, nx = 0, ny = 0, nz
   if (nx || ny || nz) { nrm[id * 3] += nx * w; nrm[id * 3 + 1] += ny * w; nrm[id * 3 + 2] += nz * w; }
   if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
   if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
-  const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
+  const before = cnt[id]; cnt[id] = Math.min(60, before + w);                     // capped so a point that's gone can be outvoted quickly
   if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]); cellDirty(ix, iy, iz); }
   else if (before < 12 && cnt[id] >= 12) cellDirty(ix, iy, iz);          // settled: refit its tile
   markDirty(id);
@@ -109,11 +109,21 @@ function carve(x, y, z, amt) {                             // seen *through*: th
   if (before >= CONF && cnt[id] < CONF) { confirmed--; cellDirty(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)); }
   markDirty(id);
 }
+function carveSeen(x, y, z, dx, dy, dz) {                 // a sight-line went straight through this point: it has moved or was never there
+  const id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)));
+  if (id === undefined || cnt[id] <= 0) return;
+  const nx = nrm[id * 3], ny = nrm[id * 3 + 1], nz = nrm[id * 3 + 2], nl = Math.hypot(nx, ny, nz);
+  const facing = nl > 1e-6 ? Math.abs(nx * dx + ny * dy + nz * dz) / nl : 1;          // a ray skimming along a wall says little; one aimed at the surface says a lot
+  const before = cnt[id]; cnt[id] = Math.max(0, facing > .6 ? Math.min(before, 12) * .2 - .5 : facing > .35 ? Math.min(before, 12) * .5 - .6 : before - .3);   // seen straight through: gone at once
+  if (before >= CONF && cnt[id] < CONF) { confirmed--; cellDirty(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)); }
+  markDirty(id); erased++;
+}
+let erased = 0;
 function tint(id, r, g, b, w) {                            // running average of camera colour
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -431,9 +441,16 @@ function maybeKeyframe(vp, tNow) {
   if (kf.has && p.distanceTo(kf.pos) < .22 && q.angleTo(kf.q) < .21) return;      // nothing new in view since the last keyframe
   if (!currentId) currentId = 'scan-' + Date.now();
   const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
+  /* motion blur kills Gaussian splats: score sharpness (variance of the Laplacian on a small copy), keep only frames near the best seen */
+  const sg = kf.sg || (kf.sg = Object.assign(document.createElement('canvas'), { width: 160, height: 120 }).getContext('2d', { willReadFrequently: true }));
+  sg.drawImage(v, 0, 0, 160, 120); const px = sg.getImageData(0, 0, 160, 120).data; let sm = 0, sq = 0, nn = 0;
+  for (let y = 1; y < 119; y += 1) for (let x = 1; x < 159; x += 1) { const i = (y * 160 + x) * 4, L = (k) => px[k] * .3 + px[k + 1] * .59 + px[k + 2] * .11;
+    const lap = 4 * L(i) - L(i - 4) - L(i + 4) - L(i - 640) - L(i + 640); sm += lap; sq += lap * lap; nn++; }
+  const sharp = sq / nn - (sm / nn) ** 2; kf.best = Math.max((kf.best || 0) * .995, sharp);
+  if (sharp < kf.best * .45) { kf.blurred = (kf.blurred || 0) + 1; return; }
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
-  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(vp.transform.matrix), w, h, hfov: 2 * Math.atan(1 / c.f), cy: c.cy };
+  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(vp.transform.matrix), w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(vp.transform.matrix) };
   kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
 }
 function camFrame(vp) {
@@ -522,12 +539,13 @@ function metaAgreement(M, raws, cfg, f, step) {
   return tot > 40 ? hit / tot : -1;
 }
 function calibrateStep(M, raws, modes) {
-  if (metaSurf.n > 3000) {                                         // the reliable way: Meta's room scan is the ground truth
+  if (metaSurf.n > 3000 && !depth.metaStale) {                     // the reliable way: Meta's room scan is the ground truth (when it's of this room)
     const cal = depth.cal, MODES = depthModes(M);
     for (const c of calCandidates(M, modes)) { const sc = metaAgreement(M, raws, c, MODES[c.mode], 4); if (sc < 0) continue; const k = JSON.stringify(c), o = cal.score.get(k) || { s: 0, n: 0 }; o.s += sc; o.n++; cal.score.set(k, o); }
     cal.pairs++; cal.method = 'Meta scan';
     if (cal.pairs >= 24) {
       let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (o.n >= 4 && m > bs) { bs = m; best = k; } }
+      if (bs < .3) { depth.metaStale = true; cal.pairs = 0; cal.score = new Map(); toast('The Meta room scan does not match this room: calibrating from your own views'); return; }   // old or other-room Meta data
       if (best) { depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.locked = true; depth.agree = bs; try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {} clearMap();
         toast(bs > .45 ? 'Depth matched to the Meta scan (' + Math.round(bs * 100) + '%): scanning' : 'Depth only ' + Math.round(bs * 100) + '% matches the Meta scan. Redo the Meta room scan?'); }
     }
@@ -579,11 +597,11 @@ function integrateDepth() {
       const plaus = cands.map(m => { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } return [m, sc]; }).sort((a, b) => b[1] - a[1]);
       const modes = plaus.filter(p => p[1] >= plaus[0][1] * .6).slice(0, 2).map(p => p[0]);
       calibrateStep(M, raws, modes); depth.frames++;
-      depth.status = depth.cal.locked ? 'calibrated' : 'CALIBRATING ' + depth.cal.pairs + '/' + (metaSurf.n > 3000 ? 24 : CAL_PAIRS) + (metaSurf.n > 3000 ? ' vs Meta scan' : ' · Meta scan missing: two-view') + ' · look around';
+      depth.status = depth.cal.locked ? 'calibrated' : 'CALIBRATING ' + depth.cal.pairs + '/' + (metaSurf.n > 3000 && !depth.metaStale ? 24 : CAL_PAIRS) + (metaSurf.n > 3000 && !depth.metaStale ? ' vs Meta scan' : ' · Meta scan missing: two-view') + ' · look around';
       return;
     }
     if (depth.cfg && depth.cfg.mode && cands.includes(depth.cfg.mode)) depth.mode = depth.cfg.mode;
-    if (depth.cfg && metaSurf.n > 3000 && depth.frames % 3 === 0) {
+    if (depth.cfg && metaSurf.n > 3000 && !depth.metaStale && depth.frames % 3 === 0) {
       const a = metaAgreement(M, raws, depth.cfg, MODES[depth.cfg.mode] || MODES[depth.mode], 6);
       if (a >= 0) { depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
         if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; } }
@@ -597,7 +615,7 @@ function integrateDepth() {
   const PE = M.PE, fpx = 2 / (PE[0] * DW), fpy = 2 / (PE[5] * DH);
   /* your body: torso capsule from the head down (world-up), and a ball round each hand/controller */
   const head = M.head, hands = M.hands;
-  const inBody = (x, y, z) => { if (Math.hypot(x - head.x, z - head.z) < .35 && y < head.y + .25 && y > head.y - 1.75) return true; for (const h of hands) if ((x - h.x) ** 2 + (y - h.y) ** 2 + (z - h.z) ** 2 < .0256) return true; return false; };
+  const inBody = (x, y, z) => { if (Math.hypot(x - head.x, z - head.z) < .42 && y < head.y + .25 && y > head.y - 1.95) return true; for (const h of hands) if ((x - h.x) ** 2 + (y - h.y) ** 2 + (z - h.z) ** 2 < .0256) return true; return false; };
   const cam = M.cam, vinv = M.vinv;
   const n = _nd.elements; let added = 0;
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
@@ -640,7 +658,12 @@ function integrateDepth() {
 
 /* ================= the integration worker: all per-pixel maths off the main thread ================= */
 const INTEG_SRC = `
-let zs = null;
+let zs = null, FR = 0;
+/* every voxel the map holds, mirrored here as an open-addressing hash so rays can be tested against it without the main thread */
+const HB = 1 << 22, HK = new Float64Array(HB); let hN = 0;
+function hIdx(k) { const lo = k % 4294967296, hi = (k - lo) / 4294967296; let h = Math.imul((lo | 0) ^ Math.imul(hi | 0, 0x9E3779B1), 0x85EBCA6B); h ^= h >>> 13; h = Math.imul(h, 0xC2B2AE35); return (h >>> 10) & (HB - 1); }
+function hAdd(k) { let i = hIdx(k); const v = k + 1; while (HK[i] !== 0) { if (HK[i] === v) return; i = (i + 1) & (HB - 1); } if (hN > HB * .7) return; HK[i] = v; hN++; }
+function hHas(k) { let i = hIdx(k); const v = k + 1; while (HK[i] !== 0) { if (HK[i] === v) return true; i = (i + 1) & (HB - 1); } return false; }
 /* camera alignment: the browser gives no camera intrinsics, so try a grid of field-of-view / centre guesses and keep the one
    that makes each surface spot the same colour from every angle you see it */
 const AL = { cands: [], slots: new Map(), acc: null, frames: 0, done: false, S: 4096 };
@@ -669,7 +692,9 @@ function alignFrame(cam, V, list, n) {
 }
 onmessage = e => {
   const d = e.data;
-  if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
+  if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
+  if (d.resetKnown) { HK.fill(0); hN = 0; return; }
+  if (d.known) { for (const k of d.known) hAdd(k); return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
   if (!zs || zs.length !== n) zs = new Float32Array(n);
   const near = d.near, far = d.far, r2m = d.r2m, rvm = d.rvm, lumA = d.lumA, mode = d.mode, fin = isFinite(far);
   let valid = 0;
@@ -684,8 +709,8 @@ onmessage = e => {
   }
   const I = d.inv, X = d.xf, ND = d.nd, flip = d.flip, fpx = 2 / (d.P0 * DW), fpy = 2 / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
   const VS = d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
-  const vox = new Map(), car = new Map(), out = new Float32Array(n * 11); let np = 0;
-  const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < .35 && y < H[1] + .25 && y > H[1] - 1.75) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < .0256) return true; } return false; };
+  const vox = new Map(), car = new Map(), out = new Float32Array(n * 11), rays = new Float32Array(n); let np = 0, nr = 0; FR++; const fo = FR % 2, go = ((FR / 2) | 0) % 2;
+  const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < .42 && y < H[1] + .25 && y > H[1] - 1.95) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < .0256) return true; } return false; };
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
     const k = y * DW + x, z = zs[k]; if (!(z > .2 && z < 4.5)) continue;
     const tol = .035 * z;
@@ -714,14 +739,22 @@ onmessage = e => {
     if (o === undefined) { o = np++ * 11; vox.set(vk, o); for (let i = 0; i < 11; i++) out[o + i] = 0; out[o + 7] = -1; }
     out[o] += wx * w; out[o + 1] += wy * w; out[o + 2] += wz * w; out[o + 3] += w; out[o + 4] += nx * w; out[o + 5] += ny * w; out[o + 6] += nz * w;
     if (R >= 0) { if (out[o + 7] < 0) out[o + 7] = out[o + 8] = out[o + 9] = 0; out[o + 7] += R * cq; out[o + 8] += G * cq; out[o + 9] += Bl * cq; out[o + 10] += cq; }
-    if ((x + y) & 1) continue;                                          // free-space carving on half the pixels is plenty
-    for (const f of [.45, .7, .88]) { if (z - f * z < .08) continue; const ax = px * f, ay = py * f, az = pz * f;
-      const cxw = X[0] * ax + X[4] * ay + X[8] * az + X[12], cyw = X[1] * ax + X[5] * ay + X[9] * az + X[13], czw = X[2] * ax + X[6] * ay + X[10] * az + X[14];
-      if (inBody(cxw, cyw, czw)) continue; const ck = key(cxw, cyw, czw), e = car.get(ck); if (e) e[3] = Math.min(.8, e[3] + .7 * w); else car.set(ck, [cxw, cyw, czw, Math.min(.8, .7 * w)]); }
+    if ((x + fo) % 2 === 0 && (y + go) % 2 === 0 && nr * 4 + 4 <= n) { rays[nr * 4] = wx; rays[nr * 4 + 1] = wy; rays[nr * 4 + 2] = wz; rays[nr * 4 + 3] = z; nr++; }   // a quarter of pixels per frame, rotating
   }
+  /* free space: walk each ray from the eye to just short of the surface it hit; any stored point it passes through is no longer there */
+  const OX = X[12], OY = X[13], OZ = X[14];
+  for (let r = 0; r < nr; r++) {
+    const ex = rays[r * 4], ey = rays[r * 4 + 1], ez = rays[r * 4 + 2], z = rays[r * 4 + 3], Dx = ex - OX, Dy = ey - OY, Dz = ez - OZ, L = Math.sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+    const s1 = 1 - Math.max(.06, .035 * z) / L, ds = .9 * VS / L; let last = -1;
+    for (let t = .2 / L; t < s1; t += ds) {
+      const qx = OX + Dx * t, qy = OY + Dy * t, qz = OZ + Dz * t, k = key(qx, qy, qz); if (k === last) continue; last = k;
+      if (hHas(k) && !vox.has(k) && !car.has(k)) car.set(k, [qx, qy, qz, Dx / L, Dy / L, Dz / L]);
+    }
+  }
+  for (const k of vox.keys()) hAdd(k);
   for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; out[o] /= w; out[o + 1] /= w; out[o + 2] /= w; out[o + 3] = Math.min(1.6, w);   // one frame alone can't confirm a voxel: noise needs a second look
     if (out[o + 10] > 0) { out[o + 7] /= out[o + 10]; out[o + 8] /= out[o + 10]; out[o + 9] /= out[o + 10]; } }
-  const C = new Float32Array(car.size * 4); let nc = 0; for (const e of car.values()) { if (vox.has(key(e[0], e[1], e[2]))) continue; C.set(e, nc * 4); nc++; }   // never carve a cell this same frame saw as surface
+  const C = new Float32Array(car.size * 6); let nc = 0; for (const e of car.values()) { C.set(e, nc * 6); nc++; }
   let align = null;
   if (cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
@@ -756,7 +789,7 @@ const _camW = new V3();
 function applyIntegration(budget) {                                // spread each depth frame over several display frames: never a dropped frame
   const t0 = performance.now(), end = t0 + budget;
   while (applyQ.length) {
-    const d = applyQ[0], P = d.P, C = d.C, chk = metaSurf.n > 3000, gen = depth.gen || 0, ts = performance.now();
+    const d = applyQ[0], P = d.P, C = d.C, chk = metaSurf.n > 3000 && !depth.metaStale, gen = depth.gen || 0, ts = performance.now();
     _camW.set(d.cam[0], d.cam[1], d.cam[2]);
     while (d.i < d.np) {
       const o = d.i * 11, id = addSighting(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], _camW, 0, P[o + 4], P[o + 5], P[o + 6]);
@@ -764,7 +797,7 @@ function applyIntegration(budget) {                                // spread eac
       if (chk && d.i % 7 === 0) { d.tot++; if (metaHas(P[o], P[o + 1], P[o + 2])) d.hit++; }
       if ((++d.i & 255) === 0 && performance.now() > end) break;
     }
-    while (d.i >= d.np && d.j < d.nc) { const o = d.j * 4; carve(C[o], C[o + 1], C[o + 2], C[o + 3]); if ((++d.j & 511) === 0 && performance.now() > end) break; }
+    while (d.i >= d.np && d.j < d.nc) { const o = d.j * 6; carveSeen(C[o], C[o + 1], C[o + 2], C[o + 3], C[o + 4], C[o + 5]); if ((++d.j & 511) === 0 && performance.now() > end) break; }
     d.ms += performance.now() - ts;
     if (d.i < d.np || d.j < d.nc) return;                             // out of time: carry on next frame
     applyQ.shift();
@@ -874,7 +907,8 @@ async function loadIntoSession(rec) {
 function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
-  flushGeo(); toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
+  flushGeo(); if (!viewer.on) integWorker().postMessage({ known: Float64Array.from(vmap.keys()) });     // so the live scan can erase what has changed since
+  toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
 }
 
 /* ================= exporting files: .json (everything) and .ply (points, opens in Blender / MeshLab / CloudCompare) ================= */
@@ -907,11 +941,17 @@ async function exportPhotos(rec) {
   $('st').textContent = 'Packing photos…';
   const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
   if (!fr.length) { $('st').textContent = 'No photos recorded for this scan. Turn on camera colour while scanning.'; return; }
-  const f0 = fr[0], fl = f0.w / 2 / Math.tan(f0.hfov / 2);
-  const tj = { camera_model: 'OPENCV', fl_x: fl, fl_y: fl, cx: f0.w / 2, cy: f0.h * (.5 + (f0.cy || 0)), w: f0.w, h: f0.h, k1: 0, k2: 0, p1: 0, p2: 0, ply_file_path: 'points3D.ply',
-    frames: fr.map((f, i) => { const m = f.m; return { file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }; }) };
-  const readme = 'House Scanner photo export: ' + fr.length + ' keyframes with headset poses.\n\nTrain a Gaussian splat on a PC:\n- Brush (free, github.com/ArthurBrussee/brush): open this folder (Nerfstudio format).\n- Nerfstudio: ns-train splatfacto --data <this folder>\n- Postshot / RealityScan: import the images folder and let it solve camera poses itself (most robust).\n\nPoses are OpenGL camera-to-world in the scan\'s coordinates (metres, y up). Intrinsics assume a ' + (f0.hfov * 180 / Math.PI).toFixed(0) + '° horizontal FOV.\n';
-  const files = [{ name: 'transforms.json', blob: new Blob([JSON.stringify(tj, null, 1)]) }, { name: 'points3D.ply', blob: plyBlob(rec) }, { name: 'README.txt', blob: new Blob([readme]) },
+  const f0 = fr[0], intr = f => { const fl = f.w / 2 / Math.tan(f.hfov / 2); return { fl_x: fl, fl_y: fl, cx: f.w * (.5 + (f.cx || 0)), cy: f.h * (.5 + (f.cy || 0)), w: f.w, h: f.h }; };
+  /* Nerfstudio / Brush format; intrinsics per frame because auto-alignment can refine them mid-scan */
+  const tj = Object.assign({ camera_model: 'OPENCV', k1: 0, k2: 0, p1: 0, p2: 0, ply_file_path: 'points3D.ply' }, intr(f0), {
+    frames: fr.map((f, i) => { const m = f.m; return Object.assign({ file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }, intr(f)); }) });
+  const manifest = { format: 'house-scanner-capture/2', app: 'house-scanner-webxr', created: new Date().toISOString(), scan: rec.id, frames: fr.length, points: rec.points.length / 3, voxel_size_m: rec.voxelSize,
+    frame: 'WebXR reference space (unbounded or local-floor): metres, +y up; cameras OpenGL convention (-z forward, +y up), camera-to-world',
+    intrinsics: fr.every(f => f.aligned) ? 'auto-aligned on headset (pinhole, no distortion)' : 'partly assumed (pinhole, no distortion): refine poses+intrinsics before training',
+    known_gaps: ['camera pose = head pose (RGB camera offset ~3-5 cm not modelled)', 'no lens distortion model', 'auto exposure not locked'] };
+  const poses = fr.map((f, i) => JSON.stringify({ i, t: f.t, file: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', head: f.head || f.m, cam: f.m, sharp: f.sharp || null, hfov_deg: f.hfov * 180 / Math.PI, cx: f.cx || 0, cy: f.cy || 0 })).join('\n');
+  const readme = 'House Scanner photo export: ' + fr.length + ' keyframes with headset poses.\n\nTrain a Gaussian splat on a PC:\n- Brush (free, github.com/ArthurBrussee/brush): open this folder (Nerfstudio format).\n- Nerfstudio: ns-train splatfacto --data <this folder>\n- Best quality: python tools/splat/run.py <this zip> (refines poses with COLMAP, trains, exports .ply/.spz). See docs/gaussian-splat-pipeline.md in the repo.\n- Postshot / RealityScan: import the images folder and let it solve camera poses itself (most robust).\n\nPoses are OpenGL camera-to-world in the scan\'s coordinates (metres, y up). Intrinsics assume a ' + (f0.hfov * 180 / Math.PI).toFixed(0) + '° horizontal FOV.\n';
+  const files = [{ name: 'transforms.json', blob: new Blob([JSON.stringify(tj, null, 1)]) }, { name: 'manifest.json', blob: new Blob([JSON.stringify(manifest, null, 1)]) }, { name: 'poses.jsonl', blob: new Blob([poses]) }, { name: 'points3D.ply', blob: plyBlob(rec) }, { name: 'README.txt', blob: new Blob([readme]) },
     ...fr.map((f, i) => ({ name: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', blob: f.blob }))];
   download((rec.name || 'scan').replace(/\W+/g, '-') + '-photos.zip', await zipMany(files));
 }
@@ -1170,7 +1210,7 @@ function buildUnderstanding(res, group) {
   }
 }
 const underG = new THREE.Group(); scene.add(underG);
-let understanding = null, underOn = true, underAt = 0, underN = 0;
+let understanding = null, underOn = false, underAt = 0, underN = 0;
 /* the analysis runs in a background worker so the headset never stalls while it thinks */
 let anWorker = null, anBusy = false, anFailed = false;
 function makeWorker() {
@@ -1216,8 +1256,6 @@ const BTN = () => page === 0 ? [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
   { id: 'view', label: ['Points: dots', 'Points: solid', 'Points: hidden'][showMode] },
   { id: 'meta', label: useMeta ? 'Meta layout ✓' : 'Meta layout', on: useMeta },
-  { id: 'under', label: underOn ? 'Understanding ✓' : 'Understanding', on: underOn },
-  { id: 'analyze', label: 'Re-analyse' },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
   { id: 'clear', label: 'Clear map' },
@@ -1296,10 +1334,9 @@ function drawPanel() {
       'depth   ' + (depth.steady === false ? 'paused: turning' : depth.status),
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · ' + planes.size + ' planes · cover ' + cov.covered + '/' + cov.n,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
-      'clean   ' + cleaned.toLocaleString() + ' strays removed · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
+      'clean   ' + cleaned.toLocaleString() + ' strays · ' + erased.toLocaleString() + ' moved-away erased · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
       'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') : ''),
-      ...understandingLines(understanding).slice(0, 2).map(l => 'rooms   ' + l.slice(0, 44)),
-      ...(scanErr ? ['ERROR   ' + scanErr] : [])
+            ...(scanErr ? ['ERROR   ' + scanErr] : [])
     ];
     diag.forEach((l, i) => { g.fillStyle = /^ERROR/.test(l) ? '#ff8a7a' : '#8fc4ce'; g.fillText(l.slice(0, 60), 32, 166 + i * 24); });
     const bw = 280, bh = 64;
@@ -1327,7 +1364,7 @@ async function press(id, frame) {
   if (id === 'finish') {
     if (!confirmed) { toast('Nothing captured yet'); return; }
     finishing = true; scanning = false; drawHud(); drawPanel();
-    try { await saveScan(frame); runUnderstanding(); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
+    try { await saveScan(frame); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
     setTimeout(() => { finishing = false; xrSession && xrSession.end(); }, 2500);
   }
   if (id === 'clear') { clearMap(); currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
@@ -1384,7 +1421,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null;
+    depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
     depth.status = hasDepth ? 'starting' : 'NOT GRANTED by the browser (Quest settings > browser permissions; update Horizon OS)';
@@ -1394,7 +1431,7 @@ $('bAR').addEventListener('click', async () => {
     $('ui').classList.add('hide');
     s.addEventListener('end', () => { if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
-    else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; }
+    else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = colorCam.on && /activation|gesture|user/i.test(e.message) ? 'Camera is ready. Tap Start scanning again.' : 'Could not start: ' + e.message; }
@@ -1430,16 +1467,13 @@ function openViewer(rec) {
   showMode = 1; pmat.uniforms.style.value = 1; pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = CONF; pmat.depthWrite = true; tmat.depthWrite = true; pmat.needsUpdate = tmat.needsUpdate = true;
   pmat.uniforms.scale.value = innerHeight / (2 * Math.tan(camera.fov * Math.PI / 360));
   const n = rec.points.length / 3, geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3)); geo.computeBoundingBox();
-  const ug = new THREE.Group(); g.add(ug); const ures = rec.understanding || analyze(rec.points, rec.masks, rec.planes, rec.meshes); buildUnderstanding(ures, ug);
-  ug.traverse(o => { if (o.isSprite) o.scale.multiplyScalar(3.5); if (o.userData.follow !== undefined) o.position.set(viewer.target ? 0 : 0, o.userData.follow + .05, 0); });
-  viewer.res = ures;
-  for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .08 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
-  for (const p of rec.planes) { if (!p.poly || p.poly.length < 3) continue; const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
+  if (false) for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .08 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
+  if (false) for (const p of rec.planes) { if (!p.poly || p.poly.length < 3) continue; const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
   const bb = geo.boundingBox; if (bb && isFinite(bb.min.x)) { bb.getCenter(viewer.target); viewer.dist = Math.max(3, bb.getSize(new V3()).length() * .8); }
   cloud.visible = true; layout.visible = false;
-  $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · ' + understandingLines(viewer.res).join(' · ').replace(/\s+/g, ' ') + ' · drag to orbit, scroll or pinch to zoom';
+  $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
 }
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 0; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = true; }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 0; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
 const cv = renderer.domElement, ptrs = new Map();
 cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.setPointerCapture(e.pointerId); });
@@ -1487,10 +1521,10 @@ renderer.setAnimationLoop((t, frame) => {
     tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
     if (scanning && N) cleanSlice(4000);
     if (cov.dirty && cov.geo && Math.floor(clockT * 3) !== Math.floor((clockT - dt) * 3)) { cov.geo.attributes.done.needsUpdate = true; cov.dirty = false; }
-    covMat.uniforms.time.value = clockT; if (cov.pts) cov.pts.visible = scanning && !replayMode && useMeta && depth.cal && depth.cal.locked;
+    covMat.uniforms.time.value = clockT; if (cov.pts) cov.pts.visible = scanning && !replayMode && useMeta && depth.cal && depth.cal.locked && depth.agree != null && depth.agree > .45;   // only guide by the Meta scan when it matches this room
     if (clockT - depth.lastT > depth.rate || depth.steady === false) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
     { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
-    if (scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
+    if (underOn && scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
     { const cp = renderer.xr.getCamera().getWorldPosition(new V3()), f = renderer.xr.getCamera().getWorldDirection(new V3()); f.y = 0; f.normalize();
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }

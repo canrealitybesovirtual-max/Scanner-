@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Splat Viewer</title>
+<style>:root{color-scheme:dark}body{margin:0;background:#111315;color:#ddd;font:14px system-ui}#st{position:fixed;left:12px;top:10px}</style>
+</head><body><div id="st">Loading…</div>
+<!-- WebXR walk-through of a trained splat (tools/splat/export.py output). Usage: splat-viewer.html?src=<url of scene.ply|.spz>&meta=<url of scene.meta.json> -->
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+"@mkkellogg/gaussian-splats-3d":"https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"}}</script>
+<script type="module">
+import * as GS from '@mkkellogg/gaussian-splats-3d';
+const q = new URLSearchParams(location.search), src = q.get('src'), st = document.getElementById('st');
+if (!src) { st.textContent = 'Add ?src=<scene.ply url> to the address'; throw new Error('no src'); }
+const meta = q.get('meta') ? await fetch(q.get('meta')).then(r => r.json()).catch(() => null) : null;
+const viewer = new GS.Viewer({
+  webXRMode: GS.WebXRMode.VR,                 // TODO: AR mode + anchor to the live room so the splat overlays reality
+  sharedMemoryForWorkers: false,              // static hosting without COOP/COEP headers
+  cameraUp: [0, 1, 0], initialCameraPosition: [0, 1.6, 0], initialCameraLookAt: [0, 1.6, -1],
+  sphericalHarmonicsDegree: 0                 // TODO: 1 on PC, 0 on Quest for frame rate
+});
+viewer.addSplatScene(src, { progressiveLoad: true, splatAlphaRemovalThreshold: 8,
+  position: [0, meta ? -meta.floor_y : 0, 0] })   // floor at y=0 so you stand on it
+  .then(() => { st.textContent = (meta ? meta.splats.toLocaleString() + ' splats · ' : '') + 'Enter VR to walk through'; viewer.start(); })
+  .catch(e => { st.textContent = 'Could not load: ' + e.message; });
+// TODO: per-room streaming for whole-house scenes (> 3 M splats), teleport locomotion, fps readout
+</script></body></html>

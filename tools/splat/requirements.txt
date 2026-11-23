@@ -1,0 +1,6 @@
+# PC side of the splat pipeline (see docs/gaussian-splat-pipeline.md)
+numpy>=1.24
+pillow>=10.0
+plyfile>=1.0
+nerfstudio==1.1.5        # brings torch-dependent gsplat; install torch for your CUDA first
+# external binaries on PATH: colmap (3.9+), ns-train / ns-export / ns-eval (from nerfstudio)
