@@ -1074,10 +1074,72 @@ function rawCtx(f, X) {
   return { X, rays, nr: pts.length / 3, PRJ: f.PRJ, NDI: f.NDI, flip: f.flip, R0: f.R0, DW: f.DW, DH: f.DH, jx: f.jx, jy: f.jy, zf, cam: null, V: null, moving: false, now: 0 };
 }
 /* offline refinement: fuse everything, re-align every frame to that consensus surface, fuse again with the corrected poses */
+
+/* ---------- loop closure: split the walk into segments, align segments that see the same place, spread the correction ---------- */
+function surfOf(maxPts) {                                           // points + normals of the current TSDF surface (sub-sampled)
+  const all = concatParts(meshRegions([...TREG.keys()], [], 0)), n = all.P.length / 3, st = Math.max(1, Math.floor(n / maxPts)), P = [], N = [];
+  for (let i = 0; i < n; i += st) { P.push(all.P[i * 3], all.P[i * 3 + 1], all.P[i * 3 + 2]); N.push(all.N[i * 3], all.N[i * 3 + 1], all.N[i * 3 + 2]); }
+  return { P: new Float32Array(P), N: new Float32Array(N) };
+}
+function icpPP(F, M, iters) {                                       // point-to-plane ICP: moves M onto F; returns the transform and the inlier share
+  const HG = .1, hash = new Map(); for (let i = 0; i < F.P.length / 3; i++) { const k = Math.floor(F.P[i * 3] / HG) * 1e8 + Math.floor(F.P[i * 3 + 1] / HG) * 1e4 + Math.floor(F.P[i * 3 + 2] / HG); let a = hash.get(k); if (!a) hash.set(k, a = []); a.push(i); }
+  let T = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], inl = 0, tot = 0, e2 = 0; const st = Math.max(1, Math.floor(M.P.length / 3 / 2500));
+  for (let it = 0; it < iters; it++) {
+    const H = new Array(36).fill(0), g = [0, 0, 0, 0, 0, 0], maxd = it < iters / 3 ? .15 : it < 2 * iters / 3 ? .07 : .035; inl = 0; tot = 0; e2 = 0;
+    for (let q = 0; q < M.P.length / 3; q += st) {
+      const px = M.P[q * 3], py = M.P[q * 3 + 1], pz = M.P[q * 3 + 2], x = T[0] * px + T[4] * py + T[8] * pz + T[12], y = T[1] * px + T[5] * py + T[9] * pz + T[13], z = T[2] * px + T[6] * py + T[10] * pz + T[14];
+      const hx = Math.floor(x / HG), hy = Math.floor(y / HG), hz = Math.floor(z / HG); let bd = maxd * maxd, bj = -1; tot++;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) { const L = hash.get((hx + a) * 1e8 + (hy + b) * 1e4 + hz + c); if (L) for (const j of L) { const d2 = (F.P[j * 3] - x) ** 2 + (F.P[j * 3 + 1] - y) ** 2 + (F.P[j * 3 + 2] - z) ** 2; if (d2 < bd) { bd = d2; bj = j; } } }
+      if (bj < 0) continue; const nx = F.N[bj * 3], ny = F.N[bj * 3 + 1], nz = F.N[bj * 3 + 2]; inl++;
+      const r = nx * (x - F.P[bj * 3]) + ny * (y - F.P[bj * 3 + 1]) + nz * (z - F.P[bj * 3 + 2]), J = [nx, ny, nz, y * nz - z * ny, z * nx - x * nz, x * ny - y * nx]; e2 += r * r;
+      for (let i = 0; i < 6; i++) { g[i] -= J[i] * r; for (let j = 0; j < 6; j++) H[i * 6 + j] += J[i] * J[j]; }
+    }
+    if (inl < 300) return { ok: false, inl, tot };
+    const x6 = solve6(H, g); if (!x6) return { ok: false, inl, tot };
+    const [tx, ty, tz, ox, oy, oz] = x6, th = Math.hypot(ox, oy, oz), kx = th ? ox / th : 0, ky = th ? oy / th : 0, kz = th ? oz / th : 0, C = Math.cos(th), S = Math.sin(th), V = 1 - C;
+    T = mul4([C + kx * kx * V, ky * kx * V + kz * S, kz * kx * V - ky * S, 0, kx * ky * V - kz * S, C + ky * ky * V, kz * ky * V + kx * S, 0, kx * kz * V + ky * S, ky * kz * V - kx * S, C + kz * kz * V, 0, tx, ty, tz, 1], T);
+  }
+  return { ok: true, T, share: inl / Math.max(1, tot), rms: Math.sqrt(e2 / Math.max(1, inl)) };
+}
+const rotVec = T => { const tr = T[0] + T[5] + T[10], th = Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2))); if (th < 1e-9) return [0, 0, 0]; const k = th / (2 * Math.sin(th)); return [(T[6] - T[9]) * k, (T[8] - T[2]) * k, (T[1] - T[4]) * k]; };
+function loopClose(frames, Xs, report) {
+  const SEG = 90, S = Math.ceil(frames.length / SEG); if (S < 3) return { Xs, loops: 0 };
+  report('loop closure: building ' + S + ' segments'); const segs = [];
+  for (let s = 0; s < S; s++) { TB = new Map(); TREG = new Map(); for (let i = s * SEG; i < Math.min(frames.length, (s + 1) * SEG); i++) tsdfIntegrate(rawCtx(frames[i], Xs[i]));
+    const sp = surfOf(6000); if (sp.P.length < 900) { segs.push(null); continue; }
+    let cx = 0, cy = 0, cz = 0, mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9]; const n = sp.P.length / 3; for (let i = 0; i < n; i++) { for (let a = 0; a < 3; a++) { const v = sp.P[i * 3 + a]; mn[a] = Math.min(mn[a], v); mx[a] = Math.max(mx[a], v); } cx += sp.P[i * 3]; cy += sp.P[i * 3 + 1]; cz += sp.P[i * 3 + 2]; }
+    segs.push(Object.assign(sp, { c: [cx / n, cy / n, cz / n], mn, mx })); }
+  /* loop edges: segments at least 2 apart in time whose boxes overlap, aligned with ICP. All corrections rotate about one common centre so they can be blended */
+  const edges = [], live = segs.filter(Boolean), C0 = [0, 1, 2].map(a => live.reduce((v, g) => v + g.c[a], 0) / live.length);
+  for (let i = 0; i < S; i++) for (let j = i + 2; j < S; j++) { const A = segs[i], B = segs[j]; if (!A || !B) continue;
+    if ([0, 1, 2].some(a => A.mx[a] < B.mn[a] - .2 || B.mx[a] < A.mn[a] - .2)) continue;
+    const r = icpPP(A, B, 18); if (!r.ok || r.share < .35 || r.rms > .025) continue;
+    const t = [r.T[0] * C0[0] + r.T[4] * C0[1] + r.T[8] * C0[2] + r.T[12] - C0[0], r.T[1] * C0[0] + r.T[5] * C0[1] + r.T[9] * C0[2] + r.T[13] - C0[1], r.T[2] * C0[0] + r.T[6] * C0[1] + r.T[10] * C0[2] + r.T[14] - C0[2]];
+    if (Math.hypot(...t) < .008 && Math.hypot(...rotVec(r.T)) < .002) continue; edges.push({ i, j, d: t.concat(rotVec(r.T)), w: 10 * r.share }); }
+  if (!edges.length) return { Xs, loops: 0 };
+  report('loop closure: ' + edges.length + ' loop' + (edges.length > 1 ? 's' : '') + ' found, correcting');
+  /* pose graph per component: x_{s+1} - x_s = 0 (odometry), x_j - x_i = d (loops), x_0 = 0 */
+  const x = Array.from({ length: S }, () => [0, 0, 0, 0, 0, 0]);
+  for (let comp = 0; comp < 6; comp++) { const A = new Float64Array(S * S), b = new Float64Array(S); A[0] += 1000;
+    const add = (i, j, d, w) => { A[i * S + i] += w; A[j * S + j] += w; A[i * S + j] -= w; A[j * S + i] -= w; b[j] += w * d; b[i] -= w * d; };
+    for (let s2 = 0; s2 + 1 < S; s2++) add(s2, s2 + 1, 0, 1); for (const e of edges) add(e.i, e.j, e.d[comp], e.w);
+    const M = []; for (let i = 0; i < S; i++) M.push(Array.from(A.slice(i * S, i * S + S)).concat([b[i]]));
+    for (let c = 0; c < S; c++) { let p = c; for (let r2 = c + 1; r2 < S; r2++) if (Math.abs(M[r2][c]) > Math.abs(M[p][c])) p = r2; [M[c], M[p]] = [M[p], M[c]]; for (let r2 = c + 1; r2 < S; r2++) { const f = M[r2][c] / M[c][c]; for (let k = c; k <= S; k++) M[r2][k] -= f * M[c][k]; } }
+    for (let r2 = S - 1; r2 >= 0; r2--) { let v = M[r2][S]; for (let k = r2 + 1; k < S; k++) v -= M[r2][k] * x[k][comp]; x[r2][comp] = v / M[r2][r2]; } }
+  /* every frame: correction interpolated between its segment and the next, rotating about the segment's centre */
+  const corrOf = (xs, c) => { const [tx, ty, tz, ox, oy, oz] = xs, th = Math.hypot(ox, oy, oz), kx = th ? ox / th : 0, ky = th ? oy / th : 0, kz = th ? oz / th : 0, C = Math.cos(th), Sn = Math.sin(th), V = 1 - C;
+    const R = [C + kx * kx * V, ky * kx * V + kz * Sn, kz * kx * V - ky * Sn, 0, kx * ky * V - kz * Sn, C + ky * ky * V, kz * ky * V + kx * Sn, 0, kx * kz * V + ky * Sn, ky * kz * V - kx * Sn, C + kz * kz * V, 0, 0, 0, 0, 1];
+    return mul4([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, c[0] + tx, c[1] + ty, c[2] + tz, 1], mul4(R, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -c[0], -c[1], -c[2], 1])); };
+  let maxShift = 0;
+  const out = Xs.map((X, i) => { const s2 = Math.min(S - 1, Math.floor(i / SEG)), u = (i % SEG) / SEG, nb = Math.min(S - 1, s2 + 1), xs = x[s2].map((v, k) => v + (x[nb][k] - v) * u), seg = segs[s2] || segs.find(Boolean);
+    maxShift = Math.max(maxShift, Math.hypot(xs[0], xs[1], xs[2])); return mul4(corrOf(xs, C0), X); });
+  return { Xs: out, loops: edges.length, maxShift };
+}
 function refine(frames, oldT, report) {
   const OLD = new Map(); if (oldT) { tsdfUnpack(oldT, null); for (const [k, b] of TB) OLD.set(k, b); }
   const fuse = Xs => { TB = new Map(); TREG = new Map(); frames.forEach((f, i) => tsdfIntegrate(rawCtx(f, Xs[i]))); };
   let Xs = frames.map(f => f.X), moved = [];
+  const LC = loopClose(frames, Xs, report); Xs = LC.Xs;               // long walks first: segments that revisit a place are pulled together
   for (let pass = 0; pass < 2; pass++) {
     fuse(Xs); report('pass ' + (pass + 1) + ': re-aligning ' + frames.length + ' frames');
     Xs = frames.map((f, i) => { const zf = new Float32Array(f.DW * f.DH); for (let k = 0; k < zf.length; k++) zf[k] = f.mm[k] / 1000;
@@ -1088,7 +1150,7 @@ function refine(frames, oldT, report) {
   for (const [k, b] of TB) { const o = OLD.get(k); if (!o) continue; for (let v = 0; v < B3; v++) if (o.cw[v] > 0) { b.c[v * 3] = o.c[v * 3]; b.c[v * 3 + 1] = o.c[v * 3 + 1]; b.c[v * 3 + 2] = o.c[v * 3 + 2]; b.cw[v] = o.cw[v]; } }
   const corr = frames.map((f, i) => mul4(Xs[i], inv4r(f.X)));
   const mv = moved.filter(x => x > 0).sort((a, b) => a - b);
-  return { corr, median: mv.length ? mv[mv.length >> 1] : 0, aligned: mv.length };
+  return { corr, median: mv.length ? mv[mv.length >> 1] : 0, aligned: mv.length, loops: LC.loops, loopShift: LC.maxShift || 0 };
 }
 let OC = null, OCX = null;
 onmessage = e => {
@@ -1096,8 +1158,9 @@ onmessage = e => {
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
   if (d.resetKnown) { HK.fill(0); hN = 0; FK.clear(); return; }
   if (d.tsdfReset) { TB.clear(); TREG.clear(); tDirty.clear(); tMeshed.clear(); return; }
-  if (d.refine) { const res = refine(d.frames, d.tsdf, m => postMessage({ refineMsg: m })); const t = tsdfPack(); postMessage({ refined: d.refine, t, corr: res.corr, median: res.median, aligned: res.aligned }); return; }
+  if (d.refine) { const res = refine(d.frames, d.tsdf, m => postMessage({ refineMsg: m })); const t = tsdfPack(); postMessage({ refined: d.refine, loops: res.loops, loopShift: res.loopShift, t, corr: res.corr, median: res.median, aligned: res.aligned }); return; }
   if (d.tsdfLoad) { tsdfUnpack(d.tsdfLoad, d.T); return; }
+  if (d.mergeTsdf) { TB = new Map(); TREG = new Map(); tsdfUnpack(d.mergeTsdf[0], null); tsdfUnpack(d.mergeTsdf[1], d.mergeTsdf[2]); const t = tsdfPack(); postMessage({ merged: d.mergeId, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
   if (d.tsdfDump) { const t = tsdfPack(); postMessage({ tsdfDump: d.tsdfDump, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
   if (d.tsdfMeshAll) { const all = concatParts(meshRegions([...TREG.keys()], d.zones || [], d.floorY || 0)); postMessage({ meshAll: d.tsdfMeshAll, m: all }, [all.P.buffer, all.N.buffer, all.C.buffer, all.I.buffer]); return; }
   if (d.resetFine) return;
@@ -1576,7 +1639,7 @@ async function refineScan(rec, say) {
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.refineMsg) st.textContent = 'Refining: ' + e.data.refineMsg + '…'; if (e.data.refined) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'refine failed'));
     st.textContent = 'Refining ' + fr.length + ' frames…'; w.postMessage({ refine: 1, frames: fr, tsdf: rec.tsdf || null }); }).catch(e => { st.textContent = 'Refine failed: ' + e.message; return null; });
   w.terminate(); if (!res) return;
-  rec.tsdf = res.t; delete rec.meshCache; delete rec.tex; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, at: Date.now() };
+  rec.tsdf = res.t; delete rec.meshCache; delete rec.tex; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, loops: res.loops || 0, loopShift_m: res.loopShift || 0, at: Date.now() };
   /* photos: move each one by the correction of the depth frame taken closest to it */
   const kfs = await DB.frames(rec.id).catch(() => []); let moved = 0;
   for (const k of kfs) { let best = -1, bd = 2500; fr.forEach((f, i) => { const dt = Math.abs(f.t - k.t); if (dt < bd) { bd = dt; best = i; } });
@@ -2010,6 +2073,84 @@ async function alignPhotos(rec, say = () => {}) {
   rec.photoAlign = { at: Date.now(), rms0: res.rms0, rms1: res.rms1, edge0_px: res.edge0, edge1_px: res.edge1, used: res.used, offset_cm: Math.hypot(res.E[12], res.E[13], res.E[14]) * 100 };
   if (!rec.live) { delete rec.tex; await putIfSame(rec); }
   return res;
+}
+
+
+/* ================= whole house: merge separately scanned rooms, and draw a floor plan ================= */
+function relocArrays(SP, SN, LP, LN) {                              // wall-matching search between two point sets (same engine as Continue)
+  const w = new Worker(URL.createObjectURL(new Blob([RELOC_SRC], { type: 'text/javascript' })));
+  return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); }; w.postMessage({ SP, SN, LP, LN, guess: null }); });
+}
+async function mergeScans(A, B, say) {
+  say('finding where the two scans overlap…');
+  const BN = new Float32Array(B.points.length); if (B.normals) for (let i = 0; i < BN.length; i++) BN[i] = B.normals[i] / 127;
+  const res = await relocArrays(A.points, A.normals || new Int8Array(A.points.length), B.points, BN);
+  if (!res.ok && (res.wallFit || 0) > .6) throw new Error('the shared area matches in more than one place (too plain or symmetric). Scan a doorway or furniture that both scans see, then try again');
+  if (!res.ok) throw new Error('no shared area found (' + Math.round((res.wallFit || 0) * 100) + '% fit). Scan the doorway or hall that connects them in both scans, then try again');
+  const M = new M4().fromArray(res.A).invert(), Rn = new THREE.Matrix3().setFromMatrix4(M), v = new V3();   // B's frame -> A's frame
+  const tP = P => { const o = new Float32Array(P.length); for (let i = 0; i < P.length; i += 3) { v.set(P[i], P[i + 1], P[i + 2]).applyMatrix4(M); o[i] = v.x; o[i + 1] = v.y; o[i + 2] = v.z; } return o; };
+  const tN = Nn => { const o = new Int8Array(Nn.length); for (let i = 0; i < Nn.length; i += 3) { v.set(Nn[i], Nn[i + 1], Nn[i + 2]).applyMatrix3(Rn); o[i] = Math.round(v.x); o[i + 1] = Math.round(v.y); o[i + 2] = Math.round(v.z); } return o; };
+  const cat = (T, a, b) => { if (!a && !b) return null; const x = a || new T(0), y = b || new T(0), o = new T(x.length + y.length); o.set(x); o.set(y, x.length); return o; };
+  say('joining the surfaces…');
+  let tsdf = A.tsdf || null;
+  if (A.tsdf && B.tsdf) { const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
+    tsdf = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.merged) ok(e.data.t); }; w.onerror = e => no(new Error(e.message || 'merge failed')); w.postMessage({ mergeTsdf: [A.tsdf, B.tsdf, Array.from(M.elements)], mergeId: 1 }); }); w.terminate(); }
+  const id = 'scan-' + Date.now(), nB = B.points.length / 3;
+  const rec = { id, name: A.name + ' + ' + B.name, date: Date.now(), voxelSize: A.voxelSize, floorY: A.floorY || 0, D: A.D || null, anchor: A.anchor || null, layoutEdits: A.layoutEdits || null, planes: A.planes || [], meshes: A.meshes || [], understanding: null,
+    points: cat(Float32Array, A.points, tP(B.points)), counts: cat(Uint16Array, A.counts, B.counts || new Uint16Array(nB).fill(CONF)), masks: null, colors: cat(Uint8Array, A.colors || new Uint8Array(A.points.length / 3 * 4), B.colors || new Uint8Array(nB * 4)),
+    normals: cat(Int8Array, A.normals || new Int8Array(A.points.length), B.normals ? tN(B.normals) : new Int8Array(B.points.length)), tsdf, fineVoxel: A.fineVoxel || B.fineVoxel || null,
+    fpoints: cat(Float32Array, A.fpoints, B.fpoints ? tP(B.fpoints) : null), fcolors: cat(Uint8Array, A.fcolors, B.fcolors), fnormals: cat(Int8Array, A.fnormals, B.fnormals ? tN(B.fnormals) : null), fcounts: cat(Uint16Array, A.fcounts, B.fcounts),
+    zones: (A.zones || []).concat((B.zones || []).map(z => { v.set(z[0], z[1], z[2]).applyMatrix4(M); return [v.x, v.y, v.z, z[3]]; })), merged: { from: [A.id, B.id], wallFit: res.wallFit, overlap: res.overlap } };
+  say('copying photos and depth frames…'); const mm = (arr) => Array.from(M.clone().multiply(new M4().fromArray(arr)).elements);
+  for (const [src, move] of [[A, false], [B, true]]) {
+    for (const f of await DB.frames(src.id).catch(() => [])) { const g = Object.assign({}, f, { scan: id, k: id + '/' + f.k }); if (move) { g.m = mm(f.m); if (f.m0) g.m0 = mm(f.m0); } await DB.putFrame(g); }
+    for (const f of await DB.depthFrames(src.id).catch(() => [])) { const g = Object.assign({}, f, { scan: id, k: id + '/' + f.k }); if (move) g.X = mm(f.X); await DB.putDepth(g); } }
+  const dd = (P, C, Co, Nn, vs) => {   // where the scans overlap keep one point per voxel: the more often seen one
+    if (!P || !vs) return null; const n = P.length / 3, best = new Map(), ix = (x) => Math.floor(x / vs) + 32768;
+    for (let i = 0; i < n; i++) { const k = (ix(P[i * 3]) * 65536 + ix(P[i * 3 + 1])) * 65536 + ix(P[i * 3 + 2]), j = best.get(k); if (j === undefined || (C ? C[i] > C[j] : false)) best.set(k, i); }
+    if (best.size === n) return null; const keep = Int32Array.from(best.values()).sort(), pick = (A, w) => { if (!A) return A; const o = new A.constructor(keep.length * w); for (let q = 0; q < keep.length; q++) for (let c = 0; c < w; c++) o[q * w + c] = A[keep[q] * w + c]; return o; };
+    return [pick(P, 3), pick(C, 1), pick(Co, 4), pick(Nn, 3)]; };
+  let r1 = dd(rec.points, rec.counts, rec.colors, rec.normals, rec.voxelSize || .02); if (r1) [rec.points, rec.counts, rec.colors, rec.normals] = r1;
+  r1 = dd(rec.fpoints, rec.fcounts, rec.fcolors, rec.fnormals, rec.fineVoxel); if (r1) [rec.fpoints, rec.fcounts, rec.fcolors, rec.fnormals] = r1;
+  await DB.put(rec); autoEnqueue(id);
+  return { rec, fit: res.wallFit, overlap: res.overlap };
+}
+/* floor plan: walls and rooms from the scan, each room with its size and area (SVG) */
+function floorPlan(rec) {
+  const P = rec.points, Nn = rec.normals; if (!Nn) throw new Error('this scan has no surface directions (older version)');
+  const n = P.length / 3, hist = new Map(); for (let i = 0; i < n; i++) if (Nn[i * 3 + 1] > 100) { const k = Math.round(P[i * 3 + 1] / .04); hist.set(k, (hist.get(k) || 0) + 1); }
+  let fy = null, bc = 0; for (const k of [...hist.keys()].sort((a, b) => a - b)) { const c = hist.get(k) + (hist.get(k - 1) || 0) + (hist.get(k + 1) || 0); if (c > bc * 1.5 && c > 200) { fy = k * .04; bc = c; } }
+  if (fy == null) throw new Error('no floor found in this scan');
+  const G = .05; let x0 = 1e9, z0 = 1e9, x1 = -1e9, z1 = -1e9;
+  for (let i = 0; i < n; i++) { const y = P[i * 3 + 1] - fy; if (y < -.1 || y > 2.2) continue; x0 = Math.min(x0, P[i * 3]); x1 = Math.max(x1, P[i * 3]); z0 = Math.min(z0, P[i * 3 + 2]); z1 = Math.max(z1, P[i * 3 + 2]); }
+  const W = Math.ceil((x1 - x0) / G) + 3, H = Math.ceil((z1 - z0) / G) + 3, F = new Uint8Array(W * H), Wl = new Uint8Array(W * H), at = (x, z) => (Math.floor((z - z0) / G) + 1) * W + Math.floor((x - x0) / G) + 1;
+  for (let i = 0; i < n; i++) { const y = P[i * 3 + 1] - fy, ny = Nn[i * 3 + 1] / 127; if (ny > .8 && Math.abs(y) < .1) F[at(P[i * 3], P[i * 3 + 2])] = 1; else if (Math.abs(ny) < .4 && y > 1.05 && y < 1.95) Wl[at(P[i * 3], P[i * 3 + 2])] = 1; }   // walls: vertical surface between 1.05 and 1.95 m (above tables, sofas and counters, below door tops)
+  const dil = (A, r) => { const o = new Uint8Array(A.length); for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) { if (!A[z * W + x]) continue; for (let b = -r; b <= r; b++) for (let a = -r; a <= r; a++) { const xx = x + a, zz = z + b; if (xx >= 0 && zz >= 0 && xx < W && zz < H) o[zz * W + xx] = 1; } } return o; };
+  const ero = (A, r) => { const inv = A.map(v => 1 - v), d = dil(inv, r); return d.map(v => 1 - v); };
+  const Wd = dil(Wl, 1), Fc = ero(dil(F, 4), 4).map((v, i) => v && !Wd[i] ? 1 : 0);   // close small gaps, never through walls
+  { const out = new Uint8Array(W * H), q = []; for (let x = 0; x < W; x++) q.push(x, (H - 1) * W + x); for (let z = 0; z < H; z++) q.push(z * W, z * W + W - 1);   // floor hidden under furniture: any cell enclosed by floor and walls is floor
+    for (const i of q) out[i] = 1; while (q.length) { const j = q.pop(), x = j % W; for (const d of [1, -1, W, -W]) { const k = j + d; if (k < 0 || k >= W * H || out[k] || Fc[k] || Wd[k] || (d === 1 && x === W - 1) || (d === -1 && x === 0)) continue; out[k] = 1; q.push(k); } }
+    for (let i = 0; i < W * H; i++) if (!out[i] && !Wd[i]) Fc[i] = 1; }
+  const seed = ero(Fc, 10), lab = new Int32Array(W * H).fill(-1); const rooms = [];
+  for (let i = 0; i < W * H; i++) { if (!seed[i] || lab[i] >= 0) continue; const q = [i], id = rooms.length; lab[i] = id; let c = 0;   // a room = free floor still connected after shrinking by 50 cm (doorways split)
+    while (q.length) { const j = q.pop(); c++; for (const d of [1, -1, W, -W]) { const k = j + d; if (k >= 0 && k < W * H && seed[k] && lab[k] < 0) { lab[k] = id; q.push(k); } } } rooms.push({ seedCells: c }); }
+  const keep = rooms.map(r => r.seedCells * G * G > .6); let q = []; for (let i = 0; i < W * H; i++) if (lab[i] >= 0) { if (keep[lab[i]]) q.push(i); else lab[i] = -1; }
+  while (q.length) { const nq = []; for (const j of q) for (const d of [1, -1, W, -W]) { const k = j + d; if (k >= 0 && k < W * H && Fc[k] && lab[k] < 0) { lab[k] = lab[j]; nq.push(k); } } q = nq; }   // grow back out to the walls
+  const info = new Map(); for (let i = 0; i < W * H; i++) { const l = lab[i]; if (l < 0) continue; let o = info.get(l); if (!o) info.set(l, o = { xs: [], zs: [] }); o.xs.push(i % W); o.zs.push(Math.floor(i / W)); }
+  const S = 100 / 1 * G, pal = ['#f6d7a7', '#c7e9c0', '#c6dbef', '#fdd0a2', '#dadaeb', '#fcbba1', '#d9f0a3', '#c7eae5'];
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W * S + 40}" height="${H * S + 110}" viewBox="-20 -60 ${W * S + 40} ${H * S + 110}" font-family="system-ui,sans-serif"><rect x="-20" y="-60" width="${W * S + 40}" height="${H * S + 110}" fill="#fff"/>`;
+  const runs = (mask, color) => { let o = ''; for (let z = 0; z < H; z++) { let x = 0; while (x < W) { if (!mask(z * W + x)) { x++; continue; } const a = x; while (x < W && mask(z * W + x)) x++; o += `<rect x="${a * S}" y="${z * S}" width="${(x - a) * S}" height="${S}" fill="${color}"/>`; } } return o; };
+  let total = 0, rn = 0; const labels = [];
+  for (const [l, o] of info) { const area = o.xs.length * G * G; if (area < .8) continue; total += area; rn++; svg += runs(i => lab[i] === l, pal[rn % pal.length]);
+    const mx = o.xs.reduce((a, b) => a + b, 0) / o.xs.length, mz = o.zs.reduce((a, b) => a + b, 0) / o.zs.length; let sxx = 0, szz = 0, sxz = 0;
+    for (let k = 0; k < o.xs.length; k++) { const a = o.xs[k] - mx, b = o.zs[k] - mz; sxx += a * a; szz += b * b; sxz += a * b; }
+    const th = .5 * Math.atan2(2 * sxz, sxx - szz), c = Math.cos(th), sn = Math.sin(th), u = [], w = []; for (let k = 0; k < o.xs.length; k++) { const a = o.xs[k] - mx, b = o.zs[k] - mz; u.push(a * c + b * sn); w.push(-a * sn + b * c); }
+    const ext = A => { A.sort((a, b) => a - b); return (A[Math.floor(A.length * .98)] - A[Math.floor(A.length * .02)] + 1) * G; }, e1 = ext(u), e2 = ext(w);
+    labels.push(`<text x="${mx * S}" y="${mz * S - 6}" text-anchor="middle" font-size="15" font-weight="600" fill="#222">Room ${rn}</text><text x="${mx * S}" y="${mz * S + 12}" text-anchor="middle" font-size="13" fill="#333">${Math.max(e1, e2).toFixed(2)} × ${Math.min(e1, e2).toFixed(2)} m · ${area.toFixed(1)} m²</text>`); }
+  svg += runs(i => Wl[i] === 1, '#2b2b2b') + labels.join('');
+  svg += `<text x="0" y="-32" font-size="20" font-weight="700" fill="#111">${(rec.name || 'Scan').replace(/[<&]/g, '')}: floor plan</text><text x="0" y="-12" font-size="13" fill="#444">${rn} room${rn === 1 ? '' : 's'} · ${total.toFixed(1)} m² of floor found · grid 5 cm</text>`;
+  svg += `<g transform="translate(0,${H * S + 20})"><rect x="0" y="0" width="${100}" height="6" fill="#111"/><text x="0" y="22" font-size="12">1 m</text></g></svg>`;
+  return { svg, rooms: rn, area: total };
 }
 
 /* ================= live photo view: walk through your house the way the camera saw it =================
@@ -2472,6 +2613,7 @@ const BTN = () => page === 0 ? [
   { id: 'autodet', label: auto.detail ? 'Auto detail ✓' : 'Auto detail', on: auto.detail },
   { id: 'sweeps', label: sweep.enabled ? 'Room sweeps ✓' : 'Room sweeps', on: sweep.enabled },
   { id: 'guide', label: auto.guide ? 'Guidance ✓' : 'Guidance', on: auto.guide },
+  { id: 'tune', label: 'Self-test & tune' },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
   { id: 'clear', label: 'Clear map' },
@@ -2493,7 +2635,7 @@ function diagSnapshot() {
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, clock: colorCam.clock || null, latencyMs: colorCam.lat != null ? Math.round(colorCam.lat) : null, k1: colorCam.k1 || 0, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
-    storage: diag.storage || null, quickSaves: diag.quickSaves || 0, map: { voxels: N, free: freeIds.length, recycled, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
+    storage: diag.storage || null, tune: tune.saved || null, quickSaves: diag.quickSaves || 0, map: { voxels: N, free: freeIds.length, recycled, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
 }
 async function storageInfo() { try { const e = await navigator.storage.estimate(), p = navigator.storage.persisted ? await navigator.storage.persisted() : null; diag.storage = { usedMB: Math.round(e.usage / 1e6), quotaMB: Math.round(e.quota / 1e6), persisted: p }; } catch (err) {} }
@@ -2503,6 +2645,7 @@ function diagSave() { storageInfo(); try { localStorage.setItem('scanner.diag', 
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
+  if (tune.on) return { title: 'Self-test', sub: 'Measuring view ' + (tune.i + 1) + ' of ' + tune.modes.length + ' · hold still', p: (tune.i + Math.min(1, (performance.now() - tune.t0) / 6500)) / tune.modes.length };
   if (sweep.on && !replayMode) { const d = sweep.steps.filter(s => s.done).length; return { title: 'Room sweep', sub: sweep.msg + ' · ' + d + '/' + sweep.steps.length, p: d / sweep.steps.length }; }
   if (sweep.calibrating) return { title: 'Scanning', sub: 'Calibrating the camera from the sweep… keep scanning', p: coverage() };
   if (relocate && workerPathReady()) { const L = relocate.last; return { title: 'Finding your last scan', sub: !L ? 'Look around at the walls' : L.need ? 'Look at more of the walls around you' : 'Matching… ' + Math.round((L.wallFit || 0) * 100) + '% fit · keep looking around', p: L && !L.need ? Math.min(1, (L.wallFit || 0) / .5) : Math.min(1, ((L && L.wallCells) || 0) / 100) }; }
@@ -2598,7 +2741,7 @@ function sweepTick() {
     const hit = st.k === 'floor' ? pitch < -.8 : st.k === 'ceiling' ? pitch > .75 : Math.abs(pitch) < .5 && Math.abs(Math.atan2(Math.sin(yaw - st.yaw), Math.cos(yaw - st.yaw))) < Math.PI / 8;
     if (hit) { st.t += dt; if (st.t >= st.need) { st.done = true; kf.has = false; buzz(rightCtl.c && rightCtl.c.userData.src, .3, 20); } } }
   const left = sweep.steps.filter(s => !s.done);
-  if (!left.length) { sweep.on = false; toast('Room swept: calibrating the camera…'); calibrateCameraLive(); return; }
+  if (!left.length) { sweep.on = false; toast('Room swept: calibrating the camera…'); calibrateCameraLive(); if (!tune.saved) setTimeout(() => { if (scanning && !tune.on) tuneStart(); }, 4000); return; }
   /* point at the nearest step still to do */
   const dirOf = st => st.k === 'floor' ? new V3(f.x * .3, -1, f.z * .3).normalize() : st.k === 'ceiling' ? new V3(f.x * .3, 1, f.z * .3).normalize() : new V3(Math.sin(st.yaw), 0, -Math.cos(st.yaw));
   const nxt = left.sort((a, b) => f.angleTo(dirOf(a)) - f.angleTo(dirOf(b)))[0]; guide.dir = dirOf(nxt); guide.text = nxt.txt; sweep.msg = nxt.txt;
@@ -2615,6 +2758,22 @@ async function calibrateCameraLive() {                               // photo-ma
     toast('Camera calibrated: colours and photos locked in (' + Math.round(new V3().setFromMatrixPosition(new M4().fromArray(a.E)).length() * 100) + ' cm offset)');
   } catch (e) { toast('Camera calibration later: ' + e.message); diagLog('livecal', e.message); }
   sweep.calibrating = false;
+}
+
+
+/* ================= self-test & tune: measure this headset, keep the best view that stays smooth ================= */
+const tune = { on: false, modes: [], i: 0, t0: 0, fps: [], res: {} };
+try { const t = JSON.parse(localStorage.getItem('scanner.tune') || 'null'); if (t && t.showMode != null) { showMode = t.showMode; tune.saved = t; } } catch (e) {}
+function tuneStart() { tune.modes = (kfMem.length ? [4, 3, 0] : [3, 0]); tune.i = 0; tune.res = {}; tune.on = true; tune.t0 = performance.now(); tune.fps = []; showMode = tune.modes[0]; applySurf(); toast('Self-test: hold still and look at the room for ~20 s'); }
+function tuneTick() {
+  if (!tune.on) return; const now = performance.now(); if (now - tune.t0 < 1500) return;   // let each mode settle first
+  tune.fps.push(fps); if (now - tune.t0 < 6500) return;
+  const f = tune.fps.slice().sort((a, b) => a - b)[tune.fps.length >> 1]; tune.res[tune.modes[tune.i]] = Math.round(f);
+  if (++tune.i < tune.modes.length) { showMode = tune.modes[tune.i]; applySurf(); tune.t0 = now; tune.fps = []; return; }
+  tune.on = false; const pickM = tune.modes.find(m => tune.res[m] >= 58) ?? tune.modes.slice().sort((a, b) => tune.res[b] - tune.res[a])[0];
+  showMode = pickM; applySurf(); const prof = { showMode: pickM, fps: tune.res, depthNoise_cm: depth.track && depth.track.rms ? +(depth.track.rms * 100).toFixed(1) : null, cameraDelay_ms: colorCam.lat != null ? Math.round(colorCam.lat) : null, depthLag: depth.lag || 0, at: Date.now() };
+  try { localStorage.setItem('scanner.tune', JSON.stringify(prof)); } catch (e) {} tune.saved = prof; diagLog('tune', JSON.stringify(prof));
+  toast('Tuned: ' + ['dots', 'solid points', 'nothing', 'live mesh', 'photo mesh'][pickM] + ' (' + tune.res[pickM] + ' fps)');
 }
 
 /* ================= after saving: refine, mesh and photo-texture by themselves, one scan at a time ================= */
@@ -2710,6 +2869,7 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'tune') { page = 0; tuneStart(); }
   if (id === 'skipsweep') { sweep.on = false; toast('Sweep skipped'); }
   if (id === 'skipreloc' && relocate) { const R = relocate; relocate = null; finishContinue(R.rec, R.guess || new M4()); toast(R.guess ? 'Placed by the saved anchor' : 'Loaded where you started this session'); }
   if (id === 'autodet') { auto.detail = !auto.detail; }
@@ -2840,6 +3000,10 @@ async function listScans() {
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Refine', () => refineScan(r));
+    mk('Floor plan', () => { try { const fp = floorPlan(r); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } });
+    mk('Merge with…', async () => { const others = all.filter(o => o.id !== r.id); if (!others.length) { $('st').textContent = 'Scan another room first, then merge.'; return; }
+      const pick = prompt('Merge "' + r.name + '" with which scan? Type its number:\n' + others.map((o, i) => (i + 1) + '. ' + o.name + ' (' + new Date(o.date).toLocaleDateString() + ')').join('\n'), '1'); const o = others[(+pick || 0) - 1]; if (!o) return;
+      try { const m = await mergeScans(r, o, t => $('st').textContent = 'Merging: ' + t); $('st').textContent = 'Merged into "' + m.rec.name + '" (' + Math.round(m.overlap * 100) + '% overlap). It is being refined with loop closure now.'; listScans(); } catch (e) { $('st').textContent = 'Merge: ' + e.message; } });
     mk('Match photos', async () => { const st = $('st'); try { const a = await alignPhotos(r, m => st.textContent = 'Photo matching: ' + m + '…'); st.textContent = 'Photos matched: ' + a.used + ' photos, colour error ' + (a.rms0 * 100).toFixed(1) + '% → ' + (a.rms1 * 100).toFixed(1) + '%, camera offset ' + Math.hypot(a.E[12], a.E[13], a.E[14]).toFixed(3) + ' m. Re-run Photo texture.'; } catch (e) { st.textContent = 'Photo matching: ' + e.message; } });
     mk('Photo texture', async () => { const st = $('st'), t0 = performance.now(); st.textContent = 'Texturing…';
       try { delete r.tex; const t = await recTexture(r, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
@@ -2865,7 +3029,7 @@ function openViewer(rec) {
   recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); ibrStart(rec, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = tune.saved ? tune.saved.showMode : 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
 $('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
   download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
@@ -2927,7 +3091,7 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); sweepTick(); relocTick(); if (Math.floor(clockT * 2) !== Math.floor((clockT - dt) * 2)) liveCull(); if (replayMode || ibr.live) ibrUpdate(renderer.xr.getCamera());
+    autoTick(dt); sweepTick(); relocTick(); tuneTick(); if (Math.floor(clockT * 2) !== Math.floor((clockT - dt) * 2)) liveCull(); if (replayMode || ibr.live) ibrUpdate(renderer.xr.getCamera());
     if (showMode === 4 && !ibr.live && kfMem.length && !replayMode && Math.floor(clockT) !== Math.floor(clockT - dt)) applySurf(); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
