@@ -115,17 +115,18 @@ pg.setAttribute('col', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicD
 pg.setAttribute('cw', new THREE.BufferAttribute(cw, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setDrawRange(0, 0);
 const pmat = new THREE.ShaderMaterial({
-  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
+  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 } },
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY, photo; varying vec3 vC; varying float ok;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
-      ok = step(minC, cnt); gl_PointSize = ok * clamp(size * scale / max(.05, -mv.z), 1.0, 24.0);
+      ok = step(minC, cnt); gl_PointSize = ok * clamp(size * (1.0 + photo * .8) * scale / max(.05, -mv.z), 1.0, 40.0);
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
       vec3 base = mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));                 // floor warm, walls cool
       base *= .75 + .25 * clamp(cnt / 24.0, 0.0, 1.0);                                                    // well-seen surfaces brighter
       base = mix(base, col, step(.01, cw));                                                               // real colour from the passthrough camera
       base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * (cw > .01 ? .35 : .7));                       // seen from one angle only: amber
-      float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh); }`,
-  fragmentShader: `varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; gl_FragColor = vec4(vC, 1.0); }`
+      float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh);
+      if (photo > .5) vC = cw > .01 ? col : base * .7; }`,                                           // walk-through: the camera's colours only
+  fragmentShader: `uniform float photo, alpha; varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; if (photo > .5) { vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; } gl_FragColor = vec4(vC, alpha); }`
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
 function flushGeo() {
@@ -237,7 +238,7 @@ function handsNow() { const out = []; for (const g of grips) if (g.visible !== f
    (80° by default; ?hfov=NN in the URL to tune it, ?cy=0.0x to nudge it vertically). */
 const colorCam = { on: false, video: null, cv: document.createElement('canvas'), ctx: null, data: null, t: 0, status: 'off',
   f: 1 / Math.tan((Number(new URLSearchParams(location.search).get('hfov')) || 80) * Math.PI / 360), cy: Number(new URLSearchParams(location.search).get('cy')) || 0 };
-colorCam.cv.width = 256; colorCam.cv.height = 144; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
+colorCam.cv.width = 512; colorCam.cv.height = 288; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
 async function toggleColor() {
   if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); colorCam.status = 'off'; return; }
   try {
@@ -246,10 +247,25 @@ async function toggleColor() {
     colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight;
   } catch (e) { colorCam.status = 'unavailable (' + (e.name || e.message) + ')'; toast('Camera colour needs Horizon OS v74+ and camera permission'); }
 }
+const kf = { cv: document.createElement('canvas'), busy: false, t: 0, pos: new V3(), q: new THREE.Quaternion(), prevQ: new THREE.Quaternion(), prevT: 0, has: false, n: 0 };
+function maybeKeyframe(vp, tNow) {
+  const c = colorCam; if (!c.on || !scanning || replayMode || kf.busy || !c.video || c.video.readyState < 2) return;
+  const m = new M4().fromArray(vp.transform.matrix), p = new V3().setFromMatrixPosition(m), q = new THREE.Quaternion().setFromRotationMatrix(m);
+  const spin = kf.prevT ? kf.prevQ.angleTo(q) / Math.max(1e-3, tNow - kf.prevT) : 9; kf.prevQ.copy(q); kf.prevT = tNow;
+  if (spin > .5) return;                                                           // turning faster than ~30°/s: the frame would be blurred
+  if (kf.has && tNow - kf.t < .35) return;
+  if (kf.has && p.distanceTo(kf.pos) < .22 && q.angleTo(kf.q) < .21) return;      // nothing new in view since the last keyframe
+  if (!currentId) currentId = 'scan-' + Date.now();
+  const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
+  kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
+  kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
+  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(vp.transform.matrix), w, h, hfov: 2 * Math.atan(1 / c.f), cy: c.cy };
+  kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
+}
 function camFrame(vp) {
   const c = colorCam; if (!c.on || !c.video || c.video.readyState < 2) return null;
-  if (performance.now() - c.t > 90) { c.ctx.drawImage(c.video, 0, 0, 256, 144); c.data = c.ctx.getImageData(0, 0, 256, 144).data; c.t = performance.now(); }
-  return { data: c.data, w: 256, h: 144, f: c.f, asp: 256 / 144, cy: c.cy };
+  if (performance.now() - c.t > 90) { c.ctx.drawImage(c.video, 0, 0, 512, 288); c.data = c.ctx.getImageData(0, 0, 512, 288).data; c.t = performance.now(); }
+  return { data: c.data, w: 512, h: 288, f: c.f, asp: 512 / 288, cy: c.cy };
 }
 function sampleDepth(frame, ref, session, tNow) {
   if (!depth.binding || !scanning) return;
@@ -318,11 +334,19 @@ function sampleDepth(frame, ref, session, tNow) {
 /* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
 const DB = (() => {
   let db = null;
-  const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => { const r = indexedDB.open('house-scanner', 1); r.onupgradeneeded = () => r.result.createObjectStore('scans', { keyPath: 'id' }); r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error); });
-  const tx = (mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction('scans', mode), s = t.objectStore('scans'), q = fn(s); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
-  return { put: o => tx('readwrite', s => s.put(o)), all: () => tx('readonly', s => s.getAll()), get: id => tx('readonly', s => s.get(id)), del: id => tx('readwrite', s => s.delete(id)) };
+  const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => {
+    const r = indexedDB.open('house-scanner', 2);
+    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); };
+    r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error);
+  });
+  const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
+  return {
+    put: o => tx('scans', 'readwrite', s => s.put(o)), all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => tx('scans', 'readwrite', s => s.delete(id)),
+    putFrame: o => tx('frames', 'readwrite', s => s.put(o)), frames: id => tx('frames', 'readonly', s => s.index('scan').getAll(id)), countFrames: id => tx('frames', 'readonly', s => s.index('scan').count(id)),
+    delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
+  };
 })();
-let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null;
+let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null, replayMode = false, reality = 0;
 function snapshot() {
   const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF) keep.push(i);
   const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length), Mk = new Uint32Array(keep.length), Cl = new Uint8Array(keep.length * 4);
@@ -379,6 +403,30 @@ async function zipOne(name, blob) {                                   // a singl
   const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, 1, true); end.setUint16(10, 1, true); end.setUint32(12, cl, true); end.setUint32(16, off, true);
   return new Blob([lh.buffer, nm, data, ch.buffer, nm, end.buffer]);
 }
+async function zipMany(files) {                                    // stored (uncompressed) zip of [{name, blob}]
+  const parts = [], central = []; let off = 0;
+  for (const f of files) {
+    const data = new Uint8Array(await f.blob.arrayBuffer()), nm = new TextEncoder().encode(f.name), crc = CRC(data);
+    const lh = new DataView(new ArrayBuffer(30)); lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true);
+    const ch = new DataView(new ArrayBuffer(46)); ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
+    parts.push(lh.buffer, nm, data); central.push(ch.buffer, nm); off += 30 + nm.length + data.length;
+  }
+  const cl = central.reduce((a, x) => a + (x.byteLength ?? x.length), 0);
+  const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cl, true); end.setUint32(16, off, true);
+  return new Blob([...parts, ...central, end.buffer]);
+}
+async function exportPhotos(rec) {
+  $('st').textContent = 'Packing photos…';
+  const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
+  if (!fr.length) { $('st').textContent = 'No photos recorded for this scan. Turn on camera colour while scanning.'; return; }
+  const f0 = fr[0], fl = f0.w / 2 / Math.tan(f0.hfov / 2);
+  const tj = { camera_model: 'OPENCV', fl_x: fl, fl_y: fl, cx: f0.w / 2, cy: f0.h * (.5 + (f0.cy || 0)), w: f0.w, h: f0.h, k1: 0, k2: 0, p1: 0, p2: 0, ply_file_path: 'points3D.ply',
+    frames: fr.map((f, i) => { const m = f.m; return { file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }; }) };
+  const readme = 'House Scanner photo export: ' + fr.length + ' keyframes with headset poses.\n\nTrain a Gaussian splat on a PC:\n- Brush (free, github.com/ArthurBrussee/brush): open this folder (Nerfstudio format).\n- Nerfstudio: ns-train splatfacto --data <this folder>\n- Postshot / RealityScan: import the images folder and let it solve camera poses itself (most robust).\n\nPoses are OpenGL camera-to-world in the scan\'s coordinates (metres, y up). Intrinsics assume a ' + (f0.hfov * 180 / Math.PI).toFixed(0) + '° horizontal FOV.\n';
+  const files = [{ name: 'transforms.json', blob: new Blob([JSON.stringify(tj, null, 1)]) }, { name: 'points3D.ply', blob: plyBlob(rec) }, { name: 'README.txt', blob: new Blob([readme]) },
+    ...fr.map((f, i) => ({ name: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', blob: f.blob }))];
+  download((rec.name || 'scan').replace(/\W+/g, '-') + '-photos.zip', await zipMany(files));
+}
 async function download(name, blob) {
   const d = await dlCap();
   if (d) {
@@ -394,7 +442,8 @@ function exportJSON(rec) {
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, understanding: rec.understanding || null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
-function exportPLY(rec) {
+function exportPLY(rec) { download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', plyBlob(rec)); }
+function plyBlob(rec) {
   const n = rec.points.length / 3, head = 'ply\nformat binary_little_endian 1.0\ncomment house-scanner voxel ' + rec.voxelSize + ' m\nelement vertex ' + n + '\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
   const body = new DataView(new ArrayBuffer(n * 15));
   for (let k = 0; k < n; k++) {
@@ -403,7 +452,7 @@ function exportPLY(rec) {
     const C = rec.colors, hc = C && C[k * 4 + 3];
     body.setUint8(o + 12, hc ? C[k * 4] : 160 + 40 * h | 0); body.setUint8(o + 13, hc ? C[k * 4 + 1] : 130 + 85 * h | 0); body.setUint8(o + 14, hc ? C[k * 4 + 2] : 100 + 130 * h | 0);
   }
-  download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', new Blob([head, body.buffer], { type: 'application/octet-stream' }));
+  return new Blob([head, body.buffer], { type: 'application/octet-stream' });
 }
 /* glTF binary: coloured point cloud, Quest room meshes (in world space), wall/stair/object boxes, understanding in extras */
 function exportGLB(rec) {
@@ -663,11 +712,16 @@ const BTN = () => [
   { id: 'analyze', label: 'Re-analyse now' },
   { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
   { id: 'color', label: colorCam.on ? 'Camera colour: ON' : 'Camera colour: OFF', on: colorCam.on },
+  ...(replayMode ? [{ id: 'reality', label: ['Showing: captured', 'Showing: blend', 'Showing: real'][reality], on: true }] : []),
   { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
   { id: 'save', label: 'Save scan' },
   { id: 'clear', label: 'Clear map' },
   { id: 'exit', label: 'Exit' }
 ];
+function setReality() {                                    // captured house only, half-and-half, or the real room through passthrough
+  pmat.uniforms.alpha.value = reality === 1 ? .55 : 1; pmat.transparent = reality === 1; pmat.needsUpdate = true;
+  cloud.visible = reality !== 2; renderer.setClearColor(0x080808, reality === 0 ? 1 : 0);
+}
 function toast(m) { toastMsg = m; toastT = 4; }
 function drawPanel() {
   const g = panel.g, W = 640, H = 680; g.clearRect(0, 0, W, H);
@@ -680,7 +734,8 @@ function drawPanel() {
     'room layout     ' + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
     'depth           ' + depth.status,
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
-    'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps)
+    'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps),
+    'photos          ' + kf.n + ' keyframes' + (colorCam.on ? (replayMode ? '' : ' · recording while you scan') : ' · turn camera colour on to record')
   ];
   lines.push(...understandingLines(understanding).map(l => l.slice(0, 54)), 'amber = seen from one angle: look again from elsewhere');
   lines.forEach((l, i) => g.fillText(l, 22, 80 + i * 25));
@@ -697,13 +752,14 @@ function drawPanel() {
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; }
   if (id === 'color') await toggleColor();
+  if (id === 'reality') { reality = (reality + 1) % 3; setReality(); }
   if (id === 'under') { underOn = !underOn; underG.visible = underOn; }
   if (id === 'analyze') { runUnderstanding(); toast(understanding ? 'Analysed in ' + Math.round(understanding.ms) + ' ms' : 'Scan a bit more first'); }
   if (id === 'room') { if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; layout.visible = showMode !== 1; }
   if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
   if (id === 'save') saveScan(frame);
-  if (id === 'clear') { clearMap(); understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -748,8 +804,11 @@ $('bAR').addEventListener('click', async () => {
     if (s.depthUsage === 'gpu-optimized' || (feats.includes('depth-sensing') && !s.depthUsage)) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed'; } }
     else if (s.depthUsage) depth.status = 'cpu depth (unsupported here)';
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { xrSession = null; $('ui').classList.remove('hide'); listScans(); });
-    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; setTimeout(() => loadIntoSession(r), 1500); }
+    s.addEventListener('end', () => { xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = false; cloud.visible = true; $('ui').classList.remove('hide'); listScans(); });
+    if (replayMode) { scanning = false; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
+    else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; }
+    kf.has = false; kf.n = 0;
+    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
 });
 let pendingOpen = null, askedRoom = false;
@@ -766,11 +825,13 @@ async function listScans() {
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
     sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : ''); n.appendChild(sm); row.appendChild(n);
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
+    mk('Walk through', () => { pendingOpen = r; replayMode = true; if (!$('bAR').disabled) $('bAR').click(); else { replayMode = false; $('st').textContent = 'Walking through needs the Quest browser. Use View here.'; } });
+    mk('Photos .zip', () => exportPhotos(r));
     mk('Continue', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
-    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); listScans(); } });
+    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
     el.appendChild(row);
   }
 }
@@ -827,6 +888,7 @@ renderer.setAnimationLoop((t, frame) => {
       else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
     }
     if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
+    { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
     if (scanning && clockT - underAt > (understanding && understanding.ms > 250 ? 30 : 10) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
     { const cp = renderer.xr.getCamera().getWorldPosition(new V3()), f = renderer.xr.getCamera().getWorldDirection(new V3()); f.y = 0; f.normalize();
