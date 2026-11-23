@@ -291,39 +291,65 @@ function camFrame(vp) {
   return { data: c.data, w: 512, h: 288, f: c.f, asp: 512 / 288, cy: c.cy };
 }
 function sampleDepth(frame, ref, session, tNow) {
-  if (!depth.binding || !scanning || DR.sync || depth.meta) return;
+  if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
+  const freeze = (extra) => Object.assign({
+    tNow, xf: new M4().fromArray(((info && info.transform) || view.transform).matrix), inv: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).invert(),
+    PE: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).elements, nd: new M4(), head: new V3().setFromMatrixPosition(vp.transform.matrix), fwdY: -vp.transform.matrix[9],
+    hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix) }, extra);
+  if (depth.cpu) {                                               // CPU depth: the browser hands us metres directly
+    try { info = frame.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
+    if (!info) { depth.status = 'waiting'; return; }
+    const jx = Math.random() / DW, jy = Math.random() / DH, zc = new Float32Array(DW * DH);
+    for (let y = 0; y < DH; y++) for (let x = 0; x < DW; x++) { let z = 0; try { z = info.getDepthInMeters((x + .5) / DW + jx, 1 - ((y + .5) / DH + jy)); } catch (e) {} zc[y * DW + x] = z; }
+    depth.sensor = 'cpu ' + info.width + '×' + info.height;
+    depth.meta = freeze({ cpu: true, zc, jx, jy }); integrateDepth(); return;
+  }
   try { info = depth.binding.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
   try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
+  depth.sensor = (isArr ? 'array' : '2d') + ' ' + (info.width || '?') + '×' + (info.height || '?') + ' near ' + (+(info.depthNear ?? session.renderState.depthNear)).toFixed(2) + ' far ' + (+(info.depthFar ?? session.renderState.depthFar)).toFixed(1);
   depth.meta = {
+    fwdY: -vp.transform.matrix[9],
     isArr, lumA, jx, jy, tNow, fmt: session.depthDataFormat,
     inv: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).invert(), PE: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements,
     xf: new M4().fromArray((info.transform || view.transform).matrix),
-    nd: info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix).invert() : new M4(),
+    nd: new M4(),
     near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
     head: new V3().setFromMatrixPosition(vp.transform.matrix), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
   };
 }
 function integrateDepth() {
   const M = depth.meta; depth.meta = null; if (!M) return;
-  const t0 = performance.now(), { isArr, lumA, tNow, near, far, r2m } = M;
+  const t0 = performance.now(), { isArr, lumA, tNow, near, far, r2m } = M; let up = 0, down = 0;
   _inv.copy(M.inv); _xf.copy(M.xf); _nd.copy(M.nd); depth.cam.setFromMatrixPosition(_xf);
   const zs = depth.zs, j = { x: M.jx, y: M.jy }, B = depthBuf;
   let valid = 0;
-  for (let k = 0; k < DW * DH; k++) {
-    const o = k * 4; let z;
-    if (lumA) z = (B[o] + B[o + 1] * 256) * r2m;                                   // millimetres
-    else {
-      const raw = (B[o] * 65536 + B[o + 1] * 256 + B[o + 2]) / 16777215;
-      if (B[o + 3] > 127) z = raw * 32 * M.rvm;                                   // already metres
-      else { if (raw <= 0 || raw >= 1) { zs[k] = 0; continue; } z = isFinite(far) ? 2 * near * far / (far + near - (raw * 2 - 1) * (far - near)) : near / (1 - raw); }
+  if (M.cpu) { for (let k = 0; k < DW * DH; k++) { zs[k] = M.zc[k]; if (zs[k] > .2 && zs[k] < 4.5) valid++; } depth.modeName = 'metres (cpu)'; }
+  else {
+    /* the sensor's encoding isn't announced reliably: try each and keep the one that gives sensible room distances */
+    const raws = depth.raws || (depth.raws = new Float32Array(DW * DH)); let flagged = 0;
+    for (let k = 0; k < DW * DH; k++) { const o = k * 4; raws[k] = lumA ? (B[o] + B[o + 1] * 256) : (B[o] * 65536 + B[o + 1] * 256 + B[o + 2]) / 16777215; if (!lumA && B[o + 3] > 127) { raws[k] *= 32; flagged++; } }
+    const MODES = {
+      mm: rw => rw * r2m,                                                                  // luminance-alpha millimetres
+      metres: rw => rw * M.rvm,                                                           // float metres
+      ndc: rw => rw <= 0 || rw >= 1 ? 0 : isFinite(far) ? 2 * near * far / (far + near - (rw * 2 - 1) * (far - near)) : near / (1 - rw),
+      reversed: rw => rw <= 0 ? 0 : isFinite(far) ? near * far / (near + rw * (far - near)) : near / rw,
+      u16: rw => rw * 65535 * r2m                                                          // 16-bit raw units
+    };
+    const cands = lumA ? ['mm'] : flagged ? ['metres'] : ['ndc', 'reversed', 'u16', 'metres'];
+    if (!depth.mode || !cands.includes(depth.mode) || depth.frames % 40 === 0) {
+      let best = null, bs = -1;
+      for (const m of cands) { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } if (sc > bs) { bs = sc; best = m; } }
+      depth.mode = best;
     }
-    zs[k] = z; if (z > .2 && z < 4.5) valid++;
+    const f = MODES[depth.mode]; depth.modeName = depth.mode;
+    for (let k = 0; k < DW * DH; k++) { const z = f(raws[k]); zs[k] = z; if (z > .2 && z < 4.5) valid++; }
+    depth.rawSample = raws[(DH >> 1) * DW + (DW >> 1)];
   }
   depth.valid = valid;
   if (++depth.frames <= 15) { depth.status = 'warming up the depth sensor'; return; }      // first ~15 frames are sensor-calibration noise
@@ -350,6 +376,7 @@ function integrateDepth() {
     const vx = _p.x, vy = _p.y, vz = _p.z;
     _p.applyMatrix4(_xf);
     if (inBody(_p.x, _p.y, _p.z)) continue;
+    if (M.fwdY < -.6) { if (_p.y > M.head.y + .1) up++; else if (_p.y < M.head.y - .3) down++; }
     const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
     if (id >= 0 && cam && w > .3) {                            // colour it from the passthrough camera frame
       _c.copy(_p).applyMatrix4(vinv);
@@ -360,6 +387,9 @@ function integrateDepth() {
     for (const f of [.45, .7, .88]) { const t = f * z; if (z - t < .08) continue; _c.set(vx * f, vy * f, vz * f).applyMatrix4(_xf); if (!inBody(_c.x, _c.y, _c.z)) carve(_c.x, _c.y, _c.z, .35 * w); }
     added++;
   }
+  /* looking down but the surface lands above your head: the depth image is upside down. Fix it once and start clean */
+  if (M.fwdY < -.6 && up + down > 300) { depth.flipVotes = (depth.flipVotes || 0) + (up > down * 2 ? 1 : down > up * 2 ? -1 : 0);
+    if (depth.flipVotes >= 3 && depth.flipAuto < 2) { depth.flipY = !depth.flipY; depth.flipAuto++; depth.flipVotes = 0; clearMap(); toast('Depth image was upside down: corrected automatically'); } }
   const ms = performance.now() - t0; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
   depth.rate = Math.max(.07, depth.ms * 4 / 1000);                    // keep integration under ~25% of the frame budget
   depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms';
@@ -745,9 +775,9 @@ function understandingLines(res) {
 
 /* ================= in-headset control panel (left hand) and pointer (right hand) ================= */
 const panel = (() => {
-  const c = document.createElement('canvas'); c.width = 640; c.height = 680; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .255), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
-  mesh.position.set(.0, .07, -.04); mesh.rotation.set(-.85, 0, 0);
+  const c = document.createElement('canvas'); c.width = 640; c.height = 800; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .3), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
+  mesh.position.set(.0, .1, -.04); mesh.rotation.set(-.85, 0, 0);
   return { c, g: c.getContext('2d'), t, mesh, hover: -1, buttons: [] };
 })();
 let scanning = true, lastSave = 0, toastMsg = '', toastT = 0, clockT = 0, fps = 72, fpsAcc = 0, fpsN = 0;
@@ -771,7 +801,7 @@ function setReality() {                                    // captured house onl
 }
 function toast(m) { toastMsg = m; toastT = 4; }
 function drawPanel() {
-  const g = panel.g, W = 640, H = 680; g.clearRect(0, 0, W, H);
+  const g = panel.g, W = 640, H = 800; g.clearRect(0, 0, W, H);
   g.fillStyle = 'rgba(14,16,18,.92)'; g.fillRect(0, 0, W, H); g.strokeStyle = '#2f3438'; g.lineWidth = 2; g.strokeRect(1, 1, W - 2, H - 2);
   g.fillStyle = '#e8e6df'; g.font = '600 28px monospace'; g.fillText('HOUSE SCANNER', 22, 44);
   g.font = '19px monospace'; g.fillStyle = '#9ad8e4';
@@ -780,21 +810,23 @@ function drawPanel() {
     'surface points  ' + confirmed.toLocaleString() + '  (~' + area.toFixed(1) + ' m²)',
     'Meta layout     ' + (useMeta ? '' : '(off) ') + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
     'depth           ' + depth.status,
+    'sensor          ' + (depth.sensor || '-') + ' · ' + (depth.modeName || '-') + (depth.rawSample !== undefined ? ' · raw ' + (+depth.rawSample).toPrecision(4) : ''),
+    '                ' + (depth.diag || '').slice(0, 50),
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
     ...(scanErr ? ['ERROR ' + scanErr] : []),
     'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps),
     'photos          ' + kf.n + ' keyframes' + (colorCam.on ? (replayMode ? '' : ' · recording while you scan') : ' · turn camera colour on to record')
   ];
   lines.push(...understandingLines(understanding).map(l => l.slice(0, 54)), 'amber = seen from one angle: look again from elsewhere');
-  lines.forEach((l, i) => g.fillText(l, 22, 80 + i * 25));
+  lines.forEach((l, i) => { g.fillStyle = /^(ERROR|depth +NOT|depth +error|depth +read)/.test(l) ? '#ff8a7a' : '#9ad8e4'; g.fillText(l, 22, 78 + i * 24); });
   panel.buttons = []; const bs = BTN(), bw = 290, bh = 50;
   bs.forEach((b, i) => {
-    const x = 22 + (i % 2) * (bw + 16), y = 300 + Math.floor(i / 2) * (bh + 10);
+    const x = 22 + (i % 2) * (bw + 16), y = 420 + Math.floor(i / 2) * (bh + 10);
     panel.buttons.push({ ...b, x, y, w: bw, h: bh });
     g.fillStyle = panel.hover === i ? '#2b6f7c' : b.on ? '#1d4a53' : '#24282c'; g.fillRect(x, y, bw, bh);
     g.fillStyle = '#eef'; g.font = '20px monospace'; g.fillText(b.label, x + 14, y + 32);
   });
-  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 668); }
+  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 788); }
   panel.t.needsUpdate = true;
 }
 async function press(id, frame) {
@@ -828,7 +860,7 @@ function updatePointer() {
   const h = pointerRay.intersectObject(panel.mesh)[0];
   laser.scale.z = h ? h.distance : 2;
   if (!h) return;
-  const px = h.uv.x * 640, py = (1 - h.uv.y) * 680;
+  const px = h.uv.x * 640, py = (1 - h.uv.y) * 800;
   panel.hover = panel.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
 }
 
@@ -842,16 +874,25 @@ async function checkXR() {
 }
 $('bAR').addEventListener('click', async () => {
   try {
-    const s = await navigator.xr.requestSession('immersive-ar', {
-      optionalFeatures: ['local-floor', 'unbounded', 'plane-detection', 'mesh-detection', 'depth-sensing', 'anchors', 'hand-tracking'],
-      depthSensing: { usagePreference: ['gpu-optimized'], dataFormatPreference: ['float32', 'luminance-alpha'] }
-    });
+    /* depth sensing in whatever format and mode this headset offers; asked as required first so we know it's really on */
+    const base = ['local-floor', 'unbounded', 'plane-detection', 'mesh-detection', 'anchors', 'hand-tracking'];
+    const tries = [
+      { requiredFeatures: ['depth-sensing'], optionalFeatures: base, depthSensing: { usagePreference: ['gpu-optimized', 'cpu-optimized'], dataFormatPreference: [] } },
+      { requiredFeatures: ['depth-sensing'], optionalFeatures: base, depthSensing: { usagePreference: ['gpu-optimized', 'cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32', 'unsigned-short'] } },
+      { optionalFeatures: base.concat('depth-sensing'), depthSensing: { usagePreference: ['gpu-optimized', 'cpu-optimized'], dataFormatPreference: [] } }
+    ];
+    let s = null, lastErr = null;
+    for (const init of tries) { try { s = await navigator.xr.requestSession('immersive-ar', init); break; } catch (e) { lastErr = e; } }
+    if (!s) throw lastErr || new Error('no session');
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    depth.binding = null; depth.frames = 0; depth.meta = null; DR.sync = null; useMeta = false; clearMeta(); depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
-    if (s.depthUsage === 'gpu-optimized' || (feats.includes('depth-sensing') && !s.depthUsage)) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed'; } }
-    else if (s.depthUsage) depth.status = 'cpu depth (unsupported here)';
+    depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; DR.sync = null; useMeta = false; clearMeta();
+    const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
+    depth.status = hasDepth ? 'starting' : 'NOT GRANTED by the browser (Quest settings > browser permissions; update Horizon OS)';
+    depth.diag = 'usage ' + (s.depthUsage || '-') + ' · format ' + (s.depthDataFormat || '-') + ' · feats ' + feats.filter(f => /depth|mesh|plane|anchor|unbounded/.test(f)).join(',');
+    if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
+    else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
     s.addEventListener('end', () => { xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = false; cloud.visible = true; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
