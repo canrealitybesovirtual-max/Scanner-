@@ -2318,11 +2318,17 @@ async function undoMerge(rec) {                                      // bring bo
   return back;
 }
 /* floor plan: walls and rooms from the scan, each room with its size and area (SVG) */
-function floorPlan(rec) {
-  const P = rec.points, Nn = rec.normals; if (!Nn) throw new Error('this scan has no surface directions (older version)');
-  const n = P.length / 3, hist = new Map(); for (let i = 0; i < n; i++) if (Nn[i * 3 + 1] > 100) { const k = Math.round(P[i * 3 + 1] / .04); hist.set(k, (hist.get(k) || 0) + 1); }
-  let fy = null, bc = 0; for (const k of [...hist.keys()].sort((a, b) => a - b)) { const c = hist.get(k) + (hist.get(k - 1) || 0) + (hist.get(k + 1) || 0); if (c > bc * 1.5 && c > 200) { fy = k * .04; bc = c; } }
-  if (fy == null) throw new Error('no floor found in this scan');
+/* floors: strong upward-facing layers at least 2.2 m apart, one per storey (table tops and beds are too close to count) */
+function floorLevels(P, Nn) {
+  const n = P.length / 3, h = new Map(); for (let i = 0; i < n; i++) if (Nn[i * 3 + 1] > 100) { const k = Math.round(P[i * 3 + 1] / .04); h.set(k, (h.get(k) || 0) + 1); }
+  const h3 = k => (h.get(k - 1) || 0) + (h.get(k) || 0) + (h.get(k + 1) || 0), peaks = [];
+  for (const k of h.keys()) { const c = h3(k); if (c > 200 && c >= h3(k - 1) && c >= h3(k + 1)) { const a = h.get(k - 1) || 0, b = h.get(k) || 0, d = h.get(k + 1) || 0; peaks.push({ y: (k + (d - a) / (a + b + d)) * .04, c }); } }   // weighted centre of the layer
+  peaks.sort((a, b) => b.c - a.c); const levels = [];
+  for (const p of peaks) { if (levels.length && (p.c < peaks[0].c * .2 || p.c < 1500)) continue; if (levels.every(y => Math.abs(y - p.y) > 2.2)) levels.push(p.y); }
+  return levels.sort((a, b) => a - b);
+}
+function planLevel(P, Nn, fy) {                                      // walls and rooms of one storey on a 5 cm grid
+  const n = P.length / 3;
   const G = .05, xs = [], zs = []; for (let i = 0; i < n; i += Math.max(1, n >> 17)) { const y = P[i * 3 + 1] - fy; if (y < -.1 || y > 2.2) continue; xs.push(P[i * 3]); zs.push(P[i * 3 + 2]); }
   const pc = (A, q) => A[Math.min(A.length - 1, Math.max(0, Math.floor(A.length * q)))]; xs.sort((a, b) => a - b); zs.sort((a, b) => a - b);   // stray far-away points can't blow up the grid
   let x0 = pc(xs, .002) - .3, x1 = pc(xs, .998) + .3, z0 = pc(zs, .002) - .3, z1 = pc(zs, .998) + .3; if (x1 - x0 > 100) x1 = x0 + 100; if (z1 - z0 > 100) z1 = z0 + 100;
@@ -2340,20 +2346,51 @@ function floorPlan(rec) {
   const keep = rooms.map(r => r.seedCells * G * G > .6); let q = []; for (let i = 0; i < W * H; i++) if (lab[i] >= 0) { if (keep[lab[i]]) q.push(i); else lab[i] = -1; }
   while (q.length) { const nq = []; for (const j of q) for (const d of [1, -1, W, -W]) { const k = j + d; if (k >= 0 && k < W * H && Fc[k] && lab[k] < 0) { lab[k] = lab[j]; nq.push(k); } } q = nq; }   // grow back out to the walls
   const info = new Map(); for (let i = 0; i < W * H; i++) { const l = lab[i]; if (l < 0) continue; let o = info.get(l); if (!o) info.set(l, o = { xs: [], zs: [] }); o.xs.push(i % W); o.zs.push(Math.floor(i / W)); }
-  const S = 100 / 1 * G, pal = ['#f6d7a7', '#c7e9c0', '#c6dbef', '#fdd0a2', '#dadaeb', '#fcbba1', '#d9f0a3', '#c7eae5'];
-  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W * S + 40}" height="${H * S + 110}" viewBox="-20 -60 ${W * S + 40} ${H * S + 110}" font-family="system-ui,sans-serif"><rect x="-20" y="-60" width="${W * S + 40}" height="${H * S + 110}" fill="#fff"/>`;
-  const runs = (mask, color) => { let o = ''; for (let z = 0; z < H; z++) { let x = 0; while (x < W) { if (!mask(z * W + x)) { x++; continue; } const a = x; while (x < W && mask(z * W + x)) x++; o += `<rect x="${a * S}" y="${z * S}" width="${(x - a) * S}" height="${S}" fill="${color}"/>`; } } return o; };
-  let total = 0, rn = 0; const labels = [];
-  for (const [l, o] of info) { const area = o.xs.length * G * G; if (area < .8) continue; total += area; rn++; svg += runs(i => lab[i] === l, pal[rn % pal.length]);
+  const rl = [];
+  for (const [l, o] of info) { const area = o.xs.length * G * G; if (area < .8) continue;
     const mx = o.xs.reduce((a, b) => a + b, 0) / o.xs.length, mz = o.zs.reduce((a, b) => a + b, 0) / o.zs.length; let sxx = 0, szz = 0, sxz = 0;
     for (let k = 0; k < o.xs.length; k++) { const a = o.xs[k] - mx, b = o.zs[k] - mz; sxx += a * a; szz += b * b; sxz += a * b; }
     const th = .5 * Math.atan2(2 * sxz, sxx - szz), c = Math.cos(th), sn = Math.sin(th), u = [], w = []; for (let k = 0; k < o.xs.length; k++) { const a = o.xs[k] - mx, b = o.zs[k] - mz; u.push(a * c + b * sn); w.push(-a * sn + b * c); }
     const ext = A => { A.sort((a, b) => a - b); return (A[Math.floor(A.length * .98)] - A[Math.floor(A.length * .02)] + 1) * G; }, e1 = ext(u), e2 = ext(w);
-    labels.push(`<text x="${mx * S}" y="${mz * S - 6}" text-anchor="middle" font-size="15" font-weight="600" fill="#222">Room ${rn}</text><text x="${mx * S}" y="${mz * S + 12}" text-anchor="middle" font-size="13" fill="#333">${Math.max(e1, e2).toFixed(2)} × ${Math.min(e1, e2).toFixed(2)} m · ${area.toFixed(1)} m²</text>`); }
-  svg += runs(i => Wl[i] === 1, '#2b2b2b') + labels.join('');
-  svg += `<text x="0" y="-32" font-size="20" font-weight="700" fill="#111">${(rec.name || 'Scan').replace(/[<&]/g, '')}: floor plan</text><text x="0" y="-12" font-size="13" fill="#444">${rn} room${rn === 1 ? '' : 's'} · ${total.toFixed(1)} m² of floor found · grid 5 cm</text>`;
-  svg += `<g transform="translate(0,${H * S + 20})"><rect x="0" y="0" width="${100}" height="6" fill="#111"/><text x="0" y="22" font-size="12">1 m</text></g></svg>`;
-  return { svg, rooms: rn, area: total };
+    rl.push({ l, area, L: Math.max(e1, e2), Wd: Math.min(e1, e2), mx, mz }); }
+  return { fy, G, x0, z0, W, H, Wl, lab, rooms: rl, total: rl.reduce((a, r) => a + r.area, 0) };
+}
+function floorPlan(rec) {
+  const P = rec.points, Nn = rec.normals; if (!Nn) throw new Error('this scan has no surface directions (older version)');
+  const levels = floorLevels(P, Nn); if (!levels.length) throw new Error('no floor found in this scan');
+  const plans = levels.map(fy => planLevel(P, Nn, fy)), G = plans[0].G, S = 100 * G, pal = ['#f6d7a7', '#c7e9c0', '#c6dbef', '#fdd0a2', '#dadaeb', '#fcbba1', '#d9f0a3', '#c7eae5'];
+  const name = (rec.name || 'Scan').replace(/[<&]/g, ''), storey = i => plans.length === 1 ? '' : i === 0 ? 'Ground floor' : 'Floor ' + (i + 1);
+  /* SVG: one plan per storey, stacked */
+  const Wmax = Math.max(...plans.map(p => p.W)) * S + 40; let y = 0, body = '', rn = 0, total = 0;
+  plans.forEach((pl, li) => { const { W, H, Wl, lab } = pl;
+    const runs = (mask, color) => { let o = ''; for (let z = 0; z < H; z++) { let x = 0; while (x < W) { if (!mask(z * W + x)) { x++; continue; } const a = x; while (x < W && mask(z * W + x)) x++; o += `<rect x="${a * S}" y="${z * S}" width="${(x - a) * S}" height="${S}" fill="${color}"/>`; } } return o; };
+    let g = storey(li) ? `<text x="0" y="-8" font-size="17" font-weight="700" fill="#111">${storey(li)} · ${pl.total.toFixed(1)} m²</text>` : '', labels = '';
+    for (const r of pl.rooms) { rn++; total += r.area; g += runs(i => lab[i] === r.l, pal[rn % pal.length]);
+      labels += `<text x="${r.mx * S}" y="${r.mz * S - 6}" text-anchor="middle" font-size="15" font-weight="600" fill="#222">Room ${rn}</text><text x="${r.mx * S}" y="${r.mz * S + 12}" text-anchor="middle" font-size="13" fill="#333">${r.L.toFixed(2)} × ${r.Wd.toFixed(2)} m · ${r.area.toFixed(1)} m²</text>`; }
+    g += runs(i => Wl[i] === 1, '#2b2b2b') + labels;
+    body += `<g transform="translate(0,${y + (storey(li) ? 26 : 0)})">${g}</g>`; y += H * S + (storey(li) ? 26 : 0) + 40; });
+  const Ht = y + 70;
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${Wmax}" height="${Ht + 60}" viewBox="-20 -60 ${Wmax} ${Ht + 60}" font-family="system-ui,sans-serif"><rect x="-20" y="-60" width="${Wmax}" height="${Ht + 60}" fill="#fff"/>`;
+  svg += `<text x="0" y="-32" font-size="20" font-weight="700" fill="#111">${name}: floor plan</text><text x="0" y="-12" font-size="13" fill="#444">${plans.length > 1 ? plans.length + ' floors · ' : ''}${rn} room${rn === 1 ? '' : 's'} · ${total.toFixed(1)} m² of floor found · grid 5 cm</text>`;
+  svg += body + `<g transform="translate(0,${y})"><rect x="0" y="0" width="100" height="6" fill="#111"/><text x="0" y="22" font-size="12">1 m</text></g></svg>`;
+  /* DXF (R12, metres): wall outlines, room outlines and labels on layers per storey; storeys side by side */
+  const out = ['0', 'SECTION', '2', 'HEADER', '9', '$INSUNITS', '70', '6', '0', 'ENDSEC', '0', 'SECTION', '2', 'ENTITIES'], f = v => v.toFixed(3);
+  const line = (ly, x1, y1, x2, y2) => out.push('0', 'LINE', '8', ly, '10', f(x1), '20', f(y1), '30', '0', '11', f(x2), '21', f(y2), '31', '0');
+  const text = (ly, x, y2, h, t) => out.push('0', 'TEXT', '8', ly, '10', f(x), '20', f(y2), '30', '0', '40', f(h), '1', t, '72', '1', '11', f(x), '21', f(y2), '31', '0');
+  let ox = 0, rn2 = 0;
+  plans.forEach((pl, li) => { const { W, H, G: g, x0, z0 } = pl, tag = 'F' + (li + 1), X = c => ox + x0 + (c - 1) * g, Y = c => -(z0 + (c - 1) * g);   // CAD y = -z, so the plan is not mirrored
+    const edges = (val, ly) => {                                   // boundary between cells where val differs, merged into long lines
+      for (let z = 0; z <= H; z++) { let a = -1; for (let x = 0; x <= W; x++) { const e = x < W && (z > 0 ? val(x, z - 1) : 0) !== (z < H ? val(x, z) : 0); if (e && a < 0) a = x; if (!e && a >= 0) { line(ly, X(a), Y(z), X(x), Y(z)); a = -1; } } }
+      for (let x = 0; x <= W; x++) { let a = -1; for (let z = 0; z <= H; z++) { const e = z < H && (x > 0 ? val(x - 1, z) : 0) !== (x < W ? val(x, z) : 0); if (e && a < 0) a = z; if (!e && a >= 0) { line(ly, X(x), Y(a), X(x), Y(z)); a = -1; } } } };
+    const Wc = new Uint8Array(W * H); { const D = new Uint8Array(W * H); for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) if (pl.Wl[z * W + x]) for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) { const xx = x + a, zz = z + b; if (xx >= 0 && zz >= 0 && xx < W && zz < H) D[zz * W + xx] = 1; }
+      for (let it = 0; it < 2; it++) { for (let z = 1; z < H - 1; z++) for (let x = 1; x < W - 1; x++) { let c = 0; for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) c += D[(z + b) * W + x + a]; Wc[z * W + x] = c >= 5 ? 1 : 0; } D.set(Wc); } }   // ~15 cm thick walls with straight faces (majority filter), not 5 cm stair-steps
+    edges((x, z) => Wc[z * W + x], tag + '_WALLS');
+    const keep = new Set(pl.rooms.map(r => r.l)); edges((x, z) => { const l = pl.lab[z * W + x]; return keep.has(l) ? l + 1 : 0; }, tag + '_ROOMS');
+    if (storey(li)) text(tag + '_TEXT', X(W / 2), Y(-12), .35, storey(li));
+    for (const r of pl.rooms) { rn2++; text(tag + '_TEXT', X(r.mx), Y(r.mz) + .15, .18, 'Room ' + rn2); text(tag + '_TEXT', X(r.mx), Y(r.mz) - .15, .12, r.L.toFixed(2) + ' x ' + r.Wd.toFixed(2) + ' m, ' + r.area.toFixed(1) + ' m2'); }
+    ox += W * g + 2; });
+  out.push('0', 'ENDSEC', '0', 'EOF');
+  return { svg, dxf: out.join('\n') + '\n', rooms: rn, area: total, floors: plans.length };
 }
 
 /* ================= live photo view: walk through your house the way the camera saw it =================
@@ -3242,8 +3279,8 @@ function listRows(el, all, lives) {
     if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
     const acts = document.createElement('div'); acts.className = 'acts'; const menus = {};
     const menu = (title) => { const d = document.createElement('details'), su = document.createElement('summary'), m = document.createElement('div'); su.textContent = title; m.className = 'menu'; d.append(su, m); menus[title] = { d, m }; return m; };
-    const GROUP = { '.json': 'Export', '.ply': 'Export', '.glb': 'Export', 'Photos .zip': 'Export', 'Floor plan': 'Export', 'Merge with…': 'More', 'Refine': 'More', 'Match photos': 'More', 'Photo texture': 'More', 'Rename': 'More', 'Delete': 'More' };
-    const LABEL = { '.glb': '3D model (.glb)', '.ply': 'Points (.ply)', '.json': 'Full backup (.json)', 'Photos .zip': 'Photos + camera poses (.zip)', 'Floor plan': 'Floor plan with room sizes (.svg)', 'Merge with…': 'Join with another scan…', 'Refine': 'Refine again', 'Match photos': 'Re-match photos', 'Photo texture': 'Re-make photo texture', 'Continue scanning': 'Continue scanning' };
+    const GROUP = { '.json': 'Export', '.ply': 'Export', '.glb': 'Export', 'Photos .zip': 'Export', 'Floor plan': 'Export', 'Floor plan DXF': 'Export', 'Merge with…': 'More', 'Refine': 'More', 'Match photos': 'More', 'Photo texture': 'More', 'Rename': 'More', 'Delete': 'More' };
+    const LABEL = { '.glb': '3D model (.glb)', '.ply': 'Points (.ply)', '.json': 'Full backup (.json)', 'Photos .zip': 'Photos + camera poses (.zip)', 'Floor plan': 'Floor plan with room sizes (.svg)', 'Floor plan DXF': 'Floor plan for CAD apps (.dxf)', 'Merge with…': 'Join with another scan…', 'Refine': 'Refine again', 'Match photos': 'Re-match photos', 'Photo texture': 'Re-make photo texture', 'Continue scanning': 'Continue scanning' };
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = LABEL[label] || label; b.addEventListener('click', e => { const d = b.closest('details'); if (d) d.open = false; fn(e); });
       if (label === 'Walk through') b.className = 'primary'; if (label === 'Delete') b.className = 'danger';
       const g = GROUP[label]; if (g) (menus[g] ? menus[g].m : menu(g)).appendChild(b); else acts.appendChild(b); };
@@ -3255,7 +3292,8 @@ function listRows(el, all, lives) {
       try { const n2 = await undoMerge(r); $('st').textContent = 'Separated back into ' + n2 + ' scans (they will not be joined automatically again)'; listScans(); } catch (e) { $('st').textContent = 'Undo: ' + e.message; } });
     mk('.json', load(r, exportJSON)); mk('.ply', load(r, exportPLY)); mk('.glb', load(r, exportGLB));
     mk('Refine', async () => { try { const x = await fresh(r); if (x.refined && !confirm('This scan is already refined. Refine again?')) return; await refineScan(x, m => $('st').textContent = m); listScans(); } catch (e) { $('st').textContent = 'Refine: ' + e.message; } });
-    mk('Floor plan', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
+    mk('Floor plan', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + (fp.floors > 1 ? fp.floors + ' floors, ' : '') + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
+    mk('Floor plan DXF', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.dxf', new Blob([fp.dxf], { type: 'application/dxf' })); $('st').textContent = 'Floor plan (CAD): ' + fp.floors + ' floor' + (fp.floors > 1 ? 's' : '') + ', ' + fp.rooms + ' rooms'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
     mk('Merge with…', async () => { const others = all.filter(o => o.id !== r.id); if (!others.length) { $('st').textContent = 'Scan another room first, then merge.'; return; }
       const pick = prompt('Merge "' + r.name + '" with which scan? Type its number:\n' + others.map((o, i) => (i + 1) + '. ' + o.name + ' (' + new Date(o.date).toLocaleDateString() + ')').join('\n'), '1'); const o = others[(+pick || 0) - 1]; if (!o) return;
       try { const [ra, ro] = await Promise.all([DB.get(r.id), DB.get(o.id)]); if (!ra || !ro) throw new Error('scan no longer exists'); const m = await mergeScans(ra, ro, t => $('st').textContent = 'Merging: ' + t); $('st').textContent = 'Merged into "' + m.rec.name + '" (' + Math.round(m.overlap * 100) + '% overlap). It is being refined with loop closure now.'; listScans(); } catch (e) { $('st').textContent = 'Merge: ' + e.message; } });
@@ -3265,7 +3303,7 @@ function listRows(el, all, lives) {
       catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (!nm) return; try { const x = await fresh(r); x.name = nm; x.date = Date.now(); await DB.put(x); listScans(); } catch (e) { $('st').textContent = 'Rename: ' + e.message; } });
     mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor) queueAnchorDelete(r.anchor.uuid, listScans.full || [], r.id); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
-    const ORDER = ['3D model (.glb)', 'Floor plan with room sizes (.svg)', 'Photos + camera poses (.zip)', 'Points (.ply)', 'Full backup (.json)', 'Join with another scan…', 'Rename', 'Refine again', 'Re-match photos', 'Re-make photo texture', 'Delete'];
+    const ORDER = ['3D model (.glb)', 'Floor plan with room sizes (.svg)', 'Floor plan for CAD apps (.dxf)', 'Photos + camera poses (.zip)', 'Points (.ply)', 'Full backup (.json)', 'Join with another scan…', 'Rename', 'Refine again', 'Re-match photos', 'Re-make photo texture', 'Delete'];
     for (const g of ['Export', 'More']) if (menus[g]) { [...menus[g].m.children].sort((a, b) => ORDER.indexOf(a.textContent) - ORDER.indexOf(b.textContent)).forEach(b => menus[g].m.appendChild(b)); acts.appendChild(menus[g].d); }
     row.appendChild(acts);
     el.appendChild(row);
