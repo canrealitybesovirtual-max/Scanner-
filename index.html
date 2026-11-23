@@ -80,14 +80,16 @@ addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); ca
 /* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
 const VS = .02, CONF = 3, MAX = 3000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
-const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX);
+const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX);   // dirs: which of 26 directions each voxel was seen from
 let N = 0, confirmed = 0, dLo = Infinity, dHi = -1;
 const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
-function addSighting(x, y, z, t, w = 1) {
+function addSighting(x, y, z, t, w = 1, cam = null, mask = 0) {
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
   if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return;
   const k = keyOf(ix, iy, iz); let id = vmap.get(k);
-  if (id === undefined) { if (N >= MAX) return; id = N++; vmap.set(k, id); pos[id * 3] = (ix + .5) * VS; pos[id * 3 + 1] = (iy + .5) * VS; pos[id * 3 + 2] = (iz + .5) * VS; cnt[id] = 0; }
+  if (id === undefined) { if (N >= MAX) return; id = N++; vmap.set(k, id); dirs[id] = 0; ang[id] = 0; pos[id * 3] = (ix + .5) * VS; pos[id * 3 + 1] = (iy + .5) * VS; pos[id * 3 + 2] = (iz + .5) * VS; cnt[id] = 0; }
+  if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
+  if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
   const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
   if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; }
   if (id < dLo) dLo = id; if (id > dHi) dHi = id;
@@ -97,22 +99,24 @@ const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('born', new THREE.BufferAttribute(born, 1).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('ang', new THREE.BufferAttribute(ang, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setDrawRange(0, 0);
 const pmat = new THREE.ShaderMaterial({
   uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: CONF }, floorY: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       ok = step(minC, cnt); gl_PointSize = ok * clamp(size * scale / max(.05, -mv.z), 1.0, 24.0);
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
       vec3 base = mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));                 // floor warm, walls cool
       base *= .75 + .25 * clamp(cnt / 24.0, 0.0, 1.0);                                                    // well-seen surfaces brighter
+      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * .7);                                          // seen from one angle only: amber
       float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh); }`,
   fragmentShader: `varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; gl_FragColor = vec4(vC, 1.0); }`
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
 function flushGeo() {
   if (dHi < dLo) return;
-  for (const n of ['position', 'cnt', 'born']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
+  for (const n of ['position', 'cnt', 'born', 'ang']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
   pg.setDrawRange(0, N); dLo = Infinity; dHi = -1;
 }
 
@@ -175,24 +179,24 @@ const dMat = new THREE.ShaderMaterial({
 });
 const qScene = new THREE.Scene(), qCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 { const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), dMat); q.frustumCulled = false; qScene.add(q); }
-const depth = { binding: null, status: 'off', flipY: false, lastT: 0, rate: .2, zs: new Float32Array(DW * DH) };
+const depth = { vi: 0, cam: new V3(), binding: null, status: 'off', flipY: false, lastT: 0, rate: .12, zs: new Float32Array(DW * DH) };
 const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4();
 function sampleDepth(frame, ref, session, tNow) {
   if (!depth.binding || !scanning) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
-  const view = vp.views[0]; let info = null;
+  depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   try { info = depth.binding.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array';
   const props = renderer.properties.get(isArr ? extArr : ext2D); props.__webglTexture = info.texture; props.__webglInit = true;
-  dMat.uniforms.isArr.value = isArr ? 1 : 0; dMat.uniforms.layer.value = info.imageIndex ?? 0;
+  dMat.uniforms.isArr.value = isArr ? 1 : 0; dMat.uniforms.layer.value = info.imageIndex ?? depth.vi;
   dMat.uniforms.jit.value.set(Math.random() / DW, Math.random() / DH);               // sub-pixel jitter: over time every depth pixel gets read
   const xrOn = renderer.xr.enabled; renderer.xr.enabled = false;
   renderer.setRenderTarget(depthRT); renderer.render(qScene, qCam); renderer.setRenderTarget(null); renderer.xr.enabled = xrOn;
   renderer.readRenderTargetPixels(depthRT, 0, 0, DW, DH, depthBuf);
   /* depth values → metres. Quest gives normalised depth with near/far; other devices give raw units × rawValueToMeters */
   _inv.fromArray(info.projectionMatrix || view.projectionMatrix).invert();
-  _xf.fromArray((info.transform || view.transform).matrix);
+  _xf.fromArray((info.transform || view.transform).matrix); depth.cam.setFromMatrixPosition(_xf);
   if (info.normDepthBufferFromNormView) _nd.fromArray(info.normDepthBufferFromNormView.matrix).invert(); else _nd.identity();
   const near = info.depthNear ?? session.renderState.depthNear, far = info.depthFar ?? session.renderState.depthFar;
   const lumA = session.depthDataFormat === 'luminance-alpha', r2m = info.rawValueToMeters || .001;
@@ -209,7 +213,7 @@ function sampleDepth(frame, ref, session, tNow) {
   const n = _nd.elements; let added = 0;
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
     const k = y * DW + x, z = zs[k];
-    if (!(z > .25 && z < 4.2)) continue;
+    if (!(z > .2 && z < 4.5)) continue;
     const tol = .035 * z;                                           // drop "flying pixels" on depth edges
     if (Math.abs(zs[k - 1] - z) > tol || Math.abs(zs[k + 1] - z) > tol || Math.abs(zs[k - DW] - z) > tol || Math.abs(zs[k + DW] - z) > tol) continue;
     const u = (x + .5) / DW + j.x, v = (y + .5) / DH + j.y;
@@ -217,7 +221,7 @@ function sampleDepth(frame, ref, session, tNow) {
     if (depth.flipY) vv = 1 - vv;
     _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(_inv); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
     _p.multiplyScalar(z / -_p.z).applyMatrix4(_xf);
-    addSighting(_p.x, _p.y, _p.z, tNow, z < 1.5 ? 1 : z < 2.5 ? .7 : .45);           // close looks count for more
+    addSighting(_p.x, _p.y, _p.z, tNow, z < 1.5 ? 1 : z < 2.5 ? .7 : .45, depth.cam);           // close looks count for more
     added++;
   }
   depth.status = 'live · ' + added + ' pts/frame';
@@ -233,16 +237,17 @@ const DB = (() => {
 let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null;
 function snapshot() {
   const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF) keep.push(i);
-  const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length);
-  keep.forEach((id, k) => { P[k * 3] = pos[id * 3]; P[k * 3 + 1] = pos[id * 3 + 1]; P[k * 3 + 2] = pos[id * 3 + 2]; Cn[k] = Math.min(65535, Math.round(cnt[id])); });
+  const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length), Mk = new Uint32Array(keep.length);
+  keep.forEach((id, k) => { P[k * 3] = pos[id * 3]; P[k * 3 + 1] = pos[id * 3 + 1]; P[k * 3 + 2] = pos[id * 3 + 2]; Cn[k] = Math.min(65535, Math.round(cnt[id])); Mk[k] = dirs[id]; });
   return {
-    voxelSize: VS, points: P, counts: Cn,
+    voxelSize: VS, points: P, counts: Cn, masks: Mk, understanding,
     planes: [...planes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), poly: e.poly })),
     meshes: [...meshes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), v: e.v, i: e.i })),
     floorY: pmat.uniforms.floorY.value
   };
 }
 async function saveScan(frame) {
+  runUnderstanding();
   const s = snapshot(); if (!s.points.length) { toast('Nothing captured yet'); return; }
   const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
   if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
@@ -268,7 +273,7 @@ async function loadIntoSession(rec) {
 }
 function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
-  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF); }
+  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0); }
   flushGeo(); toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
 }
 
@@ -297,7 +302,8 @@ async function download(name, blob) {
 }
 function exportJSON(rec) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
-    planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null };
+    planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
+    masks: rec.masks ? b64(rec.masks) : null, understanding: rec.understanding || null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
 function exportPLY(rec) {
@@ -311,21 +317,227 @@ function exportPLY(rec) {
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', new Blob([head, body.buffer], { type: 'application/octet-stream' }));
 }
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
+}
+
+
+/* ================= understanding the house: floors, ceilings, walls, stairs, objects =================
+   Works on the confirmed points (plus, when known, which directions each was seen from) and the
+   Space Setup planes. Everything is measured in a 10 cm grid seen from above:
+   - each grid cell's points are split into vertical runs (wall faces, sides) and thin horizontal layers;
+   - a layer seen from above is something you could stand on or set things on; seen only from below, a ceiling;
+   - floor levels are the big upward layers; ceilings the big downward ones 1.9–4 m above them;
+   - walls are tall vertical runs, fitted into straight segments;
+   - stairs are chains of tread-sized patches each 12–24 cm above the last, in a consistent direction;
+   - objects are whatever is left between a floor and its ceiling, grouped by contact. */
+const UPM = (() => { let m = 0; for (let i = 0; i < 27; i++) if (i !== 13 && Math.floor((i % 9) / 3) === 2) m |= 1 << i; return m; })();
+const DNM = (() => { let m = 0; for (let i = 0; i < 27; i++) if (i !== 13 && Math.floor((i % 9) / 3) === 0) m |= 1 << i; return m; })();
+const popc = m => { m = m - ((m >>> 1) & 0x55555555); m = (m & 0x33333333) + ((m >>> 2) & 0x33333333); return (((m + (m >>> 4)) & 0x0F0F0F0F) * 0x01010101) >>> 24; };
+function analyze(P, masks, planesIn) {
+  const C = .1, n = P.length / 3, cells = new Map();
+  const ck = (cx, cz) => (cx + 50000) * 100000 + (cz + 50000);
+  for (let k = 0; k < n; k++) {
+    const cx = Math.floor(P[k * 3] / C), cz = Math.floor(P[k * 3 + 2] / C), key = ck(cx, cz);
+    let c = cells.get(key); if (!c) { c = { cx, cz, ys: [], ms: [] }; cells.set(key, c); }
+    c.ys.push(P[k * 3 + 1]); c.ms.push(masks ? masks[k] : 0);
+  }
+  /* split every cell into runs */
+  const floorH = new Map(), ceilH = new Map(), HB = .02, hb = y => Math.round(y / HB);
+  for (const c of cells.values()) {
+    const ord = c.ys.map((y, i) => i).sort((a, b) => c.ys[a] - c.ys[b]); c.runs = [];
+    let cur = null;
+    for (const i of ord) {
+      const y = c.ys[i], m = c.ms[i];
+      if (cur && y - cur.y1 <= .05) { cur.y1 = y; cur.m |= m; cur.n++; } else { cur = { y0: y, y1: y, m, n: 1 }; c.runs.push(cur); }
+    }
+    for (const r of c.runs) {
+      r.span = r.y1 - r.y0; r.vert = r.span >= .45; r.h = (r.y0 + r.y1) / 2;
+      r.up = masks ? (r.m & UPM) !== 0 : true; r.down = masks ? (r.m & DNM) !== 0 && !(r.m & UPM) : true;
+      if (!r.vert) { if (r.up) floorH.set(hb(r.y1), (floorH.get(hb(r.y1)) || 0) + C * C); if (r.down) ceilH.set(hb(r.y0), (ceilH.get(hb(r.y0)) || 0) + C * C); }
+    }
+  }
+  /* floor levels and their ceilings */
+  const peaks = (H, minA) => {
+    const sm = b => (H.get(b - 1) || 0) + (H.get(b) || 0) + (H.get(b + 1) || 0), out = [];
+    for (const b of H.keys()) { const s = sm(b); if (s >= minA && s >= sm(b - 1) && s > sm(b + 1) - 1e-12) { let wy = 0; for (const d of [-1, 0, 1]) wy += (b + d) * HB * (H.get(b + d) || 0); out.push({ y: wy / s, area: s }); } }
+    out.sort((a, b) => a.y - b.y); const m = [];
+    for (const p of out) { const q = m[m.length - 1]; if (q && p.y - q.y < .15) { if (p.area > q.area) m[m.length - 1] = p; } else m.push(p); }
+    return m;
+  };
+  let levels = peaks(floorH, 1.5);
+  const ssFloors = (planesIn || []).filter(p => p.label === 'floor').map(p => p.m[13]);
+  for (const fy of ssFloors) if (!levels.some(l => Math.abs(l.y - fy) < .12)) levels.push({ y: fy, area: 0, fromSetup: true });
+  levels.sort((a, b) => a.y - b.y);
+  levels = levels.filter((l, i) => i === 0 || l.y - levels[0].y > 1.9 || l.area > 6);          // between-floor ledges (beds, counters) are not levels
+  const ceils = peaks(ceilH, .8);
+  for (const l of levels) { const c = ceils.find(c => c.y - l.y > 1.9 && c.y - l.y < 4.2); l.ceiling = c ? c.y : null; }
+  const levelOf = y => { let best = levels[0]; for (const l of levels) if (l.y <= y + .3) best = l; return best; };
+  if (!levels.length) return { levels: [], walls: [], stairs: [], objects: [], points: n };
+  /* walls: tall vertical runs, fitted to straight lines per level */
+  const wallCells = [];
+  for (const c of cells.values()) for (const r of c.runs) {
+    if (!r.vert) continue; const L = levelOf(r.y0);
+    if (r.y0 <= L.y + .6 && r.y1 >= L.y + 1.5) { wallCells.push({ x: (c.cx + .5) * C, z: (c.cz + .5) * C, L, top: r.y1, c }); c.wall = true; }
+  }
+  const walls = [];
+  for (const L of levels) {
+    let pts = wallCells.filter(w => w.L === L);
+    for (let iter = 0; iter < 60 && pts.length > 12; iter++) {
+      let best = null;
+      for (let t = 0; t < 120; t++) {
+        const a = pts[(Math.random() * pts.length) | 0], b = pts[(Math.random() * pts.length) | 0];
+        const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz); if (len < .4 || len > 6) continue;
+        const nx = -dz / len, nz = dx / len; let cnt = 0; for (const p of pts) if (Math.abs((p.x - a.x) * nx + (p.z - a.z) * nz) < .07) cnt++;
+        if (!best || cnt > best.cnt) best = { a, nx, nz, ux: dx / len, uz: dz / len, cnt };
+      }
+      if (!best || best.cnt < 8) break;
+      const inl = pts.filter(p => Math.abs((p.x - best.a.x) * best.nx + (p.z - best.a.z) * best.nz) < .07).map(p => ({ p, s: (p.x - best.a.x) * best.ux + (p.z - best.a.z) * best.uz })).sort((a, b) => a.s - b.s);
+      let seg = [inl[0]];
+      const flush = () => { if (seg.length >= 5) { const s0 = seg[0].s, s1 = seg[seg.length - 1].s; if (s1 - s0 >= .45) { const tops = seg.map(q => q.p.top).sort((a, b) => a - b); walls.push({ x1: best.a.x + best.ux * s0, z1: best.a.z + best.uz * s0, x2: best.a.x + best.ux * s1, z2: best.a.z + best.uz * s1, y0: L.y, y1: tops[tops.length >> 1], len: s1 - s0 }); } } };
+      for (let i = 1; i < inl.length; i++) { if (inl[i].s - inl[i - 1].s > .35) { flush(); seg = []; } seg.push(inl[i]); }
+      flush();
+      pts = pts.filter(p => Math.abs((p.x - best.a.x) * best.nx + (p.z - best.a.z) * best.nz) >= .16);   // take the whole wall thickness out, so its other face isn't counted again
+    }
+  }
+  /* stairs: tread patches (upward layers) and the 12–24 cm rises between them */
+  const nodes = [], nodeAt = new Map();
+  for (const c of cells.values()) for (const r of c.runs) if (!r.vert && r.up) { const nd = { c, h: r.y1, p: -1 }; nodes.push(nd); const k = ck(c.cx, c.cz); (nodeAt.get(k) || nodeAt.set(k, []).get(k)).push(nd); }
+  const par = nodes.map((_, i) => i), find = i => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
+  nodes.forEach((nd, i) => nd.i = i);
+  for (const nd of nodes) for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) { const l = nodeAt.get(ck(nd.c.cx + dx, nd.c.cz + dz)); if (l) for (const o of l) if (o !== nd && Math.abs(o.h - nd.h) < .03) par[find(o.i)] = find(nd.i); }
+  const patches = new Map();
+  for (const nd of nodes) { const r = find(nd.i); let p = patches.get(r); if (!p) { p = { id: r, nodes: [], sx: 0, sz: 0, sh: 0, up: new Map() }; patches.set(r, p); } p.nodes.push(nd); p.sx += (nd.c.cx + .5) * C; p.sz += (nd.c.cz + .5) * C; p.sh += nd.h; nd.p = r; }
+  for (const p of patches.values()) { const k = p.nodes.length; p.x = p.sx / k; p.z = p.sz / k; p.h = p.sh / k; p.area = k * C * C; p.big = p.area > 3.5; p.wide = p.area > .8; }   // wide: a landing or a floor
+  for (const nd of nodes) for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
+    const l = nodeAt.get(ck(nd.c.cx + dx, nd.c.cz + dz)); if (!l) continue;
+    for (const o of l) { const d = o.h - nd.h; if (d > .12 && d < .24 && o.p !== nd.p) patches.get(nd.p).up.set(o.p, d); }
+  }
+  const stairs = [], usedP = new Set();
+  const order = [...patches.values()].sort((a, b) => a.h - b.h);
+  for (const start of order) {
+    if (usedP.has(start.id)) continue;
+    let best = null;
+    const walk = (chain, dir) => {
+      const last = chain[chain.length - 1];
+      let ext = false;
+      for (const [nid, rise] of last.up) {
+        const nx = patches.get(nid); if (usedP.has(nid) || chain.includes(nx) || (nx.big && chain.length < 2)) continue;
+        if (!nx.big && (nx.area < .05 || nx.area > 2.5)) continue;
+        const hx = nx.x - last.x, hz = nx.z - last.z, run = Math.hypot(hx, hz);
+        if (!last.wide && !nx.wide && (run < .15 || run > .5)) continue;
+        const d = run > 1e-3 ? [hx / run, hz / run] : dir;
+        if (dir && d && d[0] * dir[0] + d[1] * dir[1] < .55 && !nx.wide && !last.wide) continue;
+        const rises = chain.rises.concat(rise); if (rises.length > 2) { const m = rises.reduce((a, b) => a + b) / rises.length; if (rises.some(r => Math.abs(r - m) > .04)) continue; }
+        const c2 = chain.concat(nx); c2.rises = rises; ext = true;
+        if (!nx.big) walk(c2, last.wide || nx.wide ? null : dir || d); else if (!best || c2.length > best.length) best = c2;   // a whole floor's centre says nothing about the stair's direction
+      }
+      if (!ext && (!best || chain.length > best.length)) best = chain;
+    };
+    const ch = [start]; ch.rises = []; walk(ch, null);
+    const treads = best ? best.filter(p => !p.big) : [];
+    if (best && best.rises.length >= 3 && treads.length >= 2) {
+      best.forEach(p => { if (!p.big) usedP.add(p.id); });
+      const rise = best.rises.reduce((a, b) => a + b) / best.rises.length;
+      let run = 0, rn = 0; for (let i = 1; i < best.length; i++) if (!best[i].wide && !best[i - 1].wide) { run += Math.hypot(best[i].x - best[i - 1].x, best[i].z - best[i - 1].z); rn++; }
+      stairs.push({ steps: Math.max(best.rises.length, Math.round((best[best.length - 1].h - best[0].h) / rise)), rise, run: rn ? run / rn : null, y0: best[0].h, y1: best[best.length - 1].h, path: best.map(p => [p.x, p.h, p.z]), treads: treads.map(p => ({ x: p.x, z: p.z, h: p.h, cells: p.nodes.map(nd => [nd.c.cx, nd.c.cz]) })) });
+      for (const p of treads) for (const nd of p.nodes) nd.c.stair = true;
+    }
+  }
+  /* objects: what's left above each floor and below its ceiling, grouped by touching cells */
+  const occ = new Map();
+  for (const c of cells.values()) {
+    if (c.wall || c.stair) continue;
+    for (const r of c.runs) {
+      const L = levelOf(r.y0), top = r.y1;
+      if (top < L.y + .06) continue;                                         // the floor itself
+      if (L.ceiling && r.y0 > L.ceiling - .12) continue;                      // the ceiling
+      if (!r.vert && Math.abs(r.h - L.y) < .05) continue;
+      const k = ck(c.cx, c.cz), o = occ.get(k);
+      if (!o) occ.set(k, { c, L, top, bot: r.y0 }); else { o.top = Math.max(o.top, top); o.bot = Math.min(o.bot, r.y0); }
+    }
+  }
+  const seen = new Set(), objects = [];
+  for (const [k, o] of occ) {
+    if (seen.has(k)) continue;
+    const comp = [], st = [k]; seen.add(k);
+    while (st.length) { const kk = st.pop(), oo = occ.get(kk); comp.push(oo); for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) { const nk = ck(oo.c.cx + dx, oo.c.cz + dz); if (!seen.has(nk) && occ.has(nk) && Math.abs(occ.get(nk).top - oo.top) < .9) { seen.add(nk); st.push(nk); } } }
+    const area = comp.length * C * C; if (area < .03) continue;
+    const L = comp[0].L, x1 = Math.min(...comp.map(q => q.c.cx)) * C, x2 = (Math.max(...comp.map(q => q.c.cx)) + 1) * C, z1 = Math.min(...comp.map(q => q.c.cz)) * C, z2 = (Math.max(...comp.map(q => q.c.cz)) + 1) * C;
+    const tops = comp.map(q => q.top).sort((a, b) => a - b), top = tops[Math.floor(tops.length * .9)], h = top - L.y;
+    if (h < .08) continue;
+    let label = null;
+    for (const p of planesIn || []) { if (!p.label || p.label === 'floor' || p.label === 'ceiling' || p.label === 'wall') continue; const px = p.m[12], py = p.m[13], pz = p.m[14]; if (px > x1 - .2 && px < x2 + .2 && pz > z1 - .2 && pz < z2 + .2 && Math.abs(py - top) < .25) { label = p.label; break; } }
+    const fw = x2 - x1, fd = z2 - z1;
+    if (!label) label = h > 1.25 ? 'tall furniture' : h > .6 && h < 1 && area > .25 ? 'table / counter' : area > 1.6 && h < .75 ? 'bed / sofa' : h > .3 && h < .6 && area > .15 ? 'seat' : h < .3 ? 'low object' : 'object';
+    objects.push({ x1, x2, z1, z2, y0: L.y, top, h, area, label, w: fw, d: fd });
+  }
+  return { levels: levels.map(l => ({ y: l.y, area: l.area, ceiling: l.ceiling, fromSetup: !!l.fromSetup })), walls, stairs, objects, points: n };
+}
+
+/* ---- drawing what was understood ---- */
+function label3D(text, color) {
+  const c = document.createElement('canvas'), g = c.getContext('2d'); g.font = '600 30px monospace';
+  const w = Math.ceil(g.measureText(text).width) + 24; c.width = w; c.height = 46;
+  g.fillStyle = 'rgba(10,12,14,.78)'; g.fillRect(0, 0, w, 46); g.fillStyle = color || '#e8f6f8'; g.font = '600 30px monospace'; g.fillText(text, 12, 33);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false, transparent: true })); s.renderOrder = 40; s.scale.set(w / 46 * .07, .07, 1); return s;
+}
+function buildUnderstanding(res, group) {
+  group.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } });
+  group.clear();
+  const line = (pts, color, op = 1) => new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color, transparent: op < 1, opacity: op }));
+  for (const l of res.levels) {
+    const s = label3D((l === res.levels[0] ? 'Floor ' : 'Floor level ') + l.y.toFixed(2) + ' m' + (l.ceiling ? ' · ceiling ' + (l.ceiling - l.y).toFixed(2) + ' m high' : ''), '#f0d58a');
+    s.position.set(0, l.y + .05, 0); s.userData.follow = l.y; group.add(s);
+  }
+  for (const w of res.walls) {
+    const a = new V3(w.x1, w.y0, w.z1), b = new V3(w.x2, w.y0, w.z2), a2 = new V3(w.x1, w.y1, w.z1), b2 = new V3(w.x2, w.y1, w.z2);
+    group.add(line([a, b, b2, a2, a], 0x7fd8ff, .9));
+    const q = new THREE.Mesh(new THREE.BufferGeometry().setFromPoints([a, b, b2, a, b2, a2]), new THREE.MeshBasicMaterial({ color: 0x5fb8e0, transparent: true, opacity: .12, side: THREE.DoubleSide, depthWrite: false })); group.add(q);
+    const s = label3D('wall ' + w.len.toFixed(2) + ' m', '#9fe4ff'); s.position.set((w.x1 + w.x2) / 2, w.y0 + 1.3, (w.z1 + w.z2) / 2); group.add(s);
+  }
+  for (const st of res.stairs) {
+    group.add(line(st.path.map(p => new V3(p[0], p[1] + .02, p[2])), 0xffa040));
+    for (const t of st.treads) for (const [cx, cz] of t.cells) { const m = new THREE.Mesh(new THREE.PlaneGeometry(.095, .095), new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: .45, depthWrite: false, side: THREE.DoubleSide })); m.rotation.x = -Math.PI / 2; m.position.set((cx + .5) * .1, t.h + .012, (cz + .5) * .1); group.add(m); }
+    const top = st.path[st.path.length - 1], s = label3D('stairs · ' + st.steps + ' steps · rise ' + Math.round(st.rise * 100) + ' cm' + (st.run ? ' · tread ' + Math.round(st.run * 100) + ' cm' : '') + ' · ' + (st.y1 - st.y0).toFixed(2) + ' m', '#ffb26b');
+    const mid = st.path[st.path.length >> 1]; s.position.set(mid[0], mid[1] + .6, mid[2]); group.add(s);
+  }
+  for (const o of res.objects) {
+    if (o.area < .06 && o.h < .25) continue;
+    const bx = new THREE.Box3(new V3(o.x1, o.y0, o.z1), new V3(o.x2, o.top, o.z2)); group.add(new THREE.Box3Helper(bx, 0xc9a0ff));
+    const s = label3D(o.label + ' · ' + o.w.toFixed(1) + '×' + o.d.toFixed(1) + ' m · ' + Math.round(o.h * 100) + ' cm', '#dcc4ff'); s.position.set((o.x1 + o.x2) / 2, o.top + .12, (o.z1 + o.z2) / 2); group.add(s);
+  }
+}
+const underG = new THREE.Group(); scene.add(underG);
+let understanding = null, underOn = true, underAt = 0, underN = 0;
+function runUnderstanding() {
+  const s = snapshot(); if (s.points.length < 3000) return;
+  const t0 = performance.now(); understanding = analyze(s.points, s.masks, s.planes); understanding.ms = performance.now() - t0;
+  buildUnderstanding(understanding, underG); underG.visible = underOn; underN = confirmed;
+}
+function understandingLines(res) {
+  if (!res) return ['understanding    (scan more, then it fills in)'];
+  const L = res.levels;
+  return [
+    'floors   ' + (L.length ? L.map(l => l.y.toFixed(2) + ' m' + (l.ceiling ? ' (ceil ' + (l.ceiling - l.y).toFixed(2) + ')' : '')).join(', ') : 'none yet'),
+    'walls    ' + res.walls.length + ' · ' + res.walls.reduce((a, w) => a + w.len, 0).toFixed(1) + ' m   stairs ' + res.stairs.length + (res.stairs.length ? ' (' + res.stairs.map(s => s.steps + ' steps').join(', ') + ')' : '') + '   objects ' + res.objects.length
+  ];
 }
 
 /* ================= in-headset control panel (left hand) and pointer (right hand) ================= */
 const panel = (() => {
-  const c = document.createElement('canvas'); c.width = 640; c.height = 480; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .18), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
+  const c = document.createElement('canvas'); c.width = 640; c.height = 600; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .225), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
   mesh.position.set(.0, .07, -.04); mesh.rotation.set(-.85, 0, 0);
   return { c, g: c.getContext('2d'), t, mesh, hover: -1, buttons: [] };
 })();
 let scanning = true, lastSave = 0, toastMsg = '', toastT = 0, clockT = 0, fps = 72, fpsAcc = 0, fpsN = 0;
 const BTN = () => [
   { id: 'scan', label: scanning ? 'Scanning: ON' : 'Scanning: PAUSED', on: scanning },
-  { id: 'room', label: 'Room setup' },
+  { id: 'room', label: 'Meta room scan' },
+  { id: 'under', label: underOn ? 'Understanding: ON' : 'Understanding: OFF', on: underOn },
+  { id: 'analyze', label: 'Re-analyse now' },
   { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
   { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
   { id: 'save', label: 'Save scan' },
@@ -334,7 +546,7 @@ const BTN = () => [
 ];
 function toast(m) { toastMsg = m; toastT = 4; }
 function drawPanel() {
-  const g = panel.g, W = 640, H = 480; g.clearRect(0, 0, W, H);
+  const g = panel.g, W = 640, H = 600; g.clearRect(0, 0, W, H);
   g.fillStyle = 'rgba(14,16,18,.92)'; g.fillRect(0, 0, W, H); g.strokeStyle = '#2f3438'; g.lineWidth = 2; g.strokeRect(1, 1, W - 2, H - 2);
   g.fillStyle = '#e8e6df'; g.font = '600 28px monospace'; g.fillText('HOUSE SCANNER', 22, 44);
   g.font = '19px monospace'; g.fillStyle = '#9ad8e4';
@@ -346,24 +558,27 @@ function drawPanel() {
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
     'fps             ' + Math.round(fps)
   ];
-  lines.forEach((l, i) => g.fillText(l, 22, 84 + i * 26));
+  lines.push(...understandingLines(understanding).map(l => l.slice(0, 54)), 'amber = seen from one angle: look again from elsewhere');
+  lines.forEach((l, i) => g.fillText(l, 22, 80 + i * 25));
   panel.buttons = []; const bs = BTN(), bw = 290, bh = 50;
   bs.forEach((b, i) => {
-    const x = 22 + (i % 2) * (bw + 16), y = 222 + Math.floor(i / 2) * (bh + 10);
+    const x = 22 + (i % 2) * (bw + 16), y = 300 + Math.floor(i / 2) * (bh + 10);
     panel.buttons.push({ ...b, x, y, w: bw, h: bh });
     g.fillStyle = panel.hover === i ? '#2b6f7c' : b.on ? '#1d4a53' : '#24282c'; g.fillRect(x, y, bw, bh);
     g.fillStyle = '#eef'; g.font = '20px monospace'; g.fillText(b.label, x + 14, y + 32);
   });
-  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 466); }
+  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 590); }
   panel.t.needsUpdate = true;
 }
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; }
+  if (id === 'under') { underOn = !underOn; underG.visible = underOn; }
+  if (id === 'analyze') { runUnderstanding(); toast(understanding ? 'Analysed in ' + Math.round(understanding.ms) + ' ms' : 'Scan a bit more first'); }
   if (id === 'room') { if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; layout.visible = showMode !== 1; }
   if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
   if (id === 'save') saveScan(frame);
-  if (id === 'clear') { clearMap(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -383,7 +598,7 @@ function updatePointer() {
   const h = pointerRay.intersectObject(panel.mesh)[0];
   laser.scale.z = h ? h.distance : 2;
   if (!h) return;
-  const px = h.uv.x * 640, py = (1 - h.uv.y) * 480;
+  const px = h.uv.x * 640, py = (1 - h.uv.y) * 600;
   panel.hover = panel.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
 }
 
@@ -412,7 +627,7 @@ $('bAR').addEventListener('click', async () => {
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
 });
-let pendingOpen = null;
+let pendingOpen = null, askedRoom = false;
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
@@ -442,11 +657,14 @@ function openViewer(rec) {
   for (let k = 0; k < n; k++) { const h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7)); cols[k * 3] = .62 + .16 * h; cols[k * 3 + 1] = .5 + .34 * h; cols[k * 3 + 2] = .38 + .52 * h; }
   geo.setAttribute('color', new THREE.BufferAttribute(cols, 3)); geo.computeBoundingBox();
   g.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: rec.voxelSize * 1.2, vertexColors: true, sizeAttenuation: true })));
+  const ug = new THREE.Group(); g.add(ug); const ures = rec.understanding || analyze(rec.points, rec.masks, rec.planes); buildUnderstanding(ures, ug);
+  ug.traverse(o => { if (o.isSprite) o.scale.multiplyScalar(3.5); if (o.userData.follow !== undefined) o.position.set(viewer.target ? 0 : 0, o.userData.follow + .05, 0); });
+  viewer.res = ures;
   for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .25 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
-  for (const p of rec.planes) { const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
+  for (const p of rec.planes) { if (!p.poly || p.poly.length < 3) continue; const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
   const bb = geo.boundingBox; if (bb && isFinite(bb.min.x)) { bb.getCenter(viewer.target); viewer.dist = Math.max(3, bb.getSize(new V3()).length() * .8); }
   cloud.visible = false; layout.visible = false;
-  $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
+  $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · ' + understandingLines(viewer.res).join(' · ').replace(/\s+/g, ' ') + ' · drag to orbit, scroll or pinch to zoom';
 }
 function closeViewer() { if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = true; }
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
@@ -484,6 +702,10 @@ renderer.setAnimationLoop((t, frame) => {
       else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
     }
     if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
+    if (scanning && clockT - underAt > (understanding && understanding.ms > 250 ? 30 : 10) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
+    if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
+    { const cp = renderer.xr.getCamera().getWorldPosition(new V3()), f = renderer.xr.getCamera().getWorldDirection(new V3()); f.y = 0; f.normalize();
+      underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
   } else if (viewer.on) {
