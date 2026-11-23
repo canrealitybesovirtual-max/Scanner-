@@ -539,8 +539,8 @@ function maybeKeyframe(vp, tNow) {
   const raw = kf.prevT ? kf.prevQ.angleTo(q) / Math.max(1e-3, tNow - kf.prevT) : 0; kf.prevQ.copy(q); kf.prevT = tNow;
   kf.spin = (kf.spin || 0) * .8 + raw * .2;
   if (kf.spin > 1.2) return;                                                       // turning faster than ~70°/s: the frame would be blurred                                                           // turning faster than ~30°/s: the frame would be blurred
-  if (kf.has && tNow - kf.t < .35) return;
-  if (kf.has && p.distanceTo(kf.pos) < (det.on ? .06 : .22) && q.angleTo(kf.q) < (det.on ? .12 : .21)) return;      // nothing new in view since the last keyframe
+  if (kf.has && tNow - kf.t < .25) return; if (kf.n >= 1500) return;                     // up to 1500 photos a scan
+  if (kf.has && p.distanceTo(kf.pos) < (det.on ? .05 : .12) && q.angleTo(kf.q) < (det.on ? .1 : .12)) return;       // a new viewpoint every ~12 cm or ~7°: lots of angles for the walk-through
   if (tNow - (kf.tryT || 0) < .25) return; kf.tryT = tNow;
   if (!currentId) currentId = 'scan-' + Date.now();
   const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
@@ -1436,22 +1436,51 @@ async function zipMany(files) {                                    // stored (un
   const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cl, true); end.setUint32(16, off, true);
   return new Blob([...parts, ...central, end.buffer]);
 }
+
+/* 16-bit greyscale PNG (millimetres), for depth images */
+async function png16(w, h, mm) {
+  const raw = new Uint8Array(h * (1 + w * 2)); for (let y = 0; y < h; y++) { const o = y * (1 + w * 2); raw[o] = 0; for (let x = 0; x < w; x++) { const v = mm[y * w + x]; raw[o + 1 + x * 2] = v >> 8; raw[o + 2 + x * 2] = v & 255; } }
+  const z = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
+  const chunk = (type, data) => { const b = new Uint8Array(12 + data.length), dv = new DataView(b.buffer); dv.setUint32(0, data.length); for (let i = 0; i < 4; i++) b[4 + i] = type.charCodeAt(i); b.set(data, 8); dv.setUint32(8 + data.length, CRC(b.subarray(4, 8 + data.length))); return b; };
+  const ih = new Uint8Array(13), dv = new DataView(ih.buffer); dv.setUint32(0, w); dv.setUint32(4, h); ih[8] = 16; ih[9] = 0;
+  return new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ih), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))], { type: 'image/png' });
+}
+/* render the fused surface from each photo's camera: per-photo depth for depth-supervised splat training */
+async function photoDepths(rec, frames, say) {
+  const parts = await recMesh(rec).catch(() => []); if (!parts.length) return null;
+  const sc2 = new THREE.Scene(), out = []; for (const m of parts) { if (!m.I.length) continue; const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1)); const o = new THREE.Mesh(g, ibrDist); o.frustumCulled = false; sc2.add(o); }
+  const cam = new THREE.PerspectiveCamera(); cam.matrixAutoUpdate = false; cam.matrixWorldAutoUpdate = false;
+  let rt = null; const prevT = renderer.getRenderTarget(), cc = new THREE.Color(), ca = renderer.getClearAlpha(); renderer.getClearColor(cc);
+  for (let i = 0; i < frames.length; i++) { const f = frames[i]; if (i % 20 === 0) say('depth ' + (i + 1) + ' / ' + frames.length);
+    const w = Math.round(f.w / 2), h = Math.round(f.h / 2), fx = 1 / Math.tan(f.hfov / 2), asp = f.w / f.h, n = .05, fa = 30;
+    if (!rt || rt.width !== w || rt.height !== h) { if (rt) rt.dispose(); rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.FloatType }); }
+    cam.projectionMatrix.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+    cam.matrixWorld.fromArray(f.m); cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
+    renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(sc2, cam);
+    const px = new Float32Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
+    const mm = new Uint16Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = px[((h - 1 - y) * w + x) * 4]; mm[y * w + x] = v > .05 && v < 60 ? Math.round(v * 1000) : 0; }   // top row first, like the photo
+    out.push(await png16(w, h, mm)); await new Promise(r => setTimeout(r, 0)); }
+  renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose(); sc2.traverse(o => o.geometry && o.geometry.dispose());
+  return out;
+}
 async function exportPhotos(rec) {
   $('st').textContent = 'Packing photos…';
   const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
   if (!fr.length) { $('st').textContent = 'No photos recorded for this scan. Turn on camera colour while scanning.'; return; }
+  let deps = null; if (!xrSession) { try { deps = await photoDepths(rec, fr, m => $('st').textContent = 'Packing photos: ' + m + '…'); } catch (e) { deps = null; } }
   const f0 = fr[0], intr = f => { const fl = f.w / 2 / Math.tan(f.hfov / 2); return { fl_x: fl, fl_y: fl, cx: f.w * (.5 + (f.cx || 0)), cy: f.h * (.5 + (f.cy || 0)), w: f.w, h: f.h }; };
   /* Nerfstudio / Brush format; intrinsics per frame because auto-alignment can refine them mid-scan */
   const tj = Object.assign({ camera_model: 'OPENCV', k1: 0, k2: 0, p1: 0, p2: 0, ply_file_path: 'points3D.ply' }, intr(f0), {
-    frames: fr.map((f, i) => { const m = f.m; return Object.assign({ file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }, intr(f)); }) });
+    frames: fr.map((f, i) => { const m = f.m; return Object.assign({ file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', ...(deps ? { depth_file_path: 'depth/frame_' + String(i + 1).padStart(5, '0') + '.png' } : {}), transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }, intr(f)); }) });
   const manifest = { format: 'house-scanner-capture/2', app: 'house-scanner-webxr', created: new Date().toISOString(), scan: rec.id, frames: fr.length, points: rec.points.length / 3, voxel_size_m: rec.voxelSize,
     frame: 'WebXR reference space (unbounded or local-floor): metres, +y up; cameras OpenGL convention (-z forward, +y up), camera-to-world',
     intrinsics: fr.every(f => f.aligned) ? 'photo-matched: poses, camera offset on the headset and lens solved by colour consistency against the fused surface (pinhole, no distortion)' : 'partly assumed (pinhole, no distortion): refine poses+intrinsics before training', photo_matching: rec.photoAlign || null,
-    known_gaps: ['camera pose = head pose (RGB camera offset ~3-5 cm not modelled)', 'no lens distortion model', 'auto exposure not locked'] };
-  const poses = fr.map((f, i) => JSON.stringify({ i, t: f.t, file: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', head: f.head || f.m, cam: f.m, sharp: f.sharp || null, hfov_deg: f.hfov * 180 / Math.PI, cx: f.cx || 0, cy: f.cy || 0 })).join('\n');
+    depth: 'depth/*.png: 16-bit millimetres along the camera axis, rendered from the fused surface at half resolution (nerfstudio depth_unit_scale_factor 0.001)',
+    known_gaps: [(fr.every(f => f.aligned) ? 'camera offset solved by photo matching (residual ~1 cm)' : 'camera pose = head pose (RGB camera offset ~3-5 cm not modelled)'), 'no lens distortion model', 'auto exposure not locked (per-photo gains in poses.jsonl)'] };
+  const poses = fr.map((f, i) => JSON.stringify({ i, t: f.t, file: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', head: f.head || f.m, cam: f.m, sharp: f.sharp || null, hfov_deg: f.hfov * 180 / Math.PI, cx: f.cx || 0, cy: f.cy || 0, gain: f.gain || 1 })).join('\n');
   const readme = 'House Scanner photo export: ' + fr.length + ' keyframes with headset poses.\n\nTrain a Gaussian splat on a PC:\n- Brush (free, github.com/ArthurBrussee/brush): open this folder (Nerfstudio format).\n- Nerfstudio: ns-train splatfacto --data <this folder>\n- Best quality: python tools/splat/run.py <this zip> (refines poses with COLMAP, trains, exports .ply/.spz). See docs/gaussian-splat-pipeline.md in the repo.\n- Postshot / RealityScan: import the images folder and let it solve camera poses itself (most robust).\n\nPoses are OpenGL camera-to-world in the scan\'s coordinates (metres, y up). Intrinsics assume a ' + (f0.hfov * 180 / Math.PI).toFixed(0) + '° horizontal FOV.\n';
   const files = [{ name: 'transforms.json', blob: new Blob([JSON.stringify(tj, null, 1)]) }, { name: 'manifest.json', blob: new Blob([JSON.stringify(manifest, null, 1)]) }, { name: 'poses.jsonl', blob: new Blob([poses]) }, { name: 'points3D.ply', blob: plyBlob(rec) }, { name: 'README.txt', blob: new Blob([readme]) },
-    ...fr.map((f, i) => ({ name: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', blob: f.blob }))];
+    ...fr.map((f, i) => ({ name: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', blob: f.blob })), ...(deps ? deps.map((b, i) => ({ name: 'depth/frame_' + String(i + 1).padStart(5, '0') + '.png', blob: b })) : [])];
   download((rec.name || 'scan').replace(/\W+/g, '-') + '-photos.zip', await zipMany(files));
 }
 async function download(name, blob) {
@@ -1926,12 +1955,14 @@ for (let k = 0; k < IBR_K; k++) { const tex = new THREE.Texture(); tex.flipY = f
 const SLOT = i => `if (phOn[${i}] > .5) { vec4 e = phV[${i}] * vec4(vW, 1.0); float z = -e.z;
     if (z > .1) { vec4 q = phI[${i}]; float u = .5 + q.z + .5 * q.x * e.x / z, v = .5 - .5 * q.x * q.y * e.y / z + q.w;
       if (u > .004 && u < .996 && v > .004 && v < .996 && z < texture2D(sh[${i}], vec2(u, 1.0 - v)).r + .045) {
-        vec3 r1 = normalize(vW - cameraPosition), r2 = normalize(vW - phP[${i}]); float w = exp(-(1.0 - dot(r1, r2)) * 45.0) / (1.0 + z * .3) + 1e-4;
+        vec3 r1 = normalize(vW - cameraPosition), r2 = normalize(vW - phP[${i}]); float de = length(vW - cameraPosition);
+        float edge = smoothstep(0.0, .08, min(min(u, 1.0 - u), min(v, 1.0 - v)));        // feather the photo's own borders (vignette, blur)
+        float w = (exp(-(1.0 - dot(r1, r2)) * 45.0) * clamp((de + .3) / (z + .3), .25, 1.0) * edge * phF[${i}]) / (1.0 + z * .3) + 1e-5;
         acc += w * texture2D(ph[${i}], vec2(u, v)).rgb * phG[${i}]; ws += w; } } }`;
 function ibrMaterial(useMap, map) {
   return new THREE.ShaderMaterial({ side: THREE.DoubleSide, transparent: true, vertexColors: !useMap, defines: useMap ? { IBR_MAP: 1 } : {},
     uniforms: { baseMap: { value: map || null }, ph: { value: ibr.slots.map(s => s.tex) }, sh: { value: ibr.slots.map(s => s.rt.texture) }, phV: { value: ibr.slots.map(s => s.view) }, phI: { value: ibr.slots.map(s => s.intr) },
-      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, opacity: { value: 1 } },
+      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, phF: { value: [0, 0, 0, 0, 0, 0] }, opacity: { value: 1 } },
     vertexShader: `varying vec3 vW; varying vec2 vUv2; varying vec3 vC2; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
       #ifdef IBR_MAP
       vUv2 = uv;
@@ -1939,7 +1970,7 @@ function ibrMaterial(useMap, map) {
       vC2 = color;
       #endif
       gl_Position = projectionMatrix * viewMatrix * w; }`,
-    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float opacity;
+    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float phF[6]; uniform float opacity;
       varying vec3 vW; varying vec2 vUv2; varying vec3 vC2;
       void main(){ vec3 acc = vec3(0.0); float ws = 0.0;
         ${[0, 1, 2, 3, 4, 5].map(SLOT).join('\n')}
@@ -1977,16 +2008,22 @@ async function ibrLoad(slot, k) {                                    // decode o
     renderer.xr.enabled = false; scene.overrideMaterial = ibrDist; renderer.setRenderTarget(slot.rt); renderer.setClearColor(new THREE.Color(1000, 0, 0), 1); renderer.clear();
     renderer.render(scene, ibrCam);
     scene.overrideMaterial = null; renderer.setRenderTarget(prevT); renderer.xr.enabled = xrEn; renderer.setClearColor(cc, ca);
-    slot.on = 1;
+    slot.on = 1; slot.fade = 0;
   } catch (e) { diagLog('ibr', e.message); }
   ibr.loading = false;
 }
 function ibrUpdate(eyeCam) {                                         // pick the photos for where you are now (a few times a second), feed the shaders
   if (!ibr.on) return;
-  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { U.phOn.value[k] = ibr.slots[k].on; U.phG.value[k] = ibr.slots[k].gain; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
+  /* frame-rate guard: blend fewer photos if the headset is struggling, more when there's headroom */
+  if (renderer.xr.isPresenting) { ibr.slow = fps < 62 ? (ibr.slow || 0) + 1 : 0; ibr.fast = fps > 70 ? (ibr.fast || 0) + 1 : 0;
+    if (ibr.slow > 90 && (ibr.k || IBR_K) > 3) { ibr.k = (ibr.k || IBR_K) - 1; ibr.slow = 0; } if (ibr.fast > 300 && (ibr.k || IBR_K) < IBR_K) { ibr.k = (ibr.k || IBR_K) + 1; ibr.fast = 0; } }
+  const kAct = ibr.k || IBR_K;
+  for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k]; sl.fade = Math.min(1, (sl.fade || 0) + 1 / 20); }       // ~1/3 s fade-in for a newly loaded photo
+  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
   if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
   const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
   const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
+  for (const sl of ibr.slots) { const r2 = sc.findIndex(x => x[1] === sl.idx); sl.rank = r2 < 0 ? IBR_K : r2; }
   const want = new Set(sc.map(x => x[1])), have = new Set(ibr.slots.map(s => s.idx));
   const missing = sc.find(x => !have.has(x[1])); if (!missing) return;
   let slot = ibr.slots.find(s => s.idx < 0) || ibr.slots.filter(s => !want.has(s.idx)).sort((a, b) => b.idx - a.idx)[0]; if (!slot) return;
