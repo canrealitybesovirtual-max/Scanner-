@@ -81,7 +81,9 @@ addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); ca
 const VS = .02, CONF = 3, MAX = 2000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
 const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX);   // dirs: which of 26 directions each voxel was seen from
-let N = 0, confirmed = 0, dLo = Infinity, dHi = -1;
+let N = 0, confirmed = 0, newLo = 0;
+const dmark = new Uint8Array(MAX); let dlist = [];
+const markDirty = id => { if (!dmark[id]) { dmark[id] = 1; dlist.push(id); } };
 const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
 function addSighting(x, y, z, t, w = 1, cam = null, mask = 0) {
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
@@ -92,7 +94,7 @@ function addSighting(x, y, z, t, w = 1, cam = null, mask = 0) {
   if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
   const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
   if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; }
-  if (id < dLo) dLo = id; if (id > dHi) dHi = id;
+  markDirty(id);
   return id;
 }
 function carve(x, y, z, amt) {                             // seen *through*: this spot is empty air now
@@ -100,12 +102,12 @@ function carve(x, y, z, amt) {                             // seen *through*: th
   if (id === undefined || cnt[id] <= 0) return;
   const before = cnt[id]; cnt[id] = Math.max(0, before - amt);
   if (before >= CONF && cnt[id] < CONF) confirmed--;
-  if (id < dLo) dLo = id; if (id > dHi) dHi = id;
+  markDirty(id);
 }
 function tint(id, r, g, b, w) {                            // running average of camera colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { vmap.clear(); N = 0; confirmed = 0; dLo = Infinity; dHi = -1; pg.setDrawRange(0, 0); }
+function clearMap() { vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -130,9 +132,16 @@ const pmat = new THREE.ShaderMaterial({
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
 function flushGeo() {
-  if (dHi < dLo) return;
-  for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
-  pg.setDrawRange(0, N); dLo = Infinity; dHi = -1;
+  /* new points: one contiguous block of positions; changed points: sorted, merged into a few short ranges */
+  if (N > newLo) { const a = pg.attributes.position; a.clearUpdateRanges(); a.addUpdateRange(newLo * 3, (N - newLo) * 3); a.needsUpdate = true; }
+  if (dlist.length) {
+    dlist.sort((x, y) => x - y);
+    let gap = 48, ranges = [];
+    for (;;) { ranges = []; let a = dlist[0], b = a; for (let i = 1; i < dlist.length; i++) { const v = dlist[i]; if (v - b <= gap) b = v; else { ranges.push([a, b]); a = b = v; } } ranges.push([a, b]); if (ranges.length <= 256) break; gap *= 4; }
+    for (const n of ['cnt', 'born', 'ang', 'col', 'cw']) { const at = pg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); for (const [a, b] of ranges) at.addUpdateRange(a * k, (b - a + 1) * k); at.needsUpdate = true; }
+    for (const id of dlist) dmark[id] = 0; dlist = [];
+  }
+  pg.setDrawRange(0, N); newLo = N;
 }
 
 /* ================= room layout from Space Setup: planes and the room mesh ================= */
@@ -152,6 +161,7 @@ function meshWire(e) {
   e.obj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: LABEL_COL[e.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .28, depthWrite: false }));
   e.obj.matrixAutoUpdate = false; e.obj.matrix.copy(e.m); layout.add(e.obj);
 }
+function clearMeta() { for (const e of planes.values()) layout.remove(e.obj); for (const e of meshes.values()) layout.remove(e.obj); planes.clear(); meshes.clear(); }
 function syncLayout(frame, ref) {
   const dp = frame.detectedPlanes;
   if (dp) {
@@ -210,6 +220,14 @@ function depthReaderInit(gl) {
   if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('depth framebuffer incomplete');
   DR.gl = gl;
 }
+function depthReady() {                                    // true once the background copy has landed in depthBuf
+  if (!DR.sync) return false;
+  const gl = renderer.getContext(), st = gl.clientWaitSync(DR.sync, 0, 0);
+  if (st !== gl.ALREADY_SIGNALED && st !== gl.CONDITION_SATISFIED) return false;
+  gl.deleteSync(DR.sync); DR.sync = null;
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, depthBuf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  renderer.resetState(); return true;
+}
 function readDepth(info, isArr, layer, lumA, jx, jy) {
   const gl = renderer.getContext();
   if (!DR.gl) depthReaderInit(gl);
@@ -223,7 +241,9 @@ function readDepth(info, isArr, layer, lumA, jx, jy) {
   gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, DR.vbo);
   const loc = gl.getAttribLocation(DR.prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
-  gl.readPixels(0, 0, DW, DH, gl.RGBA, gl.UNSIGNED_BYTE, depthBuf);
+  if (!DR.pbo) { DR.pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.bufferData(gl.PIXEL_PACK_BUFFER, DW * DH * 4, gl.STREAM_READ); }
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.readPixels(0, 0, DW, DH, gl.RGBA, gl.UNSIGNED_BYTE, 0); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  DR.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); gl.flush();             // the GPU copies it out in the background
   gl.disableVertexAttribArray(loc);
   gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
   renderer.resetState();                                  // hand GL back to three.js in a known state
@@ -268,7 +288,7 @@ function camFrame(vp) {
   return { data: c.data, w: 512, h: 288, f: c.f, asp: 512 / 288, cy: c.cy };
 }
 function sampleDepth(frame, ref, session, tNow) {
-  if (!depth.binding || !scanning) return;
+  if (!depth.binding || !scanning || DR.sync || depth.meta) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   try { info = depth.binding.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
@@ -276,30 +296,39 @@ function sampleDepth(frame, ref, session, tNow) {
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
   try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy); } catch (e) { depth.status = 'read failed: ' + e.message; renderer.resetState(); return; }
-  /* depth values → metres. Quest gives normalised depth with near/far; other devices give raw units × rawValueToMeters */
-  _inv.fromArray(info.projectionMatrix || view.projectionMatrix).invert();
-  _xf.fromArray((info.transform || view.transform).matrix); depth.cam.setFromMatrixPosition(_xf);
-  if (info.normDepthBufferFromNormView) _nd.fromArray(info.normDepthBufferFromNormView.matrix).invert(); else _nd.identity();
-  const near = info.depthNear ?? session.renderState.depthNear, far = info.depthFar ?? session.renderState.depthFar;
-  const r2m = info.rawValueToMeters || .001, zs = depth.zs, j = { x: jx, y: jy }, B = depthBuf;
+  /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
+  depth.meta = {
+    isArr, lumA, jx, jy, tNow, fmt: session.depthDataFormat,
+    inv: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).invert(), PE: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements,
+    xf: new M4().fromArray((info.transform || view.transform).matrix),
+    nd: info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix).invert() : new M4(),
+    near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
+    head: new V3().setFromMatrixPosition(vp.transform.matrix), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
+  };
+}
+function integrateDepth() {
+  const M = depth.meta; depth.meta = null; if (!M) return;
+  const t0 = performance.now(), { isArr, lumA, tNow, near, far, r2m } = M;
+  _inv.copy(M.inv); _xf.copy(M.xf); _nd.copy(M.nd); depth.cam.setFromMatrixPosition(_xf);
+  const zs = depth.zs, j = { x: M.jx, y: M.jy }, B = depthBuf;
   let valid = 0;
   for (let k = 0; k < DW * DH; k++) {
     const o = k * 4; let z;
     if (lumA) z = (B[o] + B[o + 1] * 256) * r2m;                                   // millimetres
     else {
       const raw = (B[o] * 65536 + B[o + 1] * 256 + B[o + 2]) / 16777215;
-      if (B[o + 3] > 127) z = raw * 32 * (info.rawValueToMeters || 1);            // already metres
+      if (B[o + 3] > 127) z = raw * 32 * M.rvm;                                   // already metres
       else { if (raw <= 0 || raw >= 1) { zs[k] = 0; continue; } z = isFinite(far) ? 2 * near * far / (far + near - (raw * 2 - 1) * (far - near)) : near / (1 - raw); }
     }
     zs[k] = z; if (z > .2 && z < 4.5) valid++;
   }
   depth.valid = valid;
   if (++depth.frames <= 15) { depth.status = 'warming up the depth sensor'; return; }      // first ~15 frames are sensor-calibration noise
-  const PE = new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements, fpx = 2 / (PE[0] * DW), fpy = 2 / (PE[5] * DH);
+  const PE = M.PE, fpx = 2 / (PE[0] * DW), fpy = 2 / (PE[5] * DH);
   /* your body: torso capsule from the head down (world-up), and a ball round each hand/controller */
-  const head = depth.head.setFromMatrixPosition(vp.transform.matrix), hands = handsNow();
+  const head = M.head, hands = M.hands;
   const inBody = (x, y, z) => { if (Math.hypot(x - head.x, z - head.z) < .35 && y < head.y + .25 && y > head.y - 1.75) return true; for (const h of hands) if ((x - h.x) ** 2 + (y - h.y) ** 2 + (z - h.z) ** 2 < .0256) return true; return false; };
-  const cam = camFrame(vp), vinv = cam ? depth.vinv.fromArray(vp.transform.inverse.matrix) : null;
+  const cam = M.cam, vinv = M.vinv;
   const n = _nd.elements; let added = 0;
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
     const k = y * DW + x, z = zs[k];
@@ -328,7 +357,9 @@ function sampleDepth(frame, ref, session, tNow) {
     for (const f of [.45, .7, .88]) { const t = f * z; if (z - t < .08) continue; _c.set(vx * f, vy * f, vz * f).applyMatrix4(_xf); if (!inBody(_c.x, _c.y, _c.z)) carve(_c.x, _c.y, _c.z, .35 * w); }
     added++;
   }
-  depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' valid px · ' + (isArr ? 'array' : '2d') + ' ' + (session.depthDataFormat || '?');
+  const ms = performance.now() - t0; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
+  depth.rate = Math.max(.07, depth.ms * 4 / 1000);                    // keep integration under ~25% of the frame budget
+  depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms';
 }
 
 /* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
@@ -359,7 +390,6 @@ function snapshot() {
   };
 }
 async function saveScan(frame) {
-  runUnderstanding();
   const s = snapshot(); if (!s.points.length) { toast('Nothing captured yet'); return; }
   const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
   if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
@@ -683,10 +713,23 @@ function buildUnderstanding(res, group) {
 }
 const underG = new THREE.Group(); scene.add(underG);
 let understanding = null, underOn = true, underAt = 0, underN = 0;
-function runUnderstanding() {
+/* the analysis runs in a background worker so the headset never stalls while it thinks */
+let anWorker = null, anBusy = false, anFailed = false;
+function makeWorker() {
+  const src = "import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';\nconst V3 = THREE.Vector3, M4 = THREE.Matrix4, UPM = " + UPM + ", DNM = " + DNM + ";\n" + analyze.toString() +
+    "\nonmessage = e => { const d = e.data, t0 = performance.now(); try { const res = analyze(d.P, d.masks, d.planes, d.meshes); res.ms = performance.now() - t0; postMessage({ res }); } catch (x) { postMessage({ err: String(x) }); } };";
+  const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
+  w.onmessage = e => { anBusy = false; if (e.data.res) { understanding = e.data.res; buildUnderstanding(understanding, underG); underG.visible = underOn; if (!useMeta && understanding.levels[0]) pmat.uniforms.floorY.value = understanding.levels[0].y; } };
+  w.onerror = () => { anBusy = false; anFailed = true; };
+  return w;
+}
+function runUnderstanding(sync) {
   const s = snapshot(); if (s.points.length < 3000) return;
-  const t0 = performance.now(); understanding = analyze(s.points, s.masks, s.planes, s.meshes); understanding.ms = performance.now() - t0;
-  buildUnderstanding(understanding, underG); underG.visible = underOn; underN = confirmed;
+  underN = confirmed;
+  if (sync || anFailed) { const t0 = performance.now(); understanding = analyze(s.points, s.masks, s.planes, s.meshes); understanding.ms = performance.now() - t0; buildUnderstanding(understanding, underG); underG.visible = underOn; return; }
+  if (anBusy) return;
+  try { anWorker = anWorker || makeWorker(); anBusy = true; anWorker.postMessage({ P: s.points, masks: s.masks, planes: s.planes, meshes: s.meshes }, [s.points.buffer, s.masks.buffer]); }
+  catch (e) { anFailed = true; anBusy = false; runUnderstanding(true); }
 }
 function understandingLines(res) {
   if (!res) return ['understanding    (scan more, then it fills in)'];
@@ -707,7 +750,8 @@ const panel = (() => {
 let scanning = true, lastSave = 0, toastMsg = '', toastT = 0, clockT = 0, fps = 72, fpsAcc = 0, fpsN = 0;
 const BTN = () => [
   { id: 'scan', label: scanning ? 'Scanning: ON' : 'Scanning: PAUSED', on: scanning },
-  { id: 'room', label: 'Meta room scan' },
+  { id: 'meta', label: useMeta ? 'Meta room data: ON' : 'Meta room data: OFF', on: useMeta },
+  { id: 'room', label: 'Redo Meta room scan' },
   { id: 'under', label: underOn ? 'Understanding: ON' : 'Understanding: OFF', on: underOn },
   { id: 'analyze', label: 'Re-analyse now' },
   { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
@@ -731,7 +775,7 @@ function drawPanel() {
   const area = confirmed * VS * VS;
   const lines = [
     'surface points  ' + confirmed.toLocaleString() + '  (~' + area.toFixed(1) + ' m²)',
-    'room layout     ' + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
+    'Meta layout     ' + (useMeta ? '' : '(off) ') + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
     'depth           ' + depth.status,
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
     'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps),
@@ -754,8 +798,9 @@ async function press(id, frame) {
   if (id === 'color') await toggleColor();
   if (id === 'reality') { reality = (reality + 1) % 3; setReality(); }
   if (id === 'under') { underOn = !underOn; underG.visible = underOn; }
-  if (id === 'analyze') { runUnderstanding(); toast(understanding ? 'Analysed in ' + Math.round(understanding.ms) + ' ms' : 'Scan a bit more first'); }
-  if (id === 'room') { if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
+  if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
+  if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s saved room layout (check it is this house)' : 'Ignoring the Quest\'s saved room layout'); }
+  if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; layout.visible = showMode !== 1; }
   if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
   if (id === 'save') saveScan(frame);
@@ -800,7 +845,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    depth.binding = null; depth.frames = 0; depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
+    depth.binding = null; depth.frames = 0; depth.meta = null; DR.sync = null; useMeta = false; clearMeta(); depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
     if (s.depthUsage === 'gpu-optimized' || (feats.includes('depth-sensing') && !s.depthUsage)) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed'; } }
     else if (s.depthUsage) depth.status = 'cpu depth (unsupported here)';
     $('ui').classList.add('hide');
@@ -811,7 +856,7 @@ $('bAR').addEventListener('click', async () => {
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
   } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
 });
-let pendingOpen = null, askedRoom = false;
+let pendingOpen = null, askedRoom = true, useMeta = false;
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
@@ -881,15 +926,16 @@ renderer.setAnimationLoop((t, frame) => {
     if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
-    syncLayout(frame, refSpace);
+    if (useMeta) syncLayout(frame, refSpace);
     if (pendingLoad) {                                       // the saved anchor has been found: map old coordinates into this session's
       const ap = frame.getPose(pendingLoad.anchor.anchorSpace, refSpace);
       if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m); mergeRecord(pendingLoad.rec, now.multiply(then.invert())); pendingLoad = null; }
       else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
     }
+    if (depth.meta && depthReady()) integrateDepth();
     if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
     { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
-    if (scanning && clockT - underAt > (understanding && understanding.ms > 250 ? 30 : 10) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
+    if (scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
     { const cp = renderer.xr.getCamera().getWorldPosition(new V3()), f = renderer.xr.getCamera().getWorldDirection(new V3()); f.y = 0; f.normalize();
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
