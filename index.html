@@ -78,21 +78,32 @@ const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, .02, 40
 addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
 
 /* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
-const VS = .02, CONF = 3, MAX = 3000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
+const VS = .02, CONF = 3, MAX = 2000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
-const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX);   // dirs: which of 26 directions each voxel was seen from
+const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX);   // dirs: which of 26 directions each voxel was seen from
 let N = 0, confirmed = 0, dLo = Infinity, dHi = -1;
 const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
 function addSighting(x, y, z, t, w = 1, cam = null, mask = 0) {
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
-  if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return;
+  if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return -1;
   const k = keyOf(ix, iy, iz); let id = vmap.get(k);
-  if (id === undefined) { if (N >= MAX) return; id = N++; vmap.set(k, id); dirs[id] = 0; ang[id] = 0; pos[id * 3] = (ix + .5) * VS; pos[id * 3 + 1] = (iy + .5) * VS; pos[id * 3 + 2] = (iz + .5) * VS; cnt[id] = 0; }
+  if (id === undefined) { if (N >= MAX) return -1; id = N++; vmap.set(k, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = (ix + .5) * VS; pos[id * 3 + 1] = (iy + .5) * VS; pos[id * 3 + 2] = (iz + .5) * VS; cnt[id] = 0; }
   if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
   if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
   const before = cnt[id]; cnt[id] = Math.min(60000, before + w);
   if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; }
   if (id < dLo) dLo = id; if (id > dHi) dHi = id;
+  return id;
+}
+function carve(x, y, z, amt) {                             // seen *through*: this spot is empty air now
+  const id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS)));
+  if (id === undefined || cnt[id] <= 0) return;
+  const before = cnt[id]; cnt[id] = Math.max(0, before - amt);
+  if (before >= CONF && cnt[id] < CONF) confirmed--;
+  if (id < dLo) dLo = id; if (id > dHi) dHi = id;
+}
+function tint(id, r, g, b, w) {                            // running average of camera colour
+  const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
 function clearMap() { vmap.clear(); N = 0; confirmed = 0; dLo = Infinity; dHi = -1; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
@@ -100,23 +111,26 @@ pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.Dyn
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('born', new THREE.BufferAttribute(born, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('ang', new THREE.BufferAttribute(ang, 1).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('col', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage));
+pg.setAttribute('cw', new THREE.BufferAttribute(cw, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setDrawRange(0, 0);
 const pmat = new THREE.ShaderMaterial({
   uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: CONF }, floorY: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY; varying vec3 vC; varying float ok;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       ok = step(minC, cnt); gl_PointSize = ok * clamp(size * scale / max(.05, -mv.z), 1.0, 24.0);
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
       vec3 base = mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));                 // floor warm, walls cool
       base *= .75 + .25 * clamp(cnt / 24.0, 0.0, 1.0);                                                    // well-seen surfaces brighter
-      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * .7);                                          // seen from one angle only: amber
+      base = mix(base, col, step(.01, cw));                                                               // real colour from the passthrough camera
+      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * (cw > .01 ? .35 : .7));                       // seen from one angle only: amber
       float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh); }`,
   fragmentShader: `varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; gl_FragColor = vec4(vC, 1.0); }`
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
 function flushGeo() {
   if (dHi < dLo) return;
-  for (const n of ['position', 'cnt', 'born', 'ang']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
+  for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw']) { const a = pg.attributes[n], s = a.itemSize; a.clearUpdateRanges(); a.addUpdateRange(dLo * s, (dHi - dLo + 1) * s); a.needsUpdate = true; }
   pg.setDrawRange(0, N); dLo = Infinity; dHi = -1;
 }
 
@@ -179,8 +193,30 @@ const dMat = new THREE.ShaderMaterial({
 });
 const qScene = new THREE.Scene(), qCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 { const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), dMat); q.frustumCulled = false; qScene.add(q); }
-const depth = { vi: 0, cam: new V3(), binding: null, status: 'off', flipY: false, lastT: 0, rate: .12, zs: new Float32Array(DW * DH) };
-const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4();
+const depth = { vi: 0, frames: 0, head: new V3(), vinv: new M4(), cam: new V3(), binding: null, status: 'off', flipY: false, lastT: 0, rate: .12, zs: new Float32Array(DW * DH) };
+const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4(), _c = new V3();
+const grips = [];
+function handsNow() { const out = []; for (const g of grips) if (g.visible !== false && g.matrixWorld) { const v = new V3().setFromMatrixPosition(g.matrixWorld); if (v.lengthSq() > 1e-6) out.push(v); } return out; }
+
+/* ================= passthrough camera colour (Quest browser, Horizon OS v74+) =================
+   The browser gives no camera intrinsics, so this uses a pinhole with an assumed horizontal FOV
+   (80° by default; ?hfov=NN in the URL to tune it, ?cy=0.0x to nudge it vertically). */
+const colorCam = { on: false, video: null, cv: document.createElement('canvas'), ctx: null, data: null, t: 0, status: 'off',
+  f: 1 / Math.tan((Number(new URLSearchParams(location.search).get('hfov')) || 80) * Math.PI / 360), cy: Number(new URLSearchParams(location.search).get('cy')) || 0 };
+colorCam.cv.width = 256; colorCam.cv.height = 144; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
+async function toggleColor() {
+  if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); colorCam.status = 'off'; return; }
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 1280, height: 720 }, audio: false });
+    const v = colorCam.video = document.createElement('video'); v.muted = true; v.playsInline = true; v.srcObject = st; await v.play();
+    colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight;
+  } catch (e) { colorCam.status = 'unavailable (' + (e.name || e.message) + ')'; toast('Camera colour needs Horizon OS v74+ and camera permission'); }
+}
+function camFrame(vp) {
+  const c = colorCam; if (!c.on || !c.video || c.video.readyState < 2) return null;
+  if (performance.now() - c.t > 90) { c.ctx.drawImage(c.video, 0, 0, 256, 144); c.data = c.ctx.getImageData(0, 0, 256, 144).data; c.t = performance.now(); }
+  return { data: c.data, w: 256, h: 144, f: c.f, asp: 256 / 144, cy: c.cy };
+}
 function sampleDepth(frame, ref, session, tNow) {
   if (!depth.binding || !scanning) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
@@ -210,6 +246,12 @@ function sampleDepth(frame, ref, session, tNow) {
     else { if (r <= 0 || r >= 1) { zs[k] = 0; continue; } z = isFinite(far) ? 2 * near * far / (far + near - (r * 2 - 1) * (far - near)) : near / (1 - r); }
     zs[k] = z;
   }
+  if (++depth.frames <= 15) { depth.status = 'warming up the depth sensor'; return; }      // first ~15 frames are sensor-calibration noise
+  const PE = new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements, fpx = 2 / (PE[0] * DW), fpy = 2 / (PE[5] * DH);
+  /* your body: torso capsule from the head down (world-up), and a ball round each hand/controller */
+  const head = depth.head.setFromMatrixPosition(vp.transform.matrix), hands = handsNow();
+  const inBody = (x, y, z) => { if (Math.hypot(x - head.x, z - head.z) < .35 && y < head.y + .25 && y > head.y - 1.75) return true; for (const h of hands) if ((x - h.x) ** 2 + (y - h.y) ** 2 + (z - h.z) ** 2 < .0256) return true; return false; };
+  const cam = camFrame(vp), vinv = cam ? depth.vinv.fromArray(vp.transform.inverse.matrix) : null;
   const n = _nd.elements; let added = 0;
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
     const k = y * DW + x, z = zs[k];
@@ -220,8 +262,22 @@ function sampleDepth(frame, ref, session, tNow) {
     let vu = n[0] * u + n[4] * v + n[12], vv = n[1] * u + n[5] * v + n[13];
     if (depth.flipY) vv = 1 - vv;
     _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(_inv); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
-    _p.multiplyScalar(z / -_p.z).applyMatrix4(_xf);
-    addSighting(_p.x, _p.y, _p.z, tNow, z < 1.5 ? 1 : z < 2.5 ? .7 : .45, depth.cam);           // close looks count for more
+    _p.multiplyScalar(z / -_p.z);
+    /* how squarely the surface faces the sensor, from the depth slope: grazing looks count far less */
+    const gx = (zs[k + 1] - zs[k - 1]) / (2 * z * fpx), gy = (zs[k + DW] - zs[k - DW]) / (2 * z * fpy), cosA = 1 / Math.sqrt(1 + gx * gx + gy * gy);
+    if (cosA < .3) continue;
+    const q = Math.max(0, 1 - z / 4.6) * cosA, w = Math.max(.06, q * q * 2.2);
+    const vx = _p.x, vy = _p.y, vz = _p.z;
+    _p.applyMatrix4(_xf);
+    if (inBody(_p.x, _p.y, _p.z)) continue;
+    const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
+    if (id >= 0 && cam && w > .3) {                            // colour it from the passthrough camera frame
+      _c.copy(_p).applyMatrix4(vinv);
+      if (_c.z < -.1) { const cu = .5 + .5 * cam.f * _c.x / -_c.z, cv = .5 - .5 * cam.f * cam.asp * _c.y / -_c.z + cam.cy;
+        if (cu > 0 && cu < 1 && cv > 0 && cv < 1) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, d = cam.data; tint(id, d[pi] / 255, d[pi + 1] / 255, d[pi + 2] / 255, q); } }
+    }
+    /* the ray passed through empty air before the surface: wear down anything that was there (ghosts, people walking past) */
+    for (const f of [.45, .7, .88]) { const t = f * z; if (z - t < .08) continue; _c.set(vx * f, vy * f, vz * f).applyMatrix4(_xf); if (!inBody(_c.x, _c.y, _c.z)) carve(_c.x, _c.y, _c.z, .35 * w); }
     added++;
   }
   depth.status = 'live · ' + added + ' pts/frame';
@@ -237,10 +293,10 @@ const DB = (() => {
 let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null;
 function snapshot() {
   const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF) keep.push(i);
-  const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length), Mk = new Uint32Array(keep.length);
-  keep.forEach((id, k) => { P[k * 3] = pos[id * 3]; P[k * 3 + 1] = pos[id * 3 + 1]; P[k * 3 + 2] = pos[id * 3 + 2]; Cn[k] = Math.min(65535, Math.round(cnt[id])); Mk[k] = dirs[id]; });
+  const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length), Mk = new Uint32Array(keep.length), Cl = new Uint8Array(keep.length * 4);
+  keep.forEach((id, k) => { P[k * 3] = pos[id * 3]; P[k * 3 + 1] = pos[id * 3 + 1]; P[k * 3 + 2] = pos[id * 3 + 2]; Cn[k] = Math.min(65535, Math.round(cnt[id])); Mk[k] = dirs[id]; if (cw[id] > .01) { Cl[k * 4] = col[id * 3] * 255; Cl[k * 4 + 1] = col[id * 3 + 1] * 255; Cl[k * 4 + 2] = col[id * 3 + 2] * 255; Cl[k * 4 + 3] = 255; } });
   return {
-    voxelSize: VS, points: P, counts: Cn, masks: Mk, understanding,
+    voxelSize: VS, points: P, counts: Cn, masks: Mk, colors: Cl, understanding,
     planes: [...planes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), poly: e.poly })),
     meshes: [...meshes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), v: e.v, i: e.i })),
     floorY: pmat.uniforms.floorY.value
@@ -273,7 +329,7 @@ async function loadIntoSession(rec) {
 }
 function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
-  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0); }
+  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
   flushGeo(); toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
 }
 
@@ -303,7 +359,7 @@ async function download(name, blob) {
 function exportJSON(rec) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
-    masks: rec.masks ? b64(rec.masks) : null, understanding: rec.understanding || null };
+    masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, understanding: rec.understanding || null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
 function exportPLY(rec) {
@@ -312,12 +368,36 @@ function exportPLY(rec) {
   for (let k = 0; k < n; k++) {
     const y = rec.points[k * 3 + 1], h = Math.max(0, Math.min(1, (y - (rec.floorY || 0)) / 2.7)), o = k * 15;
     body.setFloat32(o, rec.points[k * 3], true); body.setFloat32(o + 4, y, true); body.setFloat32(o + 8, rec.points[k * 3 + 2], true);
-    body.setUint8(o + 12, 160 + 40 * h | 0); body.setUint8(o + 13, 130 + 85 * h | 0); body.setUint8(o + 14, 100 + 130 * h | 0);
+    const C = rec.colors, hc = C && C[k * 4 + 3];
+    body.setUint8(o + 12, hc ? C[k * 4] : 160 + 40 * h | 0); body.setUint8(o + 13, hc ? C[k * 4 + 1] : 130 + 85 * h | 0); body.setUint8(o + 14, hc ? C[k * 4 + 2] : 100 + 130 * h | 0);
   }
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', new Blob([head, body.buffer], { type: 'application/octet-stream' }));
 }
+/* glTF binary: coloured point cloud, Quest room meshes (in world space), wall/stair/object boxes, understanding in extras */
+function exportGLB(rec) {
+  const chunks = [], views = [], accs = [], meshesG = [], nodes = []; let off = 0;
+  const add = (arr, target) => { const b = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength); chunks.push(b); const pad = (4 - b.byteLength % 4) % 4; if (pad) chunks.push(new Uint8Array(pad)); views.push({ buffer: 0, byteOffset: off, byteLength: b.byteLength, ...(target ? { target } : {}) }); off += b.byteLength + pad; return views.length - 1; };
+  const acc = (arr, type, ct, count, norm, mm) => { accs.push({ bufferView: add(arr, ct === 5125 ? 34963 : 34962), componentType: ct, count, type, ...(norm ? { normalized: true } : {}), ...(mm || {}) }); return accs.length - 1; };
+  const bounds = P => { const mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9]; for (let i = 0; i < P.length; i += 3) for (let a = 0; a < 3; a++) { mn[a] = Math.min(mn[a], P[i + a]); mx[a] = Math.max(mx[a], P[i + a]); } return { min: mn, max: mx }; };
+  const n = rec.points.length / 3, C = new Uint8Array(n * 4);
+  for (let k = 0; k < n; k++) { const hc = rec.colors && rec.colors[k * 4 + 3], h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7));
+    C[k * 4] = hc ? rec.colors[k * 4] : 160 + 40 * h; C[k * 4 + 1] = hc ? rec.colors[k * 4 + 1] : 130 + 85 * h; C[k * 4 + 2] = hc ? rec.colors[k * 4 + 2] : 100 + 130 * h; C[k * 4 + 3] = 255; }
+  meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5121, n, true) } }] }); nodes.push({ name: 'scan points', mesh: 0 });
+  const mm = new M4(), v = new V3();
+  for (const me of rec.meshes) {
+    mm.fromArray(me.m); const W = new Float32Array(me.v.length); for (let i = 0; i < W.length; i += 3) { v.set(me.v[i], me.v[i + 1], me.v[i + 2]).applyMatrix4(mm); W[i] = v.x; W[i + 1] = v.y; W[i + 2] = v.z; }
+    meshesG.push({ name: me.label, primitives: [{ mode: 4, attributes: { POSITION: acc(W, 'VEC3', 5126, W.length / 3, false, bounds(W)) }, indices: acc(new Uint32Array(me.i), 'SCALAR', 5125, me.i.length) }] });
+    nodes.push({ name: 'meta: ' + me.label, mesh: meshesG.length - 1 });
+  }
+  const und = rec.understanding;
+  const json = { asset: { version: '2.0', generator: 'House Scanner' }, scene: 0, scenes: [{ name: rec.name, nodes: nodes.map((_, i) => i), extras: { understanding: und || null, planes: rec.planes } }], nodes, meshes: meshesG, accessors: accs, bufferViews: views, buffers: [{ byteLength: off }] };
+  const jb = new TextEncoder().encode(JSON.stringify(json)), jpad = (4 - jb.length % 4) % 4, jlen = jb.length + jpad;
+  const head = new DataView(new ArrayBuffer(20)); head.setUint32(0, 0x46546C67, true); head.setUint32(4, 2, true); head.setUint32(8, 12 + 8 + jlen + 8 + off, true); head.setUint32(12, jlen, true); head.setUint32(16, 0x4E4F534A, true);
+  const bh = new DataView(new ArrayBuffer(8)); bh.setUint32(0, off, true); bh.setUint32(4, 0x004E4942, true);
+  download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
+}
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, understanding: o.understanding || null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
 }
 
@@ -334,7 +414,7 @@ function parseJSON(o) {
 const UPM = (() => { let m = 0; for (let i = 0; i < 27; i++) if (i !== 13 && Math.floor((i % 9) / 3) === 2) m |= 1 << i; return m; })();
 const DNM = (() => { let m = 0; for (let i = 0; i < 27; i++) if (i !== 13 && Math.floor((i % 9) / 3) === 0) m |= 1 << i; return m; })();
 const popc = m => { m = m - ((m >>> 1) & 0x55555555); m = (m & 0x33333333) + ((m >>> 2) & 0x33333333); return (((m + (m >>> 4)) & 0x0F0F0F0F) * 0x01010101) >>> 24; };
-function analyze(P, masks, planesIn) {
+function analyze(P, masks, planesIn, meshesIn) {
   const C = .1, n = P.length / 3, cells = new Map();
   const ck = (cx, cz) => (cx + 50000) * 100000 + (cz + 50000);
   for (let k = 0; k < n; k++) {
@@ -472,6 +552,17 @@ function analyze(P, masks, planesIn) {
     if (!label) label = h > 1.25 ? 'tall furniture' : h > .6 && h < 1 && area > .25 ? 'table / counter' : area > 1.6 && h < .75 ? 'bed / sofa' : h > .3 && h < .6 && area > .15 ? 'seat' : h < .3 ? 'low object' : 'object';
     objects.push({ x1, x2, z1, z2, y0: L.y, top, h, area, label, w: fw, d: fd });
   }
+  /* Quest Space Setup furniture comes as labelled meshes (volumes): trust their labels and boxes */
+  const v3 = new V3(), mm = new M4();
+  for (const me of meshesIn || []) {
+    const lb = (me.label || '').toLowerCase(); if (!lb || /global|mesh|wall|floor|ceiling|other/.test(lb) || !me.v || !me.v.length) continue;
+    mm.fromArray(me.m); let x1 = 1e9, x2 = -1e9, y1 = 1e9, y2 = -1e9, z1 = 1e9, z2 = -1e9;
+    for (let i = 0; i < me.v.length; i += 3) { v3.set(me.v[i], me.v[i + 1], me.v[i + 2]).applyMatrix4(mm); x1 = Math.min(x1, v3.x); x2 = Math.max(x2, v3.x); y1 = Math.min(y1, v3.y); y2 = Math.max(y2, v3.y); z1 = Math.min(z1, v3.z); z2 = Math.max(z2, v3.z); }
+    const ov = o => Math.max(0, Math.min(o.x2, x2) - Math.max(o.x1, x1)) * Math.max(0, Math.min(o.z2, z2) - Math.max(o.z1, z1));
+    for (let i = objects.length - 1; i >= 0; i--) if (ov(objects[i]) > .4 * objects[i].area) objects.splice(i, 1);   // the depth blob of the same thing
+    const L = levelOf(y1);
+    objects.push({ x1, x2, z1, z2, y0: L ? L.y : y1, top: y2, h: y2 - (L ? L.y : y1), area: (x2 - x1) * (z2 - z1), label: lb + ' (Meta)', w: x2 - x1, d: z2 - z1, meta: true });
+  }
   return { levels: levels.map(l => ({ y: l.y, area: l.area, ceiling: l.ceiling, fromSetup: !!l.fromSetup })), walls, stairs, objects, points: n };
 }
 
@@ -513,7 +604,7 @@ const underG = new THREE.Group(); scene.add(underG);
 let understanding = null, underOn = true, underAt = 0, underN = 0;
 function runUnderstanding() {
   const s = snapshot(); if (s.points.length < 3000) return;
-  const t0 = performance.now(); understanding = analyze(s.points, s.masks, s.planes); understanding.ms = performance.now() - t0;
+  const t0 = performance.now(); understanding = analyze(s.points, s.masks, s.planes, s.meshes); understanding.ms = performance.now() - t0;
   buildUnderstanding(understanding, underG); underG.visible = underOn; underN = confirmed;
 }
 function understandingLines(res) {
@@ -527,8 +618,8 @@ function understandingLines(res) {
 
 /* ================= in-headset control panel (left hand) and pointer (right hand) ================= */
 const panel = (() => {
-  const c = document.createElement('canvas'); c.width = 640; c.height = 600; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .225), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
+  const c = document.createElement('canvas'); c.width = 640; c.height = 680; const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(.24, .255), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); mesh.renderOrder = 50;
   mesh.position.set(.0, .07, -.04); mesh.rotation.set(-.85, 0, 0);
   return { c, g: c.getContext('2d'), t, mesh, hover: -1, buttons: [] };
 })();
@@ -539,6 +630,7 @@ const BTN = () => [
   { id: 'under', label: underOn ? 'Understanding: ON' : 'Understanding: OFF', on: underOn },
   { id: 'analyze', label: 'Re-analyse now' },
   { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
+  { id: 'color', label: colorCam.on ? 'Camera colour: ON' : 'Camera colour: OFF', on: colorCam.on },
   { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
   { id: 'save', label: 'Save scan' },
   { id: 'clear', label: 'Clear map' },
@@ -546,7 +638,7 @@ const BTN = () => [
 ];
 function toast(m) { toastMsg = m; toastT = 4; }
 function drawPanel() {
-  const g = panel.g, W = 640, H = 600; g.clearRect(0, 0, W, H);
+  const g = panel.g, W = 640, H = 680; g.clearRect(0, 0, W, H);
   g.fillStyle = 'rgba(14,16,18,.92)'; g.fillRect(0, 0, W, H); g.strokeStyle = '#2f3438'; g.lineWidth = 2; g.strokeRect(1, 1, W - 2, H - 2);
   g.fillStyle = '#e8e6df'; g.font = '600 28px monospace'; g.fillText('HOUSE SCANNER', 22, 44);
   g.font = '19px monospace'; g.fillStyle = '#9ad8e4';
@@ -556,7 +648,7 @@ function drawPanel() {
     'room layout     ' + planes.size + ' planes · ' + [...meshes.values()].reduce((a, e) => a + (e.i ? e.i.length / 3 : 0), 0).toLocaleString() + ' mesh tris',
     'depth           ' + depth.status,
     'anchor          ' + (originAnchor ? (anchorUUID ? 'saved' : 'ready') : 'unavailable') + (lastSave ? ' · saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : ''),
-    'fps             ' + Math.round(fps)
+    'camera colour   ' + colorCam.status + '   fps ' + Math.round(fps)
   ];
   lines.push(...understandingLines(understanding).map(l => l.slice(0, 54)), 'amber = seen from one angle: look again from elsewhere');
   lines.forEach((l, i) => g.fillText(l, 22, 80 + i * 25));
@@ -567,11 +659,12 @@ function drawPanel() {
     g.fillStyle = panel.hover === i ? '#2b6f7c' : b.on ? '#1d4a53' : '#24282c'; g.fillRect(x, y, bw, bh);
     g.fillStyle = '#eef'; g.font = '20px monospace'; g.fillText(b.label, x + 14, y + 32);
   });
-  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 590); }
+  if (toastT > 0) { g.fillStyle = '#f0d58a'; g.font = '19px monospace'; g.fillText(toastMsg.slice(0, 52), 22, 668); }
   panel.t.needsUpdate = true;
 }
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; }
+  if (id === 'color') await toggleColor();
   if (id === 'under') { underOn = !underOn; underG.visible = underOn; }
   if (id === 'analyze') { runUnderstanding(); toast(understanding ? 'Analysed in ' + Math.round(understanding.ms) + ' ms' : 'Scan a bit more first'); }
   if (id === 'room') { if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
@@ -585,7 +678,7 @@ const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new TH
 laser.scale.z = 2;
 let lastFrame = null;
 for (const i of [0, 1]) {
-  const c = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i); scene.add(c, grip);
+  const c = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i); scene.add(c, grip); grips.push(grip);
   c.addEventListener('connected', ev => {
     c.userData.hand = ev.data.handedness;
     if (ev.data.handedness === 'left') grip.add(panel.mesh); else { rightCtl.c = c; c.add(laser); }
@@ -598,7 +691,7 @@ function updatePointer() {
   const h = pointerRay.intersectObject(panel.mesh)[0];
   laser.scale.z = h ? h.distance : 2;
   if (!h) return;
-  const px = h.uv.x * 640, py = (1 - h.uv.y) * 600;
+  const px = h.uv.x * 640, py = (1 - h.uv.y) * 680;
   panel.hover = panel.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
 }
 
@@ -619,7 +712,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    depth.binding = null; depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
+    depth.binding = null; depth.frames = 0; depth.status = feats.includes('depth-sensing') || s.depthUsage ? 'starting' : 'not available (update the headset)';
     if (s.depthUsage === 'gpu-optimized' || (feats.includes('depth-sensing') && !s.depthUsage)) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed'; } }
     else if (s.depthUsage) depth.status = 'cpu depth (unsupported here)';
     $('ui').classList.add('hide');
@@ -643,7 +736,7 @@ async function listScans() {
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
     mk('Continue', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
-    mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r));
+    mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
     mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); listScans(); } });
     el.appendChild(row);
@@ -654,10 +747,10 @@ function openViewer(rec) {
   const g = new THREE.Group(); viewer.group = g; scene.add(g);
   const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3));
   const n = rec.points.length / 3, cols = new Float32Array(n * 3);
-  for (let k = 0; k < n; k++) { const h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7)); cols[k * 3] = .62 + .16 * h; cols[k * 3 + 1] = .5 + .34 * h; cols[k * 3 + 2] = .38 + .52 * h; }
+  for (let k = 0; k < n; k++) { if (rec.colors && rec.colors[k * 4 + 3]) { cols[k * 3] = rec.colors[k * 4] / 255; cols[k * 3 + 1] = rec.colors[k * 4 + 1] / 255; cols[k * 3 + 2] = rec.colors[k * 4 + 2] / 255; continue; } const h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7)); cols[k * 3] = .62 + .16 * h; cols[k * 3 + 1] = .5 + .34 * h; cols[k * 3 + 2] = .38 + .52 * h; }
   geo.setAttribute('color', new THREE.BufferAttribute(cols, 3)); geo.computeBoundingBox();
   g.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: rec.voxelSize * 1.2, vertexColors: true, sizeAttenuation: true })));
-  const ug = new THREE.Group(); g.add(ug); const ures = rec.understanding || analyze(rec.points, rec.masks, rec.planes); buildUnderstanding(ures, ug);
+  const ug = new THREE.Group(); g.add(ug); const ures = rec.understanding || analyze(rec.points, rec.masks, rec.planes, rec.meshes); buildUnderstanding(ures, ug);
   ug.traverse(o => { if (o.isSprite) o.scale.multiplyScalar(3.5); if (o.userData.follow !== undefined) o.position.set(viewer.target ? 0 : 0, o.userData.follow + .05, 0); });
   viewer.res = ures;
   for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .25 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
