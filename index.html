@@ -1545,21 +1545,30 @@ const NB7 = [[0, 0, 0]].concat(NB6);
 const coverage = () => metaSurf.n > 3000 && !depth.metaStale ? Math.min(1, cov.done.size / metaSurf.n) : null;
 
 /* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
+function metaOf(o) {                                                // what the scan list needs, without the heavy arrays
+  return { id: o.id, name: o.name, date: o.date, n: o.points ? o.points.length / 3 : 0, normals: !!o.normals, anchor: o.anchor ? { uuid: o.anchor.uuid || null, m: !!o.anchor.m } : null,
+    merged: o.merged || null, archived: o.archived || null, auto: o.auto || null, refined: !!o.refined, photoAlign: !!o.photoAlign, tex: !!o.tex };
+}
 const DB = (() => {
   let db = null;
   const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => {
-    const r = indexedDB.open('house-scanner', 4);
-    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('live')) d.createObjectStore('live', { keyPath: 'id' }); };
+    const r = indexedDB.open('house-scanner', 5);
+    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('live')) d.createObjectStore('live', { keyPath: 'id' }); if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'id' }); };
     r.onsuccess = () => { db = r.result; db.onversionchange = () => { db.close(); db = null; }; res(db); }; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error('close the scanner in other tabs'));
   });
   const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onabort = t.onerror = ev => rej(t.error || (ev && ev.target && ev.target.error) || new Error('storage write aborted')); }));
+  const txm = (stores, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(stores, 'readwrite'), q = fn(...stores.map(n => t.objectStore(n))); t.oncomplete = () => res(q && q.result); t.onabort = t.onerror = ev => rej(t.error || (ev && ev.target && ev.target.error) || new Error('storage write aborted')); }));
   return {
-    put: o => tx('scans', 'readwrite', s => s.put(o)), all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => tx('scans', 'readwrite', s => s.delete(id)),
+    put: o => txm(['scans', 'meta'], (s, m) => { m.put(metaOf(o)); return s.put(o); }),   // the scan and its small index entry, in one transaction
+    metas: async () => { const [m, n] = await Promise.all([tx('meta', 'readonly', s => s.getAll()), tx('scans', 'readonly', s => s.count())]); if (m.length === n) return m;
+      const out = []; await tx('scans', 'readonly', s => { const q = s.openCursor(); q.onsuccess = () => { const c = q.result; if (c) { out.push(metaOf(c.value)); c.continue(); } }; return null; });   // one scan at a time
+      await tx('meta', 'readwrite', s => { s.clear(); for (const x of out) s.put(x); return null; }); return out; },
+    all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => txm(['scans', 'meta'], (s, m) => { m.delete(id); return s.delete(id); }),
     putFrame: o => tx('frames', 'readwrite', s => s.put(o)), frames: id => tx('frames', 'readonly', s => s.index('scan').getAll(id)), countFrames: id => tx('frames', 'readonly', s => s.index('scan').count(id)),
     putLive: o => tx('live', 'readwrite', s => s.put(o)), allLive: () => tx('live', 'readonly', s => s.getAll()), delLive: id => tx('live', 'readwrite', s => s.delete(id)),
     putDepth: o => tx('depth', 'readwrite', s => s.put(o)), depthFrames: id => tx('depth', 'readonly', s => s.index('scan').getAll(id)), countDepth: id => tx('depth', 'readonly', s => s.index('scan').count(id)),
     delDepth: id => tx('depth', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; }),
-    putIfSame: rec => tx('scans', 'readwrite', s => { const out = { result: false }, g = s.get(rec.id); g.onsuccess = () => { const cur = g.result; if (cur && cur.date === rec.date) { s.put(rec); out.result = true; } }; return out; }),   // one transaction: no newer save can slip in between
+    putIfSame: rec => txm(['scans', 'meta'], (s, m) => { const out = { result: false }, g = s.get(rec.id); g.onsuccess = () => { const cur = g.result; if (cur && cur.date === rec.date) { s.put(rec); m.put(metaOf(rec)); out.result = true; } }; return out; }),   // one transaction: no newer save can slip in between
     adopt: (from, to) => Promise.all(['frames', 'depth'].map(st => tx(st, 'readwrite', s => { const q = s.index('scan').openCursor(IDBKeyRange.only(from)); q.onsuccess = () => { const c = q.result; if (!c) return; const v = Object.assign({}, c.value, { scan: to, k: to + c.value.k.slice(from.length) }); s.put(v); c.delete(); c.continue(); }; return null; }))),
     depthKeys: id => tx('depth', 'readonly', s => s.index('scan').getAllKeys(id)), firstFrame: id => tx('frames', 'readonly', s => { const out = { result: null }, q = s.index('scan').openCursor(IDBKeyRange.only(id)); q.onsuccess = () => { if (q.result) out.result = q.result.value; }; return out; }), getFrame: k => tx('frames', 'readonly', s => s.get(k)), getDepth: k => tx('depth', 'readonly', s => s.get(k)),
     delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
@@ -2267,10 +2276,10 @@ function markTried(k) { mergeTried.add(k); try { localStorage.setItem('scanner.m
 const strongMatch = r => r && r.ok && r.wallFit > .6 && r.ratio > 1.35 && r.overlap > .5;
 async function autoMerge(id, say) {
   let rec = await DB.get(id); if (!rec || rec.archived || !rec.normals || !rec.points.length) return null;
-  const others = (await DB.all()).filter(o => o.id !== id && !o.archived && o.normals && o.points && o.points.length).sort((a, b) => a.date - b.date);
-  for (const o of others) {
-    const pair = [id, o.id].sort().join('|'), k = pair + '|' + rec.date + '|' + o.date; if (mergeTried.has(k) || noMerge.has(pair)) continue;
-    if (xrSession) return null;
+  const others = (await DB.metas()).filter(o => o.id !== id && !o.archived && o.normals && o.n).sort((a, b) => a.date - b.date);
+  for (const om of others) {
+    const pair = [id, om.id].sort().join('|'), k = pair + '|' + rec.date + '|' + om.date; if (mergeTried.has(k) || noMerge.has(pair)) continue;
+    if (xrSession) return null; const o = await DB.get(om.id).catch(() => null); if (!o || !o.points) continue;
     say('Looking for overlap with "' + o.name + '"…');
     const [A, B] = o.date <= rec.date ? [o, rec] : [rec, o];            // the older scan keeps its frame
     const BN = n => { const f = new Float32Array(n.points.length); if (n.normals) for (let i = 0; i < f.length; i++) f[i] = n.normals[i] / 127; return f; };
@@ -3170,7 +3179,7 @@ $('bAR').addEventListener('click', async () => {
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
-    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => { if (xrSession === s) loadIntoSession(r).catch(e => toast('Could not load: ' + e.message)); }, 1500); }
+    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => { if (xrSession === s) DB.get(r.id).then(rec => { if (!rec) throw new Error('scan not found'); if (xrSession === s) return loadIntoSession(rec); }).catch(e => toast('Could not load: ' + e.message)); }, 1500); }
   } catch (e) { replayMode = false; pendingOpen = null; $('st').textContent = colorCam.on && /activation|gesture|user/i.test(e.message) ? 'Camera is ready. Tap again to start.' : 'Could not start: ' + e.message; }
 });
 function flushAnchorDeletes(s) { if (!s.deletePersistentAnchor) return; let q = []; try { q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); localStorage.removeItem('scanner.delAnchors'); } catch (e) {} for (const u of q) s.deletePersistentAnchor(u).catch(() => {}); }
@@ -3189,7 +3198,7 @@ async function recoverLive(L, existing) {                         // turn a save
 }
 async function listScans() {
   const gen = listScans.gen = (listScans.gen || 0) + 1, el0 = $('scans');
-  let full = []; try { full = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
+  let full = []; try { full = (await DB.metas()).sort((a, b) => b.date - a.date); } catch (e) {}
   const all = full.filter(x => !x.archived); listScans.full = full;
   for (const x of full) if (x.archived && (Date.now() - x.archived.at > 7 * 864e5 || !full.some(y => y.id === x.archived.into))) purgeScan(x, full);   // originals of an auto-merge: kept 7 days for Undo
   let lives = []; try { lives = (await DB.allLive()).filter(L => !xrSession || L.id !== currentId); } catch (e) {}
@@ -3198,6 +3207,7 @@ async function listScans() {
 function queueAnchorDelete(uuid, full, exceptId) { if (!uuid || full.some(y => y.id !== exceptId && y.anchor && y.anchor.uuid === uuid)) return;   // merged scans share their originals' anchor
   try { const q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); q.push(uuid); localStorage.setItem('scanner.delAnchors', JSON.stringify(q)); } catch (e) {} }
 function purgeScan(x, full) { queueAnchorDelete(x.anchor && x.anchor.uuid, full, x.id); DB.del(x.id).catch(() => {}); DB.delFrames(x.id).catch(() => {}); DB.delDepth(x.id).catch(() => {}); }
+const load = (r, fn) => async () => { const x = await DB.get(r.id).catch(() => null); if (!x) { $('st').textContent = 'That scan no longer exists'; return; } return fn(x); };
 const fresh = async (r) => { if (autoRun.cur === r.id || autoQ.includes(r.id)) throw new Error('still processing this scan: wait for Ready'); const x = await DB.get(r.id); if (!x) throw new Error('scan no longer exists'); return x; };
 function listRows(el, all, lives) {
   for (const L of lives) { const ex = all.find(r => r.id === L.id); if (ex && ex.date >= L.at) { DB.delLive(L.id).catch(() => {}); continue; }
@@ -3212,7 +3222,7 @@ function listRows(el, all, lives) {
     const th = document.createElement('img'); th.className = 'thumb'; th.alt = ''; row.appendChild(th);
     DB.firstFrame(r.id).then(f => { if (f && f.blob) { const u = URL.createObjectURL(f.blob); th.onload = () => URL.revokeObjectURL(u); th.src = u; } }).catch(() => {});
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
-    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' points' + (r.anchor && r.anchor.m ? ' · anchored' : '') + (r.merged && r.merged.auto ? ' · joined automatically' : ''); n.appendChild(sm); row.appendChild(n);
+    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.n || 0).toLocaleString() + ' points' + (r.anchor && r.anchor.m ? ' · anchored' : '') + (r.merged && r.merged.auto ? ' · joined automatically' : ''); n.appendChild(sm); row.appendChild(n);
     DB.countFrames(r.id).then(k => { if (k) sm.textContent += ' · ' + k + ' photos'; }).catch(() => {});
     const as = document.createElement('small'); as.dataset.auto = r.id; as.className = 'st'; as.textContent = r.auto ? (r.auto.error ? 'Processing stopped: ' + r.auto.error : 'Ready: ' + (r.refined ? 'refined, ' : '') + 'meshed' + (r.photoAlign ? ', photos matched' : '') + (r.tex ? ', photo-textured' : '') + ' ✓') : autoMsg.get(r.id) || ''; n.appendChild(as);
     if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
@@ -3224,17 +3234,17 @@ function listRows(el, all, lives) {
       if (label === 'Walk through') b.className = 'primary'; if (label === 'Delete') b.className = 'danger';
       const g = GROUP[label]; if (g) (menus[g] ? menus[g].m : menu(g)).appendChild(b); else acts.appendChild(b); };
     mk('Walk through', () => { pendingOpen = r; replayMode = true; if (!$('bAR').disabled) $('bAR').click(); else { replayMode = false; $('st').textContent = 'Walking through needs the Quest browser. Use View here.'; } });
-    mk('Photos .zip', () => exportPhotos(r));
+    mk('Photos .zip', load(r, x => exportPhotos(x)));
     mk('Continue scanning', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
-    mk('View', () => openViewer(r));
+    mk('View', load(r, x => openViewer(x)));
     if (r.merged && r.merged.auto && (listScans.full || []).some(x => x.archived && x.archived.into === r.id)) mk('Undo join', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing: wait for Ready'; return; }
       try { const n2 = await undoMerge(r); $('st').textContent = 'Separated back into ' + n2 + ' scans (they will not be joined automatically again)'; listScans(); } catch (e) { $('st').textContent = 'Undo: ' + e.message; } });
-    mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
+    mk('.json', load(r, exportJSON)); mk('.ply', load(r, exportPLY)); mk('.glb', load(r, exportGLB));
     mk('Refine', async () => { try { const x = await fresh(r); if (x.refined && !confirm('This scan is already refined. Refine again?')) return; await refineScan(x, m => $('st').textContent = m); listScans(); } catch (e) { $('st').textContent = 'Refine: ' + e.message; } });
-    mk('Floor plan', () => { try { const fp = floorPlan(r); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } });
+    mk('Floor plan', load(r, rf => { try { const fp = floorPlan(rf); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } }));
     mk('Merge with…', async () => { const others = all.filter(o => o.id !== r.id); if (!others.length) { $('st').textContent = 'Scan another room first, then merge.'; return; }
       const pick = prompt('Merge "' + r.name + '" with which scan? Type its number:\n' + others.map((o, i) => (i + 1) + '. ' + o.name + ' (' + new Date(o.date).toLocaleDateString() + ')').join('\n'), '1'); const o = others[(+pick || 0) - 1]; if (!o) return;
-      try { const m = await mergeScans(r, o, t => $('st').textContent = 'Merging: ' + t); $('st').textContent = 'Merged into "' + m.rec.name + '" (' + Math.round(m.overlap * 100) + '% overlap). It is being refined with loop closure now.'; listScans(); } catch (e) { $('st').textContent = 'Merge: ' + e.message; } });
+      try { const [ra, ro] = await Promise.all([DB.get(r.id), DB.get(o.id)]); if (!ra || !ro) throw new Error('scan no longer exists'); const m = await mergeScans(ra, ro, t => $('st').textContent = 'Merging: ' + t); $('st').textContent = 'Merged into "' + m.rec.name + '" (' + Math.round(m.overlap * 100) + '% overlap). It is being refined with loop closure now.'; listScans(); } catch (e) { $('st').textContent = 'Merge: ' + e.message; } });
     mk('Match photos', async () => { const st = $('st'); try { const a = await alignPhotos(await fresh(r), m => st.textContent = 'Photo matching: ' + m + '…'); st.textContent = 'Photos matched: ' + a.used + ' photos, colour error ' + (a.rms0 * 100).toFixed(1) + '% → ' + (a.rms1 * 100).toFixed(1) + '%, camera offset ' + Math.hypot(a.E[12], a.E[13], a.E[14]).toFixed(3) + ' m. Re-run Photo texture.'; } catch (e) { st.textContent = 'Photo matching: ' + e.message; } });
     mk('Photo texture', async () => { const st = $('st'), t0 = performance.now(); st.textContent = 'Texturing…';
       try { const x = await fresh(r); delete x.tex; const t = await recTexture(x, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
