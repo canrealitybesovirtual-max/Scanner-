@@ -39,6 +39,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 #vbar span{color:#ddd;text-shadow:0 1px 3px #000;font-size:13px}
 #vbar button{background:rgba(20,22,24,.8);color:#eee;border-color:#444;padding:7px 12px;font-size:13px}
 input[type=file]{display:none}
+.chk{display:block;margin:12px 0 4px;font-size:14px;color:#c9c6bd}.chk input{width:18px;height:18px;vertical-align:-3px;margin-right:6px}
 </style>
 </head>
 <body>
@@ -49,7 +50,7 @@ input[type=file]{display:none}
   <p>Walk your whole house in passthrough and it builds a 2&nbsp;cm 3D point map of every surface from the headset's depth sensor. It adds the room layout from Space Setup (walls, floor, furniture and room mesh) and saves it all so you can continue later.</p>
   <ul>
     <li>Walk slowly. Look at every surface from 0.5–3 m away, including floors, ceilings, under tables and behind doors.</li>
-    <li>New detail flashes cyan as it's captured. Surfaces that stay grey-blue need another look.</li>
+    <li>Surfaces take on their real colours from the headset camera as you scan. New detail flashes briefly; amber means look again from another angle.</li>
     <li>Left hand holds the control panel. Point and pull the right trigger to press a button.</li>
     <li>Saves stay in this browser on the headset. Export a file to keep a copy.</li>
   </ul>
@@ -57,6 +58,7 @@ input[type=file]{display:none}
     <button id="bAR" class="primary" type="button" disabled>Checking headset…</button>
     <label class="btn" for="fOpen">Open an exported scan file</label>
   </div>
+  <label class="chk"><input id="cColor" type="checkbox" checked> Real colours from the headset camera (asks for camera permission)</label>
   <input id="fOpen" type="file" accept=".json,application/json">
   <div id="scans"></div>
   <div id="st"></div>
@@ -108,6 +110,7 @@ function carve(x, y, z, amt) {                             // seen *through*: th
   markDirty(id);
 }
 function tint(id, r, g, b, w) {                            // running average of camera colour
+  if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
 function clearMap() { depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); if (cov.flags) { cov.flags.fill(0); cov.covered = 0; cov.dirty = true; } vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
@@ -135,10 +138,11 @@ const pmat = new THREE.ShaderMaterial({
       vec3 base = style < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
       base *= .7 + .3 * clamp(cnt / 24.0, 0.0, 1.0);                                                      // well-seen surfaces brighter
       base = mix(base, col, step(.01, cw));                                                               // real colour from the passthrough camera
-      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * step(3.0, cnt) * (style < .5 ? .45 : .5));     // seen from one angle only: amber hint
-      float nl = length(nrm); if (nl > 1e-4 && photo < .5) base *= .62 + .38 * max(0.0, dot(nrm / nl, normalize(vec3(.35, .9, .45))));   // light the surface by its facing
-      vC = mix(base, vec3(.25, .95, 1.0), fresh);
-      va = style < .5 ? .5 + .3 * fresh : 1.0;
+      float hc = step(.01, cw);
+      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * step(3.0, cnt) * (1.0 - hc) * (style < .5 ? .45 : .5));     // uncoloured & seen from one angle only: amber hint
+      float nl = length(nrm); if (nl > 1e-4 && photo < .5 && hc < .5) base *= .62 + .38 * max(0.0, dot(nrm / nl, normalize(vec3(.35, .9, .45))));   // light uncoloured surfaces by their facing
+      vC = mix(base, vec3(.25, .95, 1.0), fresh * (hc > .5 ? .35 : 1.0));
+      va = style < .5 ? (hc > .5 ? .8 : .5) + .2 * fresh : 1.0;
       if (photo > .5) { vC = cw > .01 ? col : base * .7; va = 1.0; } }`,
   fragmentShader: `uniform float photo, alpha, style; varying vec3 vC; varying float ok, va;
     void main(){ if (ok < .5) discard; if (photo > .5 || style < .5) { vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; }
@@ -166,33 +170,45 @@ const cells = new Map(), cellQ = new Set();
 const ckey = (ix, iy, iz) => keyOf(Math.floor(ix / TC), Math.floor(iy / TC), Math.floor(iz / TC));
 function cellAdd(ix, iy, iz, id) { const k = ckey(ix, iy, iz); let c = cells.get(k); if (!c) { c = { ids: [], slot: -1 }; cells.set(k, c); } c.ids.push(id); }
 function cellDirty(ix, iy, iz) { const c = cells.get(ckey(ix, iy, iz)); if (c) cellQ.add(c); }
-const tileGeo = new THREE.PlaneGeometry(1, 1), tileCol = new Float32Array(TMAX * 4), tileBorn = new Float32Array(TMAX);
-tileGeo.setAttribute('iCol', new THREE.InstancedBufferAttribute(tileCol, 4).setUsage(THREE.DynamicDrawUsage));
+const tileGeo = new THREE.PlaneGeometry(1, 1), tileBorn = new Float32Array(TMAX);
+for (let i = 0; i < 7; i++) tileGeo.setAttribute('iT' + i, new THREE.InstancedBufferAttribute(new Uint32Array(TMAX * 4), 4).setUsage(THREE.DynamicDrawUsage));
 tileGeo.setAttribute('iBorn', new THREE.InstancedBufferAttribute(tileBorn, 1).setUsage(THREE.DynamicDrawUsage));
 const tmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, side: THREE.DoubleSide,
   uniforms: { time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
-  vertexShader: `attribute vec4 iCol; attribute float iBorn; uniform float time, floorY, photo, style; varying vec3 vC; varying vec2 vUv, vSz; varying float va;
+  vertexShader: `attribute uvec4 iT0, iT1, iT2, iT3, iT4, iT5, iT6; attribute float iBorn; uniform float time, floorY, photo, style;
+    flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
     void main(){ vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * viewMatrix * wp;
+      t0 = iT0; t1 = iT1; t2 = iT2; t3 = iT3; t4 = iT4; t5 = iT5; t6 = iT6;
       vec3 n = normalize(mat3(instanceMatrix)[2]); vSz = vec2(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz)); vUv = uv;
-      float h = clamp((wp.y - floorY) / 2.7, 0.0, 1.0), fresh = exp(-(time - iBorn) * 1.4);
-      vec3 base = style < .5 && photo < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
-      if (iCol.a > .5 && style > .5 || photo > .5) base = iCol.a > .5 ? iCol.rgb : base * .7;
-      if (photo < .5) base *= .62 + .38 * abs(dot(n, normalize(vec3(.35, .9, .45))));
-      vC = mix(base, vec3(.25, .95, 1.0), fresh * .8);
-      va = photo > .5 || style > .5 ? 1.0 : .16 + .3 * fresh; }`,
-  fragmentShader: `uniform float alpha, photo, style; varying vec3 vC; varying vec2 vUv, vSz; varying float va;
-    void main(){ vec2 e = min(vUv, 1.0 - vUv) * vSz; float edge = 1.0 - smoothstep(.0025, .006, min(e.x, e.y));     // thin seams so it reads as a mesh
-      vec3 c = vC * (1.0 - (photo > .5 ? 0.0 : .25) * edge); float a = va + (style < .5 && photo < .5 ? edge * .22 : 0.0);
-      gl_FragColor = vec4(c, alpha * a); }`
+      float h = clamp((wp.y - floorY) / 2.7, 0.0, 1.0); vFr = exp(-max(0.0, time - iBorn) * 1.4);
+      vB = style < .5 && photo < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
+      vSh = .62 + .38 * abs(dot(n, normalize(vec3(.35, .9, .45))));
+      bool col = iT6.w > 0u; va = photo > .5 || style > .5 ? 1.0 : col ? .62 : .16; }`,
+  fragmentShader: `uniform float alpha, photo, style; flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
+    uint W[28];
+    vec3 tex(int i, int j) { int k = (clamp(j, 0, 5) * 6 + clamp(i, 0, 5)) * 3; vec3 c;
+      for (int ch = 0; ch < 3; ch++) { int b = k + ch; c[ch] = float((W[b >> 2] >> uint((b & 3) * 8)) & 255u) / 255.0; } return c; }
+    void main(){
+      W[0]=t0.x;W[1]=t0.y;W[2]=t0.z;W[3]=t0.w;W[4]=t1.x;W[5]=t1.y;W[6]=t1.z;W[7]=t1.w;W[8]=t2.x;W[9]=t2.y;W[10]=t2.z;W[11]=t2.w;W[12]=t3.x;W[13]=t3.y;
+      W[14]=t3.z;W[15]=t3.w;W[16]=t4.x;W[17]=t4.y;W[18]=t4.z;W[19]=t4.w;W[20]=t5.x;W[21]=t5.y;W[22]=t5.z;W[23]=t5.w;W[24]=t6.x;W[25]=t6.y;W[26]=t6.z;W[27]=t6.w;
+      vec3 c;
+      if (t6.w > 0u) { vec2 p = vUv * 6.0 - .5, f = fract(p); ivec2 q = ivec2(floor(p));          // the surface's real colours, 2 cm texels, smoothly blended
+        c = mix(mix(tex(q.x, q.y), tex(q.x + 1, q.y), f.x), mix(tex(q.x, q.y + 1), tex(q.x + 1, q.y + 1), f.x), f.y); }
+      else c = photo > .5 ? vB * .7 : vB * vSh;
+      c = mix(c, vec3(.25, .95, 1.0), vFr * (t6.w > 0u ? .35 : .8));
+      vec2 e = min(vUv, 1.0 - vUv) * vSz; float edge = 1.0 - smoothstep(.0025, .006, min(e.x, e.y));     // thin seams so it reads as a mesh
+      float seam = photo > .5 || t6.w > 0u && style > .5 ? 0.0 : .25;
+      c *= 1.0 - seam * edge; float a = va + (style < .5 && photo < .5 ? edge * .22 + .3 * vFr : 0.0);
+      gl_FragColor = vec4(c, alpha * min(1.0, a)); }`
 });
 const tiles = new THREE.InstancedMesh(tileGeo, tmat, TMAX); tiles.count = 0; tiles.frustumCulled = false; tiles.renderOrder = -1;
 tiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage); scene.add(tiles);
-const tFree = []; let tLo = Infinity, tHi = -1, tileN = 0;
+const tFree = []; let tLo = Infinity, tHi = -1, tileN = 0; const TXA = new Float32Array(36 * 4), TXB = new Uint32Array(28), NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const _tm = new M4(), _tn = new V3(), _tu = new V3(), _tv = new V3(), _tc = new V3(), UPV = new V3(0, 1, 0), XV = new V3(1, 0, 0);
-function tileSet(c, m, rgba) {
-  if (c.slot < 0) { if (!tFree.length && tiles.count >= TMAX) return false; c.slot = tFree.length ? tFree.pop() : tiles.count++; tileN++; tileBorn[c.slot] = clockT; }
-  m.toArray(tiles.instanceMatrix.array, c.slot * 16); tileCol.set(rgba, c.slot * 4);
+function tileSet(c, m, words) {
+  if (c.slot < 0) { if (!tFree.length && tiles.count >= TMAX) return false; c.slot = tFree.length ? tFree.pop() : tiles.count++; tileN++; tileBorn[c.slot] = viewer.on ? -1e4 : clockT; }
+  m.toArray(tiles.instanceMatrix.array, c.slot * 16); for (let i = 0; i < 7; i++) tileGeo.attributes['iT' + i].array.set(words.subarray(i * 4, i * 4 + 4), c.slot * 4);
   tLo = Math.min(tLo, c.slot); tHi = Math.max(tHi, c.slot); return true;
 }
 function tileDrop(c) {
@@ -223,7 +239,22 @@ function fitCell(c) {
   if (Math.sqrt(e2 / n) > .007 || emax > .022 || n * VS * VS < .55 * su * sv) return tileDrop(c);     // not flat, or too holey: keep the dots
   _tc.set(mx, my, mz).addScaledVector(_tu, (u0 + u1) / 2).addScaledVector(_tv, (v0 + v1) / 2);
   _tm.set(_tu.x * su, _tv.x * sv, _tn.x, _tc.x, _tu.y * su, _tv.y * sv, _tn.y, _tc.y, _tu.z * su, _tv.z * sv, _tn.z, _tc.z, 0, 0, 0, 1);
-  if (!tileSet(c, _tm, cwt > .5 ? [cr / cwt, cg / cwt, cb / cwt, 1] : [0, 0, 0, 0])) return;
+  /* bake the 6x6 colour texture: each 2 cm texel averages the camera colour of the points in it, gaps filled from neighbours */
+  TXA.fill(0);
+  if (cwt > .5) {
+    for (const id of ids) { const w = cw[id]; if (cnt[id] < CONF || w <= .01) continue;
+      const a = pos[id * 3] - mx, b = pos[id * 3 + 1] - my, d = pos[id * 3 + 2] - mz;
+      const i = Math.min(5, Math.max(0, Math.floor((a * _tu.x + b * _tu.y + d * _tu.z - u0 + VS / 2) / su * 6))), j = Math.min(5, Math.max(0, Math.floor((a * _tv.x + b * _tv.y + d * _tv.z - v0 + VS / 2) / sv * 6))), o = (j * 6 + i) * 4;
+      TXA[o] += col[id * 3] * w; TXA[o + 1] += col[id * 3 + 1] * w; TXA[o + 2] += col[id * 3 + 2] * w; TXA[o + 3] += w; }
+    for (let pass = 0; pass < 3; pass++) for (let k = 0; k < 36; k++) { if (TXA[k * 4 + 3] > 0) continue; const i = k % 6, j = (k / 6) | 0; let r0 = 0, g0 = 0, b0 = 0, w0 = 0;
+      for (const [di, dj] of NB4) { const ii = i + di, jj = j + dj; if (ii < 0 || jj < 0 || ii > 5 || jj > 5) continue; const o = (jj * 6 + ii) * 4, w = TXA[o + 3]; if (w > 0) { r0 += TXA[o] / w; g0 += TXA[o + 1] / w; b0 += TXA[o + 2] / w; w0++; } }
+      if (w0) { const o = k * 4; TXA[o] = r0 / w0 * 1e-3; TXA[o + 1] = g0 / w0 * 1e-3; TXA[o + 2] = b0 / w0 * 1e-3; TXA[o + 3] = 1e-3; } }
+    TXB.fill(0);
+    for (let k = 0; k < 36; k++) { const o = k * 4, w = TXA[o + 3]; const R = w > 0 ? TXA[o] / w : cr / cwt, G = w > 0 ? TXA[o + 1] / w : cg / cwt, B = w > 0 ? TXA[o + 2] / w : cb / cwt;
+      for (let ch = 0; ch < 3; ch++) { const v = Math.max(0, Math.min(255, Math.round([R, G, B][ch] * 255))), bi = k * 3 + ch; TXB[bi >> 2] |= v << ((bi & 3) * 8); } }
+    TXB[27] = 1;
+  } else TXB.fill(0);
+  if (!tileSet(c, _tm, TXB)) return;
   for (const id of ids) { const on = cnt[id] >= CONF && Math.abs((pos[id * 3] - _tc.x) * _tn.x + (pos[id * 3 + 1] - _tc.y) * _tn.y + (pos[id * 3 + 2] - _tc.z) * _tn.z) < .016 ? 1 : 0;
     if (tl[id] !== on) { tl[id] = on; markDirty(id); } }                      // points off the plane (a cup on a table) stay as dots
 }
@@ -232,9 +263,9 @@ function tileSlice(ms) {
   for (const c of cellQ) { cellQ.delete(c); fitCell(c); if ((++k & 7) === 0 && performance.now() - t0 > ms) break; }
 }
 function tileFlush() {
-  if (tHi < 0) return; const im = tiles.instanceMatrix, ic = tileGeo.attributes.iCol, ib = tileGeo.attributes.iBorn;
+  if (tHi < 0) return; const im = tiles.instanceMatrix, ib = tileGeo.attributes.iBorn;
   im.clearUpdateRanges(); im.addUpdateRange(tLo * 16, (tHi - tLo + 1) * 16); im.needsUpdate = true;
-  ic.clearUpdateRanges(); ic.addUpdateRange(tLo * 4, (tHi - tLo + 1) * 4); ic.needsUpdate = true;
+  for (let i = 0; i < 7; i++) { const ic = tileGeo.attributes['iT' + i]; ic.clearUpdateRanges(); ic.addUpdateRange(tLo * 4, (tHi - tLo + 1) * 4); ic.needsUpdate = true; }
   ib.clearUpdateRanges(); ib.addUpdateRange(tLo, tHi - tLo + 1); ib.needsUpdate = true;
   tLo = Infinity; tHi = -1;
 }
@@ -376,14 +407,16 @@ function handsNow() { const out = []; for (const g of grips) if (g.visible !== f
 /* ================= passthrough camera colour (Quest browser, Horizon OS v74+) =================
    The browser gives no camera intrinsics, so this uses a pinhole with an assumed horizontal FOV
    (80° by default; ?hfov=NN in the URL to tune it, ?cy=0.0x to nudge it vertically). */
-const colorCam = { on: false, video: null, cv: document.createElement('canvas'), ctx: null, data: null, t: 0, status: 'off',
-  f: 1 / Math.tan((Number(new URLSearchParams(location.search).get('hfov')) || 80) * Math.PI / 360), cy: Number(new URLSearchParams(location.search).get('cy')) || 0 };
+const colorCam = { on: false, video: null, cv: document.createElement('canvas'), ctx: null, data: null, t: 0, status: 'off', w: 512, h: 288,
+  f: 1 / Math.tan((Number(new URLSearchParams(location.search).get('hfov')) || 80) * Math.PI / 360), cx: 0, cy: Number(new URLSearchParams(location.search).get('cy')) || 0, aligned: false };
+try { const a = JSON.parse(localStorage.getItem('scanner.camAlign') || 'null'); if (a && !new URLSearchParams(location.search).get('hfov')) { colorCam.f = a.f; colorCam.cx = a.cx; colorCam.cy = a.cy; colorCam.aligned = true; } } catch (e) {}
 colorCam.cv.width = 512; colorCam.cv.height = 288; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
 async function toggleColor() {
   if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); colorCam.status = 'off'; return; }
   try {
     const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 1280, height: 720 }, audio: false });
     const v = colorCam.video = document.createElement('video'); v.muted = true; v.playsInline = true; v.srcObject = st; await v.play();
+    colorCam.w = 512; colorCam.h = Math.max(64, Math.round(512 * (v.videoHeight || 288) / (v.videoWidth || 512))); colorCam.cv.width = colorCam.w; colorCam.cv.height = colorCam.h;   // keep the real aspect (Quest gives 4:3 or 16:9)
     colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight;
   } catch (e) { colorCam.status = 'unavailable (' + (e.name || e.message) + ')'; toast('Camera colour needs Horizon OS v74+ and camera permission'); }
 }
@@ -405,8 +438,8 @@ function maybeKeyframe(vp, tNow) {
 }
 function camFrame(vp) {
   const c = colorCam; if (!c.on || !c.video || c.video.readyState < 2) return null;
-  if (performance.now() - c.t > 90) { c.ctx.drawImage(c.video, 0, 0, 512, 288); c.data = c.ctx.getImageData(0, 0, 512, 288).data; c.t = performance.now(); }
-  return { data: c.data, w: 512, h: 288, f: c.f, asp: 512 / 288, cy: c.cy };
+  if (performance.now() - c.t > 90 || !c.data) { c.ctx.drawImage(c.video, 0, 0, c.w, c.h); c.data = c.ctx.getImageData(0, 0, c.w, c.h).data; c.t = performance.now(); }
+  return { data: c.data, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy };
 }
 function sampleDepth(frame, ref, session, tNow) {
   if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta) return;
@@ -437,6 +470,7 @@ function sampleDepth(frame, ref, session, tNow) {
   try { readDepth(info, isArr, layer, lumA, jx, jy, session.depthDataFormat); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
   depth.sensor = (isArr ? 'array' : '2d') + ' ' + (info.width || '?') + '×' + (info.height || '?') + ' near ' + (+(info.depthNear ?? session.renderState.depthNear)).toFixed(2) + ' far ' + (+(info.depthFar ?? session.renderState.depthFar)).toFixed(1);
+  depth.metaReady = false;
   depth.meta = {
     fwdY: -vp.transform.matrix[9], swap: swap && isArr,
     isArr, lumA, jx, jy, tNow, fmt: session.depthDataFormat,
@@ -589,7 +623,7 @@ function integrateDepth() {
     const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
     if (id >= 0 && cam && w > .3) {                            // colour it from the passthrough camera frame
       _c.copy(_p).applyMatrix4(vinv);
-      if (_c.z < -.1) { const cu = .5 + .5 * cam.f * _c.x / -_c.z, cv = .5 - .5 * cam.f * cam.asp * _c.y / -_c.z + cam.cy;
+      if (_c.z < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * _c.x / -_c.z, cv = .5 - .5 * cam.f * cam.asp * _c.y / -_c.z + cam.cy;
         if (cu > 0 && cu < 1 && cv > 0 && cv < 1) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, d = cam.data; tint(id, d[pi] / 255, d[pi + 1] / 255, d[pi + 2] / 255, q); } }
     }
     /* the ray passed through empty air before the surface: wear down anything that was there (ghosts, people walking past) */
@@ -607,8 +641,35 @@ function integrateDepth() {
 /* ================= the integration worker: all per-pixel maths off the main thread ================= */
 const INTEG_SRC = `
 let zs = null;
+/* camera alignment: the browser gives no camera intrinsics, so try a grid of field-of-view / centre guesses and keep the one
+   that makes each surface spot the same colour from every angle you see it */
+const AL = { cands: [], slots: new Map(), acc: null, frames: 0, done: false, S: 4096 };
+for (const h of [66, 72, 78, 84, 90, 96]) for (const cx of [-.04, 0, .04]) for (const cy of [-.06, -.03, 0, .03, .06]) AL.cands.push({ f: 1 / Math.tan(h * Math.PI / 360), cx, cy, hfov: h });
+AL.acc = new Float32Array(AL.cands.length * AL.S * 5);
+function alignFrame(cam, V, list, n) {
+  const C = AL.cands, S = AL.S;
+  for (let i = 0; i < n; i++) {
+    const k = list[i * 4 + 3]; let sl = AL.slots.get(k); if (sl === undefined) { if (AL.slots.size >= S) continue; sl = AL.slots.size; AL.slots.set(k, sl); }
+    const wx = list[i * 4], wy = list[i * 4 + 1], wz = list[i * 4 + 2];
+    const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
+    if (ez > -.1) continue; const ix = ex / -ez, iy = ey / -ez;
+    for (let c = 0; c < C.length; c++) { const q = C[c], cu = .5 + q.cx + .5 * q.f * ix, cv = .5 - .5 * q.f * cam.asp * iy + q.cy;
+      if (cu <= 0 || cu >= 1 || cv <= 0 || cv >= 1) continue;
+      const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, R = cam.data[pi] / 255, G = cam.data[pi + 1] / 255, B = cam.data[pi + 2] / 255, o = (c * S + sl) * 5;
+      AL.acc[o]++; AL.acc[o + 1] += R; AL.acc[o + 2] += G; AL.acc[o + 3] += B; AL.acc[o + 4] += R * R + G * G + B * B; }
+  }
+  if (++AL.frames % 10 || AL.frames < 50) return null;
+  let best = -1, bv = 1e9, base = 1e9; const used = AL.slots.size;
+  for (let c = 0; c < C.length; c++) { let v = 0, m = 0;
+    for (let sl = 0; sl < used; sl++) { const o = (c * S + sl) * 5, nn = AL.acc[o]; if (nn < 3) continue; const r = AL.acc[o + 1], g = AL.acc[o + 2], b = AL.acc[o + 3]; v += (AL.acc[o + 4] - (r * r + g * g + b * b) / nn) / nn; m++; }
+    if (m < 250) continue; v /= m; if (v < bv) { bv = v; best = c; } if (C[c].hfov === 78 && C[c].cx === 0 && C[c].cy === 0) base = v; }
+  if (best < 0) return null;
+  AL.done = true; if (bv > base * .95) best = C.findIndex(q => q.hfov === 78 && q.cx === 0 && q.cy === 0);     // no clear winner: keep the plain guess
+  return Object.assign({ gain: base / bv }, C[best]);
+}
 onmessage = e => {
-  const d = e.data, DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
+  const d = e.data;
+  if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
   if (!zs || zs.length !== n) zs = new Float32Array(n);
   const near = d.near, far = d.far, r2m = d.r2m, rvm = d.rvm, lumA = d.lumA, mode = d.mode, fin = isFinite(far);
   let valid = 0;
@@ -642,16 +703,17 @@ onmessage = e => {
     if (inBody(wx, wy, wz)) continue;
     const nl = Math.sqrt(gx * gx + gy * gy + 1), a = gx / nl, b = gy / nl, c = 1 / nl;
     const nx = X[0] * a + X[4] * b + X[8] * c, ny = X[1] * a + X[5] * b + X[9] * c, nz = X[2] * a + X[6] * b + X[10] * c;
-    let R = -1, G = 0, Bl = 0;
+    let R = -1, G = 0, Bl = 0, cq = 0;
     if (cam && w > .3) {
       const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
-      if (ez < -.1) { const cu = .5 + .5 * cam.f * ex / -ez, cvv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
-        if (cu > 0 && cu < 1 && cvv > 0 && cvv < 1) { const pi = ((cvv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4; R = cam.data[pi] / 255; G = cam.data[pi + 1] / 255; Bl = cam.data[pi + 2] / 255; } }
+      if (ez < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * ex / -ez, cvv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
+        if (cu > .01 && cu < .99 && cvv > .01 && cvv < .99) { const pi = ((cvv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4; R = cam.data[pi] / 255; G = cam.data[pi + 1] / 255; Bl = cam.data[pi + 2] / 255;
+          const a = cu * 2 - 1, b = cvv * 2 - 1; cq = q * (1 - .75 * Math.min(1, (a * a + b * b) * .5)); } }      // lens centre is sharpest and truest
     }
     const vk = key(wx, wy, wz); let o = vox.get(vk);                  // several pixels in one voxel: one averaged sighting
     if (o === undefined) { o = np++ * 11; vox.set(vk, o); for (let i = 0; i < 11; i++) out[o + i] = 0; out[o + 7] = -1; }
     out[o] += wx * w; out[o + 1] += wy * w; out[o + 2] += wz * w; out[o + 3] += w; out[o + 4] += nx * w; out[o + 5] += ny * w; out[o + 6] += nz * w;
-    if (R >= 0) { if (out[o + 7] < 0) out[o + 7] = out[o + 8] = out[o + 9] = 0; out[o + 7] += R * q; out[o + 8] += G * q; out[o + 9] += Bl * q; out[o + 10] += q; }
+    if (R >= 0) { if (out[o + 7] < 0) out[o + 7] = out[o + 8] = out[o + 9] = 0; out[o + 7] += R * cq; out[o + 8] += G * cq; out[o + 9] += Bl * cq; out[o + 10] += cq; }
     if ((x + y) & 1) continue;                                          // free-space carving on half the pixels is plenty
     for (const f of [.45, .7, .88]) { if (z - f * z < .08) continue; const ax = px * f, ay = py * f, az = pz * f;
       const cxw = X[0] * ax + X[4] * ay + X[8] * az + X[12], cyw = X[1] * ax + X[5] * ay + X[9] * az + X[13], czw = X[2] * ax + X[6] * ay + X[10] * az + X[14];
@@ -660,14 +722,22 @@ onmessage = e => {
   for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; out[o] /= w; out[o + 1] /= w; out[o + 2] /= w; out[o + 3] = Math.min(1.6, w);   // one frame alone can't confirm a voxel: noise needs a second look
     if (out[o + 10] > 0) { out[o + 7] /= out[o + 10]; out[o + 8] /= out[o + 10]; out[o + 9] /= out[o + 10]; } }
   const C = new Float32Array(car.size * 4); let nc = 0; for (const e of car.values()) { if (vox.has(key(e[0], e[1], e[2]))) continue; C.set(e, nc * 4); nc++; }   // never carve a cell this same frame saw as surface
+  let align = null;
+  if (cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen }, [P.buffer, C.buffer]);
+  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align }, [P.buffer, C.buffer]);
 };`;
 let integ = null; const applyQ = [];
+function camAligned(a) {                                                       // the worker found how the camera image lines up with the depth
+  colorCam.f = a.f; colorCam.cx = a.cx; colorCam.cy = a.cy; colorCam.aligned = true;
+  try { localStorage.setItem('scanner.camAlign', JSON.stringify({ f: a.f, cx: a.cx, cy: a.cy })); } catch (e) {}
+  for (let id = 0; id < N; id++) if (cw[id] > 1) { cw[id] = 1; }                   // colours painted before alignment give way quickly
+  toast('Colours lined up with the camera (' + a.hfov + '°, ' + Math.round((a.gain - 1) * 100) + '% sharper)');
+}
 function integWorker() {
   if (integ) return integ;
   integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
+  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
   integ.onerror = ev => { depth.wBusy = false; depth.noWorker = true; scanErr = 'worker: ' + (ev.message || 'failed'); };
   return integ;
 }
@@ -675,7 +745,7 @@ function postIntegration(M) {                                       // hand a de
   const cfg = depth.cfg, src = cfg.src === 'info' && M.projI ? 'info' : 'view', inv = src === 'info' ? M.projI : M.projV, xf = src === 'info' ? M.xfI : M.xfV;
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
-  if (M.cam && M.cam.data) { cam = { data: M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cy: M.cam.cy }; colorCam.data = null; colorCam.t = 0; }   // hand the frame over; grab a fresh one next time
+  if (M.cam && M.cam.data) { cam = { data: M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; colorCam.data = null; colorCam.t = 0; }   // hand the frame over; grab a fresh one next time
   const msg = { DW, DH, VS, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow };
@@ -789,7 +859,7 @@ async function saveScan(frame) {
       rec.anchor = { uuid: anchorUUID, m: ap ? Array.from(ap.transform.matrix) : null };
     } catch (e) { rec.anchor = null; }
   }
-  await DB.put(rec); currentId = rec.id; lastSave = Date.now();
+  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed;
   toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
 }
 let pendingLoad = null;                                     // waits for the anchor to be found again
@@ -1227,7 +1297,7 @@ function drawPanel() {
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · ' + planes.size + ' planes · cover ' + cov.covered + '/' + cov.n,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
       'clean   ' + cleaned.toLocaleString() + ' strays removed · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
-      'camera  ' + colorCam.status,
+      'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') : ''),
       ...understandingLines(understanding).slice(0, 2).map(l => 'rooms   ' + l.slice(0, 44)),
       ...(scanErr ? ['ERROR   ' + scanErr] : [])
     ];
@@ -1252,7 +1322,7 @@ async function press(id, frame) {
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; }
-  if (id === 'recal') { depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly'); }
+  if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
     if (!confirmed) { toast('Nothing captured yet'); return; }
@@ -1293,7 +1363,13 @@ async function checkXR() {
   if (ok) { b.disabled = false; b.textContent = 'Start scanning'; }
   else { b.textContent = 'Mixed reality not available here'; $('st').textContent = 'Needs the Quest browser. If you are on the Quest and still see this, open the page on its own instead of the embedded view.'; }
 }
+try { $('cColor').checked = localStorage.getItem('scanner.color') !== '0'; } catch (e) {}
+$('cColor').addEventListener('change', () => { try { localStorage.setItem('scanner.color', $('cColor').checked ? '1' : '0'); } catch (e) {} });
 $('bAR').addEventListener('click', async () => {
+  if ($('cColor').checked && !replayMode && !colorCam.on && !colorCam.asked) {           // camera permission first, while we still have your tap
+    colorCam.asked = true; $('st').textContent = 'Allow the camera so the scan gets real colours…'; await toggleColor();
+    $('st').textContent = colorCam.on ? '' : 'No camera colour (' + colorCam.status + '): scanning in grey.';
+  }
   try {
     /* depth sensing in whatever format and mode this headset offers; asked as required first so we know it's really on */
     const base = ['local-floor', 'unbounded', 'plane-detection', 'mesh-detection', 'anchors', 'hand-tracking'];
@@ -1316,14 +1392,14 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; }
     kf.has = false; kf.n = 0;
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
-  } catch (e) { $('st').textContent = 'Could not start: ' + e.message; }
+  } catch (e) { $('st').textContent = colorCam.on && /activation|gesture|user/i.test(e.message) ? 'Camera is ready. Tap Start scanning again.' : 'Could not start: ' + e.message; }
 });
-let pendingOpen = null, askedRoom = true, useMeta = true, scanErr = '';
+let savedConf = -1, pendingOpen = null, askedRoom = true, useMeta = true, scanErr = '';
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
@@ -1350,21 +1426,20 @@ async function listScans() {
 function openViewer(rec) {
   closeViewer(); viewer.on = true; renderer.setClearColor(0x111315, 1);
   const g = new THREE.Group(); viewer.group = g; scene.add(g);
-  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3));
-  const n = rec.points.length / 3, cols = new Float32Array(n * 3);
-  for (let k = 0; k < n; k++) { if (rec.colors && rec.colors[k * 4 + 3]) { cols[k * 3] = rec.colors[k * 4] / 255; cols[k * 3 + 1] = rec.colors[k * 4 + 1] / 255; cols[k * 3 + 2] = rec.colors[k * 4 + 2] / 255; continue; } const h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7)); cols[k * 3] = .62 + .16 * h; cols[k * 3 + 1] = .5 + .34 * h; cols[k * 3 + 2] = .38 + .52 * h; }
-  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3)); geo.computeBoundingBox();
-  g.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: rec.voxelSize * 1.2, vertexColors: true, sizeAttenuation: true })));
+  clearMap(); currentId = null; pmat.uniforms.floorY.value = rec.floorY || 0; mergeRecord(rec, new M4()); flushGeo();
+  showMode = 1; pmat.uniforms.style.value = 1; pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = CONF; pmat.depthWrite = true; tmat.depthWrite = true; pmat.needsUpdate = tmat.needsUpdate = true;
+  pmat.uniforms.scale.value = innerHeight / (2 * Math.tan(camera.fov * Math.PI / 360));
+  const n = rec.points.length / 3, geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3)); geo.computeBoundingBox();
   const ug = new THREE.Group(); g.add(ug); const ures = rec.understanding || analyze(rec.points, rec.masks, rec.planes, rec.meshes); buildUnderstanding(ures, ug);
   ug.traverse(o => { if (o.isSprite) o.scale.multiplyScalar(3.5); if (o.userData.follow !== undefined) o.position.set(viewer.target ? 0 : 0, o.userData.follow + .05, 0); });
   viewer.res = ures;
-  for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .25 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
+  for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .08 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
   for (const p of rec.planes) { if (!p.poly || p.poly.length < 3) continue; const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
   const bb = geo.boundingBox; if (bb && isFinite(bb.min.x)) { bb.getCenter(viewer.target); viewer.dist = Math.max(3, bb.getSize(new V3()).length() * .8); }
-  cloud.visible = false; layout.visible = false;
+  cloud.visible = true; layout.visible = false;
   $('ui').classList.add('hide'); $('vbar').classList.add('on'); $('vInfo').textContent = rec.name + ' · ' + n.toLocaleString() + ' points · ' + understandingLines(viewer.res).join(' · ').replace(/\s+/g, ' ') + ' · drag to orbit, scroll or pinch to zoom';
 }
-function closeViewer() { if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = true; }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 0; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = true; }
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
 const cv = renderer.domElement, ptrs = new Map();
 cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.setPointerCapture(e.pointerId); });
@@ -1400,7 +1475,7 @@ renderer.setAnimationLoop((t, frame) => {
       if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m); mergeRecord(pendingLoad.rec, now.multiply(then.invert())); pendingLoad = null; }
       else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
     }
-    if (depth.meta && depthReady()) {
+    if (depth.meta && (depth.metaReady || (depth.metaReady = depthReady()))) {   // pixels stay ready while the frame waits its turn
       const M = depth.meta;
       if (!M.cpu && !depth.noWorker && depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15) {
         if (depth.wBusy && performance.now() - depth.postT > 1500) depth.wBusy = false;   // worker stalled: drop that frame
@@ -1424,7 +1499,7 @@ renderer.setAnimationLoop((t, frame) => {
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
-    tileSlice(4); tileFlush(); tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
+    tileSlice(12); tileFlush(); flushGeo(); tmat.uniforms.time.value = clockT; tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
   }
