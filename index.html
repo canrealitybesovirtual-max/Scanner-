@@ -57,6 +57,7 @@ input[type=file]{display:none}
   <div class="btns">
     <button id="bAR" class="primary" type="button" disabled>Checking headset…</button>
     <label class="btn" for="fOpen">Open an exported scan file</label>
+    <button id="bDiag" type="button">Diagnostics</button>
   </div>
   <label class="chk"><input id="cColor" type="checkbox" checked> Real colours from the headset camera (asks for camera permission)</label>
   <input id="fOpen" type="file" accept=".json,application/json">
@@ -1589,7 +1590,20 @@ function setReality() {                                    // captured house onl
   pmat.uniforms.alpha.value = reality === 1 ? .55 : 1; pmat.transparent = true; pmat.needsUpdate = true;
   applySurf(); renderer.setClearColor(0x080808, reality === 0 ? 1 : 0);
 }
-function toast(m) { toastMsg = m; toastT = 4; }
+function toast(m) { toastMsg = m; toastT = 4; diagLog('toast', m); }
+/* diagnostics: what the headset actually did, saved every 10 s so it survives a crash; downloadable from the start page */
+const diag = { log: [] };
+function diagLog(kind, msg) { diag.log.push([Math.round(performance.now()), kind, String(msg).slice(0, 160)]); if (diag.log.length > 80) diag.log.shift(); }
+function diagSnapshot() {
+  return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps),
+    session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
+    depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
+      lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, exposure: depth.expGain, noWorker: !!depth.noWorker },
+    camera: { status: colorCam.status, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
+    map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
+    layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
+}
+function diagSave() { try { localStorage.setItem('scanner.diag', JSON.stringify(diagSnapshot())); } catch (e) {} }
 /* where the scan is up to, in plain words (shown on the floating status bar and the wrist) */
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
@@ -1756,7 +1770,7 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
@@ -1804,6 +1818,8 @@ function openViewer(rec) {
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
 function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 0; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
+$('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
+  download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
 const cv = renderer.domElement, ptrs = new Map();
@@ -1861,8 +1877,9 @@ renderer.setAnimationLoop((t, frame) => {
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
+    if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
-    } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); try { glBack(); } catch (_) {} }
+    } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
     tileSlice(12); tileFlush(); flushGeo(); flushFine(); tmat.uniforms.time.value = clockT; tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
