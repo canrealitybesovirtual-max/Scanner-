@@ -1248,8 +1248,22 @@ function refine(frames, oldT, report) {
   }
   { const G = mul4(frames[0].X, inv4r(Xs[0])); Xs = Xs.map(X => mul4(G, X)); }   // keep the first frame where it was: the scan doesn't slide as a whole
   fuse(Xs); report('colouring');
-  for (const [k, b] of TB) { const o = OLD.get(k); if (!o) continue; for (let v = 0; v < B3; v++) if (o.cw[v] > 0) { b.c[v * 3] = o.c[v * 3]; b.c[v * 3 + 1] = o.c[v * 3 + 1]; b.c[v * 3 + 2] = o.c[v * 3 + 2]; b.cw[v] = o.cw[v]; } }
   const corr = frames.map((f, i) => mul4(Xs[i], inv4r(f.X)));
+  /* colour follows the geometry: each new surface voxel looks up its colour where that bit of surface used to be, using the
+     correction of the frames that saw it (a loop closure can move a wall by many cm; copying by voxel index would miss) */
+  if (OLD.size) { const CG = .25, ck = (x, y, z) => ((Math.floor(x / CG) + 4096) * 8192 + (Math.floor(y / CG) + 4096)) * 8192 + (Math.floor(z / CG) + 4096), back = new Map();
+    for (let i = 0; i < frames.length; i += 2) { const f = frames[i], X = Xs[i], ci = inv4r(corr[i]), zf = new Float32Array(f.DW * f.DH); for (let k = 0; k < zf.length; k++) zf[k] = f.mm[k] / 1000;
+      const pts = camPoints(zf, { I: f.INV, ND: f.ND, R0: f.R0, DW: f.DW, DH: f.DH, jx: f.jx, jy: f.jy, flip: f.flip }, 10);
+      for (let q = 0; q < pts.length; q += 3) { const a = pts[q], b2 = pts[q + 1], c = pts[q + 2]; back.set(ck(X[0] * a + X[4] * b2 + X[8] * c + X[12], X[1] * a + X[5] * b2 + X[9] * c + X[13], X[2] * a + X[6] * b2 + X[10] * c + X[14]), ci); } }
+    const E = BS * TV, I4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    for (const b of TB.values()) for (let v = 0; v < B3; v++) { if (!b.w[v] || Math.abs(b.d[v]) > 16000) continue;
+      const x = (b.i * BS + (v & 7) + .5) * TV, y = (b.j * BS + ((v >> 3) & 7) + .5) * TV, z = (b.k * BS + (v >> 6) + .5) * TV, M = back.get(ck(x, y, z)) || I4;
+      const qx = M[0] * x + M[4] * y + M[8] * z + M[12], qy = M[1] * x + M[5] * y + M[9] * z + M[13], qz = M[2] * x + M[6] * y + M[10] * z + M[14];
+      let best = -1, bw = 0, ob = null;
+      for (let n = 0; n < 7; n++) { const gx = Math.floor(qx / TV) + (n === 1 ? 1 : n === 2 ? -1 : 0), gy = Math.floor(qy / TV) + (n === 3 ? 1 : n === 4 ? -1 : 0), gz = Math.floor(qz / TV) + (n === 5 ? 1 : n === 6 ? -1 : 0);   // that voxel, else a coloured neighbour
+        const o = OLD.get(bk3(Math.floor(gx / BS), Math.floor(gy / BS), Math.floor(gz / BS))); if (!o) continue; const u = (gx - o.i * BS) + (gy - o.j * BS) * BS + (gz - o.k * BS) * BS * BS;
+        if (o.cw[u] > bw) { bw = o.cw[u]; best = u; ob = o; } if (n === 0 && bw) break; }
+      if (ob) { b.c[v * 3] = ob.c[best * 3]; b.c[v * 3 + 1] = ob.c[best * 3 + 1]; b.c[v * 3 + 2] = ob.c[best * 3 + 2]; b.cw[v] = ob.cw[best]; } } }
   const mv = moved.filter(x => x > 0).sort((a, b) => a - b);
   return { corr, median: mv.length ? mv[mv.length >> 1] : 0, aligned: mv.length, loops: LC.loops, loopShift: LC.maxShift || 0 };
 }
