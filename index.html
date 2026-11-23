@@ -123,7 +123,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { mapFull = false; if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { mapFull = false; fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -137,11 +137,12 @@ pg.setDrawRange(0, 0);
 /* point styles: 0 = scan dots (small, see-through, your real room stays visible), 1 = solid 2 cm tiles, 2 = photo walk-through */
 const pmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false,
-  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; attribute float tl; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
+  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, nearCut: { value: .35 }, zones: { value: Array.from({ length: 8 }, () => new THREE.Vector4()) }, nz: { value: 0 } },
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; attribute float tl; uniform vec4 zones[8]; uniform int nz; uniform float nearCut; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       float d = -mv.z, fresh = exp(-(time - born) * 1.6);
-      ok = step(style < .5 ? 3.0 : minC, cnt) * step(.35, d) * (photo > .5 ? 1.0 : 1.0 - tl);                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
+      ok = step(style < .5 ? 3.0 : minC, cnt) * step(nearCut, d) * (photo > .5 ? 1.0 : 1.0 - tl);
+      for (int i = 0; i < 8; i++) if (i < nz && distance(position, zones[i].xyz) < zones[i].w) ok = 0.0;   // a detail scan owns this space                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
       float px = size * scale / max(.05, d);
       gl_PointSize = ok * (style < .5 ? clamp(px * .45, 1.4, 5.0) * (1.0 + fresh * .5) : clamp(px * (1.0 + photo * .8), 1.0, 40.0));
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
@@ -159,6 +160,74 @@ const pmat = new THREE.ShaderMaterial({
       gl_FragColor = vec4(vC, alpha * va); }`
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
+
+/* ================= detail scans: a 5 mm map inside small zones (a shoe, a pencil on a desk), fed by full-resolution depth crops ================= */
+const VSF = .005, MAXF = 1500000;
+const fpos = new Float32Array(MAXF * 3), fcnt = new Float32Array(MAXF), fborn = new Float32Array(MAXF), fang = new Float32Array(MAXF), fcol = new Float32Array(MAXF * 3), fcw = new Float32Array(MAXF), fnrm = new Float32Array(MAXF * 3), ftl = new Uint8Array(MAXF);
+const fmap = new Map(); let FN = 0, fconf = 0, fNewLo = 0, fLo = Infinity, fHi = -1;
+const det = { on: false, zones: [], cur: null, box: null };
+function addFine(x, y, z, t, w, nx = 0, ny = 0, nz = 0) {
+  const ix = Math.floor(x / VSF), iy = Math.floor(y / VSF), iz = Math.floor(z / VSF);
+  if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return -1;
+  const k = keyOf(ix, iy, iz); let id = fmap.get(k);
+  if (id === undefined) { if (FN >= MAXF) return -1; id = FN++; fmap.set(k, id); fpos[id * 3] = x; fpos[id * 3 + 1] = y; fpos[id * 3 + 2] = z; fcnt[id] = 0; fcw[id] = 0; fang[id] = 26; fnrm[id * 3] = fnrm[id * 3 + 1] = fnrm[id * 3 + 2] = 0; }
+  else { const a = w / (Math.min(fcnt[id], 30) + w); fpos[id * 3] += (x - fpos[id * 3]) * a; fpos[id * 3 + 1] += (y - fpos[id * 3 + 1]) * a; fpos[id * 3 + 2] += (z - fpos[id * 3 + 2]) * a; }
+  if (nx || ny || nz) { fnrm[id * 3] += nx * w; fnrm[id * 3 + 1] += ny * w; fnrm[id * 3 + 2] += nz * w; }
+  const before = fcnt[id]; fcnt[id] = Math.min(60, before + w);
+  if (before < CONF && fcnt[id] >= CONF) { fconf++; fborn[id] = t; }
+  if (id < fLo) fLo = id; if (id > fHi) fHi = id; return id;
+}
+function tintFine(id, r, g, b, w) { const k = fcw[id] + w, a = w / k; fcol[id * 3] += (r - fcol[id * 3]) * a; fcol[id * 3 + 1] += (g - fcol[id * 3 + 1]) * a; fcol[id * 3 + 2] += (b - fcol[id * 3 + 2]) * a; fcw[id] = Math.min(50, k); }
+function carveFine(x, y, z, dx, dy, dz) {
+  const id = fmap.get(keyOf(Math.floor(x / VSF), Math.floor(y / VSF), Math.floor(z / VSF))); if (id === undefined || fcnt[id] <= 0) return;
+  const nx = fnrm[id * 3], ny = fnrm[id * 3 + 1], nz = fnrm[id * 3 + 2], nl = Math.hypot(nx, ny, nz), facing = nl > 1e-6 ? Math.abs(nx * dx + ny * dy + nz * dz) / nl : 1;
+  const before = fcnt[id]; fcnt[id] = Math.max(0, facing > .6 ? Math.min(before, 12) * .3 - .4 : facing > .35 ? Math.min(before, 12) * .6 - .4 : before - .2);
+  if (before >= CONF && fcnt[id] < CONF) fconf--; if (id < fLo) fLo = id; if (id > fHi) fHi = id;
+}
+const fg = new THREE.BufferGeometry();
+for (const [n, a, k] of [['position', fpos, 3], ['cnt', fcnt, 1], ['born', fborn, 1], ['ang', fang, 1], ['col', fcol, 3], ['cw', fcw, 1], ['nrm', fnrm, 3], ['tl', ftl, 1]]) fg.setAttribute(n, new THREE.BufferAttribute(a, k).setUsage(THREE.DynamicDrawUsage));
+fg.setDrawRange(0, 0);
+const fmat = pmat.clone(); fmat.uniforms.size.value = VSF * 1.25; fmat.uniforms.nearCut.value = .1; fmat.uniforms.nz.value = 0;
+const fcloud = new THREE.Points(fg, fmat); fcloud.frustumCulled = false; scene.add(fcloud);
+function flushFine() {
+  for (const n of ['time', 'scale', 'minC', 'floorY', 'photo', 'alpha', 'style']) fmat.uniforms[n].value = pmat.uniforms[n].value;
+  if (fmat.depthWrite !== pmat.depthWrite) { fmat.depthWrite = pmat.depthWrite; fmat.needsUpdate = true; } fcloud.visible = cloud.visible;
+  if (fHi < 0) return; const lo = Math.min(fLo, fNewLo), hi = Math.max(fHi, FN - 1);
+  for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw', 'nrm']) { const at = fg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); at.addUpdateRange(lo * k, (hi - lo + 1) * k); at.needsUpdate = true; }
+  fg.setDrawRange(0, FN); fNewLo = FN; fLo = Infinity; fHi = -1;
+}
+function fineClear() { fmap.clear(); FN = 0; fconf = 0; fNewLo = 0; fLo = Infinity; fHi = -1; fg.setDrawRange(0, 0); det.zones = []; det.on = false; det.cur = null; zonesSync(); }
+function zonesSync() {                                         // tell the coarse map where detail zones are; draw the active zone's outline
+  const Z = pmat.uniforms.zones.value; det.zones.slice(-8).forEach((z, i) => Z[i].set(z.c.x, z.c.y, z.c.z, z.r)); pmat.uniforms.nz.value = Math.min(8, det.zones.length);
+  if (!det.box) { det.box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x9ae6f2, transparent: true, opacity: .35, depthWrite: false })); det.box.renderOrder = 40; scene.add(det.box); }
+  det.box.visible = !!det.cur; if (det.cur) { det.box.position.copy(det.cur.c); det.box.scale.setScalar(det.cur.r * 2); }
+}
+/* the depth-image region (texture uv) that covers a zone, so the detail read spends every sample on it */
+function zoneROI(zone, proj, xf, cfg, ndRaw) {
+  const iv = new M4().copy(xf).invert(), p = new V3(), q = new THREE.Vector4(); let u0 = 1, u1 = 0, v0 = 1, v1 = 0, ok = 0;
+  const NDf = cfg.nd && ndRaw ? (cfg.nd === 1 ? ndRaw.elements : new M4().copy(ndRaw).invert().elements) : null;   // inverse of what backprojection applies
+  for (let i = 0; i < 8; i++) {
+    p.set(zone.c.x + (i & 1 ? 1 : -1) * zone.r, zone.c.y + (i & 2 ? 1 : -1) * zone.r, zone.c.z + (i & 4 ? 1 : -1) * zone.r).applyMatrix4(iv);
+    if (p.z > -.05) continue; q.set(p.x, p.y, p.z, 1).applyMatrix4(proj); let vu = q.x / q.w * .5 + .5, vv = q.y / q.w * .5 + .5;
+    if (cfg.flip) vv = 1 - vv; let u = vu, v = vv; if (NDf) { u = NDf[0] * vu + NDf[4] * vv + NDf[12]; v = NDf[1] * vu + NDf[5] * vv + NDf[13]; }
+    u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v); ok++;
+  }
+  if (ok < 4) return null;
+  u0 = Math.max(0, u0 - .02); v0 = Math.max(0, v0 - .02); u1 = Math.min(1, u1 + .02); v1 = Math.min(1, v1 + .02);
+  if (u1 - u0 < .05 || v1 - v0 < .05) return null;
+  const cxu = (u0 + u1) / 2, cxv = (v0 + v1) / 2, su = Math.max(.15, u1 - u0), sv = Math.max(.15, v1 - v0);
+  return [Math.max(0, Math.min(1 - su, cxu - su / 2)), Math.max(0, Math.min(1 - sv, cxv - sv / 2)), Math.min(1, su), Math.min(1, sv)];
+}
+function startDetail() {                                       // aim: the first surface along your gaze; the zone wraps the object there
+  if (det.zones.length >= 8) { toast('8 detail zones already: save, then start a new scan'); return; }
+  const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()), f = xc.getWorldDirection(new V3()); let hit = null;
+  for (let t = .2; t < 2.5 && !hit; t += .01) { const x = o.x + f.x * t, y = o.y + f.y * t, z = o.z + f.z * t, id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS))); if (id !== undefined && cnt[id] >= CONF) hit = new V3(x, y, z); }
+  const c = hit ? hit.addScaledVector(f, .06) : o.clone().addScaledVector(f, .5);
+  det.cur = { c, r: .24 }; det.zones.push(det.cur); det.on = true; zonesSync();
+  integWorker().postMessage({ resetFine: true });
+  toast(hit ? 'Detail scan: circle it slowly, 30–60 cm away, look inside too' : 'Nothing seen there yet: zone placed 50 cm ahead');
+}
+function endDetail() { det.on = false; det.cur = null; zonesSync(); toast('Detail kept: ' + fconf.toLocaleString() + ' fine points'); }
 function flushGeo() {
   /* new points: one contiguous block of positions; changed points: sorted, merged into a few short ranges */
   const pa = pg.attributes.position; pa.clearUpdateRanges();
@@ -185,8 +254,8 @@ for (let i = 0; i < 7; i++) tileGeo.setAttribute('iT' + i, new THREE.InstancedBu
 tileGeo.setAttribute('iBorn', new THREE.InstancedBufferAttribute(tileBorn, 1).setUsage(THREE.DynamicDrawUsage));
 const tmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, side: THREE.DoubleSide,
-  uniforms: { time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
-  vertexShader: `attribute uvec4 iT0, iT1, iT2, iT3, iT4, iT5, iT6; attribute float iBorn; uniform float time, floorY, photo, style;
+  uniforms: { time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, zones: pmat.uniforms.zones, nz: pmat.uniforms.nz },
+  vertexShader: `uniform vec4 zones[8]; uniform int nz; attribute uvec4 iT0, iT1, iT2, iT3, iT4, iT5, iT6; attribute float iBorn; uniform float time, floorY, photo, style;
     flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
     void main(){ vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * viewMatrix * wp;
       t0 = iT0; t1 = iT1; t2 = iT2; t3 = iT3; t4 = iT4; t5 = iT5; t6 = iT6;
@@ -194,7 +263,8 @@ const tmat = new THREE.ShaderMaterial({
       float h = clamp((wp.y - floorY) / 2.7, 0.0, 1.0); vFr = exp(-max(0.0, time - iBorn) * 1.4);
       vB = style < .5 && photo < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
       vSh = .62 + .38 * abs(dot(n, normalize(vec3(.35, .9, .45))));
-      bool col = iT6.w > 0u; va = photo > .5 || style > .5 ? 1.0 : col ? .62 : .16; }`,
+      bool col = iT6.w > 0u; va = photo > .5 || style > .5 ? 1.0 : col ? .62 : .16;
+      vec3 tc = (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz; for (int i = 0; i < 8; i++) if (i < nz && distance(tc, zones[i].xyz) < zones[i].w - .09) gl_Position = vec4(0.0); }`,   // only tiles wholly inside a zone
   fragmentShader: `uniform float alpha, photo, style; flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
     uint W[28];
     vec3 tex(int i, int j) { int k = (clamp(j, 0, 5) * 6 + clamp(i, 0, 5)) * 3; vec3 c;
@@ -362,10 +432,10 @@ function depthProgram(gl, isArr, isInt) {
     in vec2 p; out vec2 uv; void main(){ uv = p * .5 + .5; gl_Position = vec4(p, 0., 1.); }`;
   const fs = `#version 300 es
     precision highp float; precision highp int; precision highp ${samp};
-    uniform ${samp} t; uniform int layer, fmt; uniform vec2 jit; in vec2 uv; out vec4 o;
+    uniform ${samp} t; uniform int layer, fmt; uniform vec2 jit; uniform vec4 roi; in vec2 uv; out vec4 o;
     vec3 pack24(float v){ v = clamp(v, 0., 1.) * 16777215.; float r = floor(v / 65536.), g = floor((v - r * 65536.) / 256.), b = v - r * 65536. - g * 256.; return vec3(r, g, b) / 255.; }
     void main(){
-      ivec2 sz = textureSize(t, 0).xy; ivec2 c = ivec2(clamp(uv + jit, 0., .9999) * vec2(sz));
+      ivec2 sz = textureSize(t, 0).xy; ivec2 c = ivec2(clamp(roi.xy + roi.zw * (uv + jit), 0., .9999) * vec2(sz));
       ${isInt ? 'float raw = float(' + fetch + '.r) / 65535.; o = vec4(pack24(raw), 0.); return;' : `vec4 s = ${fetch};
       if (fmt == 1) { o = vec4(s.r, s.a, 0., 128. / 255.); return; }
       float raw = s.r;
@@ -373,7 +443,7 @@ function depthProgram(gl, isArr, isInt) {
     }`;
   const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr);
   if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
-  const P = { pr, t: gl.getUniformLocation(pr, 't'), layer: gl.getUniformLocation(pr, 'layer'), fmt: gl.getUniformLocation(pr, 'fmt'), jit: gl.getUniformLocation(pr, 'jit'), loc: gl.getAttribLocation(pr, 'p') };
+  const P = { pr, t: gl.getUniformLocation(pr, 't'), layer: gl.getUniformLocation(pr, 'layer'), fmt: gl.getUniformLocation(pr, 'fmt'), jit: gl.getUniformLocation(pr, 'jit'), roi: gl.getUniformLocation(pr, 'roi'), loc: gl.getAttribLocation(pr, 'p') };
   return DR.progs[key] = P;
 }
 function depthReaderInit(gl) {
@@ -393,7 +463,7 @@ function depthReady() {                                    // true once the back
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, depthBuf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   glBack(); return true;
 }
-function readDepth(info, isArr, layer, lumA, jx, jy, fmtName) {
+function readDepth(info, isArr, layer, lumA, jx, jy, fmtName, roi = [0, 0, 1, 1]) {
   const gl = renderer.getContext();
   if (!DR.gl) depthReaderInit(gl);
   /* 16-bit depth may arrive as an integer texture (needs an integer sampler) or a normalised one: try float, fall back on a GL error */
@@ -406,7 +476,7 @@ function readDepth(info, isArr, layer, lumA, jx, jy, fmtName) {
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.disable(gl.SCISSOR_TEST); gl.colorMask(true, true, true, true);
     gl.useProgram(P.pr);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(isArr ? gl.TEXTURE_2D_ARRAY : gl.TEXTURE_2D, info.texture);
-    gl.uniform1i(P.t, 0); gl.uniform1i(P.layer, layer); gl.uniform1i(P.fmt, lumA ? 1 : 0); gl.uniform2f(P.jit, jx, jy);
+    gl.uniform1i(P.t, 0); gl.uniform1i(P.layer, layer); gl.uniform1i(P.fmt, lumA ? 1 : 0); gl.uniform2f(P.jit, jx, jy); gl.uniform4f(P.roi, roi[0], roi[1], roi[2], roi[3]);
     gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, DR.vbo); gl.enableVertexAttribArray(P.loc); gl.vertexAttribPointer(P.loc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     const err = gl.getError();
@@ -450,7 +520,7 @@ function maybeKeyframe(vp, tNow) {
   kf.spin = (kf.spin || 0) * .8 + raw * .2;
   if (kf.spin > 1.2) return;                                                       // turning faster than ~70°/s: the frame would be blurred                                                           // turning faster than ~30°/s: the frame would be blurred
   if (kf.has && tNow - kf.t < .35) return;
-  if (kf.has && p.distanceTo(kf.pos) < .22 && q.angleTo(kf.q) < .21) return;      // nothing new in view since the last keyframe
+  if (kf.has && p.distanceTo(kf.pos) < (det.on ? .06 : .22) && q.angleTo(kf.q) < (det.on ? .12 : .21)) return;      // nothing new in view since the last keyframe
   if (tNow - (kf.tryT || 0) < .25) return; kf.tryT = tNow;
   if (!currentId) currentId = 'scan-' + Date.now();
   const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
@@ -504,9 +574,15 @@ function sampleDepth(frame, ref, session, tNow) {
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
+  let roi = null;
+  if (det.on && det.cur && workerPathReady() && (depth.detFlip = ((depth.detFlip || 0) + 1) % 3) !== 0) {   // 2 of 3 frames go to the detail zone
+    const src = depth.cfg.src === 'info' && info.projectionMatrix ? 'info' : 'view';
+    roi = zoneROI(det.cur, new M4().fromArray(src === 'info' ? info.projectionMatrix : view.projectionMatrix), new M4().fromArray((src === 'info' && info.transform ? info.transform : view.transform).matrix), depth.cfg,
+      info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix) : null);
+  }
   const calib = depth.cal && !depth.cal.locked, swap = calib ? ((depth.calFrame = (depth.calFrame || 0) + 1) % 2 === 1) : !!(depth.cfg && depth.cfg.swap);
   let layer = info.imageIndex ?? depth.vi; if (swap && isArr) layer = 1 - layer;
-  try { readDepth(info, isArr, layer, lumA, jx, jy, session.depthDataFormat); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
+  try { readDepth(info, isArr, layer, lumA, jx, jy, session.depthDataFormat, roi || undefined); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
   depth.sensor = (isArr ? 'array' : '2d') + ' ' + (info.width || '?') + '×' + (info.height || '?') + ' near ' + (+(info.depthNear ?? session.renderState.depthNear)).toFixed(2) + ' far ' + (+(info.depthFar ?? session.renderState.depthFar)).toFixed(1);
   depth.metaReady = false;
@@ -521,7 +597,8 @@ function sampleDepth(frame, ref, session, tNow) {
     ndRaw: info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix) : null,
     near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
     head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), hands: handsNow(), cam: camFrame(vp, workerPathReady()), vinv: new M4().fromArray(vp.transform.inverse.matrix),
-    moving: !!depth.movingNow, H: poseHist.slice(-LAGS).reverse()               // head poses now, 1, 2 … frames ago
+    moving: !!depth.movingNow, H: poseHist.slice(-LAGS).reverse(),              // head poses now, 1, 2 … frames ago
+    fine: !!roi, roi, zone: roi ? [det.cur.c.x, det.cur.c.y, det.cur.c.z, det.cur.r] : null
   };
 }
 const LAGS = 6, poseHist = [];
@@ -701,7 +778,7 @@ function integrateDepth() {
 
 /* ================= the integration worker: all per-pixel maths off the main thread ================= */
 const INTEG_SRC = `
-let zs = null, FR = 0, MS = new Set();
+let zs = null, FR = 0, MS = new Set(); const FK = new Set();      // FK: every 5 mm detail voxel
 const ME = new Map(), MA = new Map();          // per layout cell: [frames seen through, frames seen as surface]; per new cell: frames seen as surface
 /* every voxel the map holds, mirrored here as an open-addressing hash so rays can be tested against it without the main thread */
 const HB = 1 << 22, HK = new Float64Array(HB); let hN = 0;
@@ -738,9 +815,12 @@ let OC = null, OCX = null;
 onmessage = e => {
   const d = e.data;
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
-  if (d.resetKnown) { HK.fill(0); hN = 0; return; }
+  if (d.resetKnown) { HK.fill(0); hN = 0; FK.clear(); return; }
+  if (d.resetFine) return;
+  if (d.knownFine) { for (const k of d.knownFine) FK.add(k); return; }
   if (d.metaSet) { MS = new Set(d.metaSet); ME.clear(); MA.clear(); return; }
-  if (d.known) { for (const k of d.known) hAdd(k); return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
+  if (d.known) { for (const k of d.known) hAdd(k); return; }
+  const DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH, F = !!d.fine, R0 = d.roi || [0, 0, 1, 1], ZC = d.zone, zmin = F ? .1 : .2, zmax = F ? 1.5 : 4.5;
   if (!zs || zs.length !== n) zs = new Float32Array(n);
   let noOC = false;
   if (d.cam && d.cam.bmp) {                                              // camera pixels decoded here, off the main thread
@@ -757,17 +837,18 @@ onmessage = e => {
     if (mode === 'mm') z = rw * r2m; else if (mode === 'metres') z = rw * rvm; else if (mode === 'u16') z = rw * 65535 * r2m;
     else if (mode === 'reversed') z = rw <= 0 ? 0 : fin ? near * far / (near + rw * (far - near)) : near / rw;
     else z = rw <= 0 || rw >= 1 ? 0 : fin ? 2 * near * far / (far + near - (rw * 2 - 1) * (far - near)) : near / (1 - rw);
-    zs[k] = z; if (z > .2 && z < 4.5) valid++;
+    zs[k] = z; if (z > zmin && z < zmax) valid++;
   }
-  const I = d.inv, X = d.xf, ND = d.nd, flip = d.flip, fpx = 2 / (d.P0 * DW), fpy = 2 / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
-  const VS = d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
+  const I = d.inv, X = d.xf, ND = d.nd, flip = d.flip, fpx = 2 * R0[2] / (d.P0 * DW), fpy = 2 * R0[3] / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
+  const VS = F ? d.VSF : d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
   const vox = new Map(), car = new Map(), out = new Float32Array(n * 11), rays = new Float32Array(n); let np = 0, nr = 0; FR++; const fo = FR % 2, go = ((FR / 2) | 0) % 2;
-  const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < .42 && y < H[1] + .25 && y > H[1] - 1.95) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < .0256) return true; } return false; };
+  const TR = F ? .25 : .42, TT = F ? -.3 : .25, HR = F ? .01 : .0256;   // close-up work: a slimmer body/hand exclusion so near objects survive
+  const inBody = (x, y, z) => { if (Math.hypot(x - H[0], z - H[2]) < TR && y < H[1] + TT && y > H[1] - 1.95) return true; for (const h of hands) { const a = x - h[0], b = y - h[1], c = z - h[2]; if (a * a + b * b + c * c < HR) return true; } return false; };
   for (let y = 1; y < DH - 1; y++) for (let x = 1; x < DW - 1; x++) {
-    const k = y * DW + x, z = zs[k]; if (!(z > .2 && z < 4.5)) continue;
+    const k = y * DW + x, z = zs[k]; if (!(z > zmin && z < zmax)) continue;
     const tol = .035 * z;
     if (Math.abs(zs[k - 1] - z) > tol || Math.abs(zs[k + 1] - z) > tol || Math.abs(zs[k - DW] - z) > tol || Math.abs(zs[k + DW] - z) > tol) continue;
-    const u = (x + .5) / DW + d.jx, v = (y + .5) / DH + d.jy; let vu = u, vv = v;
+    const u = R0[0] + R0[2] * ((x + .5) / DW + d.jx), v = R0[1] + R0[3] * ((y + .5) / DH + d.jy); let vu = u, vv = v;
     if (ND) { vu = ND[0] * u + ND[4] * v + ND[12]; vv = ND[1] * u + ND[5] * v + ND[13]; }
     if (flip) vv = 1 - vv;
     const cx = vu * 2 - 1, cy = vv * 2 - 1, qw = I[3] * cx + I[7] * cy - I[11] + I[15];
@@ -778,6 +859,7 @@ onmessage = e => {
     const q = Math.max(0, 1 - z / 4.6) * cosA, w = Math.max(.25, q * q * 3);
     const wx = X[0] * px + X[4] * py + X[8] * pz + X[12], wy = X[1] * px + X[5] * py + X[9] * pz + X[13], wz = X[2] * px + X[6] * py + X[10] * pz + X[14];
     if (inBody(wx, wy, wz)) continue;
+    if (F) { const a = wx - ZC[0], b = wy - ZC[1], c = wz - ZC[2]; if (a * a + b * b + c * c > ZC[3] * ZC[3]) continue; }
     const nl = Math.sqrt(gx * gx + gy * gy + 1), a = gx / nl, b = gy / nl, c = 1 / nl;
     const nx = X[0] * a + X[4] * b + X[8] * c, ny = X[1] * a + X[5] * b + X[9] * c, nz = X[2] * a + X[6] * b + X[10] * c;
     let R = -1, G = 0, Bl = 0, cq = 0;
@@ -794,15 +876,17 @@ onmessage = e => {
     if ((x + fo) % 2 === 0 && (y + go) % 2 === 0 && nr * 4 + 4 <= n) { rays[nr * 4] = wx; rays[nr * 4 + 1] = wy; rays[nr * 4 + 2] = wz; rays[nr * 4 + 3] = z; nr++; }   // a quarter of pixels per frame, rotating
   }
   /* free space: walk each ray from the eye to just short of the surface it hit; any stored point it passes through is no longer there */
-  const OX = X[12], OY = X[13], OZ = X[14], MG = d.MG, edit = d.metaEdit && MS.size > 0, mk = (x, y, z) => ((Math.floor(x / MG) + 8192) * 16384 + (Math.floor(y / MG) + 8192)) * 16384 + (Math.floor(z / MG) + 8192);
+  const OX = X[12], OY = X[13], OZ = X[14], MG = d.MG, edit = !F && d.metaEdit && MS.size > 0, mk = (x, y, z) => ((Math.floor(x / MG) + 8192) * 16384 + (Math.floor(y / MG) + 8192)) * 16384 + (Math.floor(z / MG) + 8192);
   const mSurf = new Set(), mMiss = new Set();
   if (edit) for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; mSurf.add(mk(out[o] / w, out[o + 1] / w, out[o + 2] / w)); }
   for (let r = 0; r < nr; r++) {
     const ex = rays[r * 4], ey = rays[r * 4 + 1], ez = rays[r * 4 + 2], z = rays[r * 4 + 3], Dx = ex - OX, Dy = ey - OY, Dz = ez - OZ, L = Math.sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
-    const s1 = 1 - Math.max(.06, .035 * z) / L, s1m = 1 - Math.max(.12, .05 * z) / L, ds = .9 * VS / L; let last = -1, lastM = -1;
-    for (let t = .2 / L; t < s1; t += ds) {
+    const s1 = 1 - (F ? Math.max(.012, .02 * z) : Math.max(.06, .035 * z)) / L, s1m = 1 - Math.max(.12, .05 * z) / L, ds = .9 * VS / L; let last = -1, lastM = -1, t0 = .2 / L;
+    if (F) { const fx = OX - ZC[0], fy = OY - ZC[1], fz = OZ - ZC[2], bq = (fx * Dx + fy * Dy + fz * Dz) / (L * L), cq = (fx * fx + fy * fy + fz * fz - ZC[3] * ZC[3]) / (L * L), disc = bq * bq - cq;   // only the part of the ray inside the zone
+      if (disc <= 0) continue; t0 = Math.max(t0, -bq - Math.sqrt(disc)); }
+    for (let t = t0; t < s1; t += ds) {
       const qx = OX + Dx * t, qy = OY + Dy * t, qz = OZ + Dz * t, k = key(qx, qy, qz); if (k === last) continue; last = k;
-      if (hHas(k) && !vox.has(k) && !car.has(k)) car.set(k, [qx, qy, qz, Dx / L, Dy / L, Dz / L]);
+      if ((F ? FK.has(k) : hHas(k)) && !vox.has(k) && !car.has(k)) car.set(k, [qx, qy, qz, Dx / L, Dy / L, Dz / L]);
       if (edit && t < s1m) { const m = mk(qx, qy, qz); if (m !== lastM) { lastM = m; if (MS.has(m) && !mSurf.has(m)) mMiss.add(m); } }
     }
   }
@@ -814,14 +898,14 @@ onmessage = e => {
     for (const m of mSurf) { if (MS.has(m)) { const e = ME.get(m); if (e) e[1]++; continue; } const c = (MA.get(m) || 0) + 1; if (c >= 4) { add.push(m); MS.add(m); MA.delete(m); } else MA.set(m, c); }
     if (MA.size > 400000) MA.clear();                                   // bounded memory on very long scans
   }
-  for (const k of vox.keys()) hAdd(k);
+  if (F) for (const k of vox.keys()) FK.add(k); else for (const k of vox.keys()) hAdd(k);
   for (let i = 0; i < np; i++) { const o = i * 11, w = out[o + 3]; out[o] /= w; out[o + 1] /= w; out[o + 2] /= w; out[o + 3] = Math.min(1.6, w);   // one frame alone can't confirm a voxel: noise needs a second look
     if (out[o + 10] > 0) { out[o + 7] /= out[o + 10]; out[o + 8] /= out[o + 10]; out[o + 9] /= out[o + 10]; } }
   const C = new Float32Array(car.size * 6); let nc = 0; for (const e of car.values()) { C.set(e, nc * 6); nc++; }
   let align = null;
-  if (cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
+  if (!F && cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer]);
+  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer]);
 };`;
 let integ = null; const applyQ = [];
 function camAligned(a) {                                                       // the worker found how the camera image lines up with the depth
@@ -850,7 +934,8 @@ function postIntegration(M) {                                       // hand a de
   const msg = { DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow,
-    moving: M.moving, lagUsed: L, lagB: M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(lagRel(M, k, L).elements)) : null };
+    fine: !!M.fine, VSF, roi: M.roi || null, zone: M.zone || null,
+    moving: M.moving, lagUsed: L, lagB: !M.fine && M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(lagRel(M, k, L).elements)) : null };
   depth.wBusy = true; depth.postT = performance.now();
   integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.bmp || cam.data.buffer] : []));
 }
@@ -858,15 +943,15 @@ const _camW = new V3();
 function applyIntegration(budget) {                                // spread each depth frame over several display frames: never a dropped frame
   const t0 = performance.now(), end = t0 + budget;
   while (applyQ.length) {
-    const d = applyQ[0], P = d.P, C = d.C, chk = metaSurf.n > 3000 && !depth.metaStale, gen = depth.gen || 0, ts = performance.now();
+    const d = applyQ[0], P = d.P, C = d.C, F = d.fine, chk = !F && metaSurf.n > 3000 && !depth.metaStale, gen = depth.gen || 0, ts = performance.now();
     _camW.set(d.cam[0], d.cam[1], d.cam[2]);
     while (d.i < d.np) {
-      const o = d.i * 11, id = addSighting(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], _camW, 0, P[o + 4], P[o + 5], P[o + 6]);
-      if (id >= 0 && P[o + 7] >= 0) tint(id, P[o + 7], P[o + 8], P[o + 9], P[o + 10]);
+      const o = d.i * 11, id = F ? addFine(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], P[o + 4], P[o + 5], P[o + 6]) : addSighting(P[o], P[o + 1], P[o + 2], d.t, P[o + 3], _camW, 0, P[o + 4], P[o + 5], P[o + 6]);
+      if (id >= 0 && P[o + 7] >= 0) (F ? tintFine : tint)(id, P[o + 7], P[o + 8], P[o + 9], P[o + 10]);
       if (chk && d.i % 7 === 0) { d.tot++; if (metaHas(P[o], P[o + 1], P[o + 2])) d.hit++; }
       if ((++d.i & 255) === 0 && performance.now() > end) break;
     }
-    while (d.i >= d.np && d.j < d.nc) { const o = d.j * 6; carveSeen(C[o], C[o + 1], C[o + 2], C[o + 3], C[o + 4], C[o + 5]); if ((++d.j & 511) === 0 && performance.now() > end) break; }
+    while (d.i >= d.np && d.j < d.nc) { const o = d.j * 6; (F ? carveFine : carveSeen)(C[o], C[o + 1], C[o + 2], C[o + 3], C[o + 4], C[o + 5]); if ((++d.j & 511) === 0 && performance.now() > end) break; }
     d.ms += performance.now() - ts;
     if (d.i < d.np || d.j < d.nc) return;                             // out of time: carry on next frame
     applyQ.shift();
@@ -875,6 +960,7 @@ function applyIntegration(budget) {                                // spread eac
       if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; }
     }
     depth.ms = depth.ms ? depth.ms * .8 + d.ms * .2 : d.ms;
+    if (F) { depth.fineStatus = d.np + ' fine vox'; if (performance.now() > end) return; continue; }
     depth.status = 'LIVE · ' + d.np + ' vox · ' + d.valid + ' px · ' + depth.ms.toFixed(1) + ' ms · worker ' + (depth.lat || 0).toFixed(0) + ' ms' + (DR.isInt ? ' · int' : '');
     if (performance.now() > end) return;
   }
@@ -924,6 +1010,22 @@ const DB = (() => {
   };
 })();
 let originAnchor = null, anchorUUID = null, currentId = null, xrSession = null, refSpace = null, replayMode = false, reality = 0;
+function fineOut() {                                            // 5 mm detail points + zones, saved beside the 2 cm map
+  const keep = []; for (let i = 0; i < FN; i++) if (fcnt[i] >= CONF) keep.push(i);
+  const P = new Float32Array(keep.length * 3), C = new Uint8Array(keep.length * 4), Nr = new Int8Array(keep.length * 3), Cn = new Uint16Array(keep.length);
+  keep.forEach((id, k) => { P.set(fpos.subarray(id * 3, id * 3 + 3), k * 3); Cn[k] = Math.round(fcnt[id]);
+    if (fcw[id] > .01) { C[k * 4] = fcol[id * 3] * 255; C[k * 4 + 1] = fcol[id * 3 + 1] * 255; C[k * 4 + 2] = fcol[id * 3 + 2] * 255; C[k * 4 + 3] = 255; }
+    const nx = fnrm[id * 3], ny = fnrm[id * 3 + 1], nz = fnrm[id * 3 + 2], l = Math.hypot(nx, ny, nz); if (l > 1e-6) { Nr[k * 3] = nx / l * 127; Nr[k * 3 + 1] = ny / l * 127; Nr[k * 3 + 2] = nz / l * 127; } });
+  return { fineVoxel: VSF, fpoints: P, fcolors: C, fnormals: Nr, fcounts: Cn, zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]) };
+}
+function fineIn(rec, T) {
+  if (!rec.fpoints) return; const P = rec.fpoints, v = new V3(), t = clockT;
+  for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.fnormals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null;
+    const id = addFine(v.x, v.y, v.z, t - 10, rec.fcounts ? rec.fcounts[k] : CONF, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0);
+    if (id >= 0 && rec.fcolors && rec.fcolors[k * 4 + 3]) tintFine(id, rec.fcolors[k * 4] / 255, rec.fcolors[k * 4 + 1] / 255, rec.fcolors[k * 4 + 2] / 255, 1); }
+  for (const z of rec.zones || []) det.zones.push({ c: new V3(z[0], z[1], z[2]).applyMatrix4(T), r: z[3] });
+  zonesSync(); flushFine();
+}
 function snapshot() {
   const keep = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF) keep.push(i);
   const P = new Float32Array(keep.length * 3), Cn = new Uint16Array(keep.length), Mk = new Uint32Array(keep.length), Cl = new Uint8Array(keep.length * 4), Nr = new Int8Array(keep.length * 3);
@@ -933,7 +1035,7 @@ function snapshot() {
     voxelSize: VS, points: P, counts: Cn, masks: Mk, colors: Cl, normals: Nr, understanding,
     planes: [...planes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), poly: e.poly })),
     meshes: [...meshes.values()].map(e => ({ label: e.label, m: Array.from(e.m.elements), v: e.v, i: e.i })),
-    floorY: pmat.uniforms.floorY.value, layoutEdits: layoutEditsOut()
+    floorY: pmat.uniforms.floorY.value, layoutEdits: layoutEditsOut(), ...fineOut()
   };
 }
 async function saveScan(frame) {
@@ -963,7 +1065,8 @@ async function loadIntoSession(rec) {
 function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
-  flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
+  fineIn(rec, T);
+  flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); integWorker().postMessage({ knownFine: Float64Array.from(fmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
   toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
 }
 
@@ -1024,11 +1127,20 @@ function exportJSON(rec) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
-    layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null };
+    layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null,
+    fineVoxel: rec.fineVoxel || null, zones: rec.zones || null, fpoints: rec.fpoints ? b64(rec.fpoints) : null, fcolors: rec.fcolors ? b64(rec.fcolors) : null, fnormals: rec.fnormals ? b64(rec.fnormals) : null, fcounts: rec.fcounts ? b64(rec.fcounts) : null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
 function exportPLY(rec) { download((rec.name || 'scan').replace(/\W+/g, '-') + '.ply', plyBlob(rec)); }
 function plyBlob(rec) {
+  if (rec.fpoints && rec.fpoints.length) {                        // detail points ride along (outside their zones the 2 cm map stays)
+    const Z = rec.zones || [], inZ = (x, y, z) => Z.some(q => (x - q[0]) ** 2 + (y - q[1]) ** 2 + (z - q[2]) ** 2 < q[3] * q[3]);
+    const keep = []; for (let k = 0; k < rec.points.length / 3; k++) if (!inZ(rec.points[k * 3], rec.points[k * 3 + 1], rec.points[k * 3 + 2])) keep.push(k);
+    const n0 = keep.length, n1 = rec.fpoints.length / 3, P = new Float32Array((n0 + n1) * 3), C = new Uint8Array((n0 + n1) * 4);
+    keep.forEach((k, i) => { P.set(rec.points.subarray(k * 3, k * 3 + 3), i * 3); if (rec.colors) C.set(rec.colors.subarray(k * 4, k * 4 + 4), i * 4); });
+    P.set(rec.fpoints, n0 * 3); if (rec.fcolors) C.set(rec.fcolors, n0 * 4);
+    rec = Object.assign({}, rec, { points: P, colors: C, fpoints: null });
+  }
   const n = rec.points.length / 3, head = 'ply\nformat binary_little_endian 1.0\ncomment house-scanner voxel ' + rec.voxelSize + ' m\nelement vertex ' + n + '\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
   const body = new DataView(new ArrayBuffer(n * 15));
   for (let k = 0; k < n; k++) {
@@ -1063,7 +1175,8 @@ function exportGLB(rec) {
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
 }
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, fineVoxel: o.fineVoxel || null, zones: o.zones || null, fpoints: o.fpoints ? unb64(o.fpoints, Float32Array) : null, fcolors: o.fcolors ? unb64(o.fcolors, Uint8Array) : null, fnormals: o.fnormals ? unb64(o.fnormals, Int8Array) : null, fcounts: o.fcounts ? unb64(o.fcounts, Uint16Array) : null,
+    layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
 }
 
@@ -1308,6 +1421,7 @@ const BTN = () => page === 0 ? [
   { id: 'save', label: 'Save', big: true },
   { id: 'finish', label: 'Finish & save', on: true, big: true },
   ...(replayMode ? [{ id: 'reality', label: ['Captured', 'Blend', 'Real room'][reality], big: true }] : []),
+  ...(replayMode ? [] : [{ id: 'detail', label: det.on ? 'Finish detail' : 'Detail scan (object)', on: det.on, big: true }]),
   { id: 'more', label: 'More  ›', big: true }
 ] : [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
@@ -1328,6 +1442,7 @@ function toast(m) { toastMsg = m; toastT = 4; }
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
+  if (det.on && !replayMode) return { title: 'Detail scan', sub: (depth.tooFast ? 'Slow down · ' : '') + fconf.toLocaleString() + ' fine points · circle it 30–60 cm away', p: null };
   if (mapFull) return { title: 'Map full', sub: 'Finish & save, then start a new scan for the next area', p: 1 };
   if (!scanning) return { title: 'Paused', sub: 'Press Resume on your wrist', p: coverage() };
   if (!depth.binding && !depth.cpu) return { title: 'No depth sensor', sub: 'Using the Meta room layout only', p: null };
@@ -1383,7 +1498,7 @@ function drawPanel() {
     const st = [confirmed.toLocaleString() + ' points', kf.n + ' photos', lastSave ? 'saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : 'not saved yet'];
     g.fillText(st.join('  ·  '), 32, 168);
     if (scanErr) { g.fillStyle = '#ff8a7a'; g.fillText(('Problem: ' + scanErr).slice(0, 46), 32, 198); }
-    bs.forEach((b, i) => { const x = 32, y = 230 + i * 104, w = W - 64, h = 88; panel.buttons.push({ ...b, x, y, w, h });
+    bs.forEach((b, i) => { const x = 32, y = 220 + i * 98, w = W - 64, h = 84; panel.buttons.push({ ...b, x, y, w, h });
       rr(g, x, y, w, h, 22); g.fillStyle = panel.hover === i ? '#2e7d8b' : b.on ? '#1f525c' : '#262b30'; g.fill();
       g.font = '600 32px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 32, y + 56); });
   } else {
@@ -1409,6 +1524,7 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'detail') { if (det.on) endDetail(); else if (!workerPathReady()) toast('Wait until scanning has started'); else startDetail(); }
   if (id === 'back') page = 0;
   if (id === 'color') await toggleColor();
   if (id === 'reality') { reality = (reality + 1) % 3; setReality(); }
@@ -1487,7 +1603,7 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { hud.mesh.visible = false; if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
@@ -1576,7 +1692,7 @@ renderer.setAnimationLoop((t, frame) => {
         if (!depth.wBusy && applyQ.length < 2) { depth.meta = null; postIntegration(M); }   // otherwise this frame waits, already captured
       } else integrateDepth();
     }
-    applyIntegration(fps < 65 ? 1.5 : 3);
+    applyIntegration(fps < 65 ? 1.5 : 3); flushFine();
     tileSlice(fps < 65 ? .8 : 1.6); tileFlush();
     tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
     if (scanning && N) cleanSlice(4000);
@@ -1591,7 +1707,7 @@ renderer.setAnimationLoop((t, frame) => {
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
-    tileSlice(12); tileFlush(); flushGeo(); tmat.uniforms.time.value = clockT; tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
+    tileSlice(12); tileFlush(); flushGeo(); flushFine(); tmat.uniforms.time.value = clockT; tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
   }
