@@ -1406,7 +1406,7 @@ function mergeRecord(rec, T, reload) {
   if (rec.tsdf && !viewer.on) integWorker().postMessage({ tsdfLoad: rec.tsdf, T: Array.from(T.elements) });
   flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); integWorker().postMessage({ knownFine: Float64Array.from(fmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
   if (!reload) toast(replayMode ? 'Loaded ' + (P.length / 3).toLocaleString() + ' points' : 'Continuing "' + (rec.name || 'scan') + '": scan anywhere to add detail');
-  if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(async parts => { if (!replayMode || !parts.length) return; if (rec.tex) await showTexMesh(rec.tex, Tm, parts.filter(p => p.fine)); else showMesh(parts, Tm); toast(rec.tex ? 'Photo surfaces ready' : 'Surfaces ready'); }).catch(e => toast('Surface build failed: ' + e.message)); }
+  if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(async parts => { if (!replayMode || !parts.length) return; if (rec.tex) await showTexMesh(rec.tex, Tm, parts.filter(p => p.fine)); else showMesh(parts, Tm); await ibrStart(rec, Tm); toast(ibr.on ? 'Live photo view ready: walk around' : rec.tex ? 'Photo surfaces ready' : 'Surfaces ready'); }).catch(e => toast('Surface build failed: ' + e.message)); }
 }
 
 /* ================= exporting files: .json (everything) and .ply (points, opens in Blender / MeshLab / CloudCompare) ================= */
@@ -1651,7 +1651,7 @@ function showMesh(parts, T) {
     const o = new THREE.Mesh(g, meshMat); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; meshG.add(o); }
   applySurf();
 }
-function meshClear() { for (const o of meshG.children) { o.geometry.dispose(); if (o.userData.tex) { o.material.map.dispose(); o.material.dispose(); } } meshG.clear(); }
+function meshClear() { ibrStop(); for (const o of meshG.children) { o.geometry.dispose(); if (o.userData.tex) { o.material.map.dispose(); o.material.dispose(); } } meshG.clear(); }
 function applySurf() {                                          // saved surface mesh, else the live mesh (in mesh mode), else the point map
   const m = surfOn && meshG.children.length > 0, live = !m && showMode === 3 && liveM.size > 0;
   meshG.visible = m && reality !== 2; meshMat.opacity = reality === 1 ? .55 : 1; meshMat.depthWrite = reality !== 1;
@@ -1694,7 +1694,7 @@ onmessage = async e => {
   const reg = new Map(); for (let q = 0; q < Q; q++) { const k = Math.floor(QC[q * 3] / .64) + ',' + Math.floor(QC[q * 3 + 1] / .64) + ',' + Math.floor(QC[q * 3 + 2] / .64); let g = reg.get(k); if (!g) reg.set(k, g = []); g.push(q); }
   const regs = [...reg.values()].map(g => { let x = 0, y = 0, z = 0; for (const q of g) { x += QC[q * 3]; y += QC[q * 3 + 1]; z += QC[q * 3 + 2]; } return { g, c: [x / g.length, y / g.length, z / g.length] }; });
   const maxSharp = Math.max(1e-6, ...photos.map(p => p.sharp || 0));
-  let used = 0;
+  let used = 0; const gains = [];
   for (let pi = 0; pi < photos.length; pi++) {
     const ph = photos[pi]; if (pi % 5 === 0) say('photo ' + (pi + 1) + ' / ' + photos.length);
     let dep = null, dbest = 700; for (const d of depths) { const dt = Math.abs(d.t - ph.t); if (dt < dbest) { dbest = dt; dep = d; } }
@@ -1725,7 +1725,7 @@ onmessage = async e => {
         cand.push(q, score); if (ratios.length < 400 && q % 3 === 0) { sample(o3[0], o3[1], c3); const lp = .3 * c3[0] + .59 * c3[1] + .11 * c3[2], lv = 255 * (.3 * QK[q * 3] + .59 * QK[q * 3 + 1] + .11 * QK[q * 3 + 2]); if (lp > 12 && lp < 243 && lv > 8) ratios.push(lv / lp); }
       } }
     if (!cand.length) continue;
-    ratios.sort((a, b) => a - b); const gain = ratios.length > 20 ? Math.max(.6, Math.min(1.6, ratios[ratios.length >> 1])) : 1;   // match this photo's exposure to the fused colours
+    ratios.sort((a, b) => a - b); const gain = ratios.length > 20 ? Math.max(.6, Math.min(1.6, ratios[ratios.length >> 1])) : 1; gains.push([ph.t, gain]);   // match this photo's exposure to the fused colours
     for (let i = 0; i < cand.length; i += 2) { const q = cand[i]; best[q] = cand[i + 1];
       texel(q, (o, w0, w1, w2, w3, v) => { const x = w0 * P[v[0] * 3] + w1 * P[v[1] * 3] + w2 * P[v[2] * 3] + w3 * P[v[3] * 3], y = w0 * P[v[0] * 3 + 1] + w1 * P[v[1] * 3 + 1] + w2 * P[v[2] * 3 + 1] + w3 * P[v[3] * 3 + 1], z = w0 * P[v[0] * 3 + 2] + w1 * P[v[1] * 3 + 2] + w2 * P[v[2] * 3 + 2] + w3 * P[v[3] * 3 + 2];
         if (!proj(x, y, z, o3)) return; sample(o3[0], o3[1], c3); img[o] = c3[0] * gain; img[o + 1] = c3[1] * gain; img[o + 2] = c3[2] * gain; }); }
@@ -1739,7 +1739,7 @@ onmessage = async e => {
     for (let j = 0; j < 6; j++) OI[q * 6 + j] = q * 4 + QV.subarray(q * 4, q * 4 + 4).indexOf(I[q * 6 + j]); }
   const oc = new OffscreenCanvas(A, A); oc.getContext('2d').putImageData(new ImageData(img, A, A), 0, 0);
   const blob = await oc.convertToBlob({ type: 'image/jpeg', quality: .9 });
-  postMessage({ done: true, tex: { v: 1, P: OP, N: ON, U: OU, I: OI, img: blob, A, painted, patches: Q, photosUsed: used } }, [OP.buffer, ON.buffer, OU.buffer, OI.buffer]);
+  postMessage({ done: true, tex: { v: 1, P: OP, N: ON, U: OU, I: OI, img: blob, A, painted, patches: Q, photosUsed: used, gains } }, [OP.buffer, ON.buffer, OU.buffer, OI.buffer]);
 };`;
 async function recTexture(rec, say = () => {}) {
   if (rec.tex && rec.tex.v === 1) return rec.tex;
@@ -1759,6 +1759,86 @@ async function showTexMesh(tex, T, extraParts) {
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(tex.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(tex.N, 3)); g.setAttribute('uv', new THREE.BufferAttribute(tex.U, 2)); g.setIndex(new THREE.BufferAttribute(tex.I, 1));
   showMesh(extraParts || [], T);                                    // detail zones keep their own coloured mesh
   const o = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: t, side: THREE.DoubleSide, transparent: true })); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; o.userData.tex = true; meshG.add(o); applySurf();
+}
+
+
+/* ================= live photo view: walk through your house the way the camera saw it =================
+   The 4 photos taken nearest your eye (position and direction) are projected onto the surface in real time and blended
+   by how closely each photo's viewing ray matches yours; each photo's own depth map hides what it couldn't see. */
+const IBR_K = 4, ibr = { on: false, rec: null, frames: [], T: new M4(), Ti: new M4(), slots: [], t: 0, loading: false, gains: new Map() };
+const ibrDist = new THREE.ShaderMaterial({ side: THREE.DoubleSide, vertexShader: 'varying float vz; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vz = -mv.z; gl_Position = projectionMatrix * mv; }',
+  fragmentShader: 'varying float vz; void main(){ gl_FragColor = vec4(vz, 0.0, 0.0, 1.0); }' });
+const ibrCam = new THREE.PerspectiveCamera(); ibrCam.matrixAutoUpdate = false; ibrCam.matrixWorldAutoUpdate = false; ibrCam.layers.set(3);
+for (let k = 0; k < IBR_K; k++) { const tex = new THREE.Texture(); tex.flipY = false; tex.colorSpace = THREE.SRGBColorSpace; tex.minFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+  ibr.slots.push({ idx: -1, tex, rt: new THREE.WebGLRenderTarget(256, 256, { type: THREE.HalfFloatType, depthBuffer: true }), view: new M4(), intr: new THREE.Vector4(), pos: new V3(), on: 0, gain: 1, bmp: null }); }
+const SLOT = i => `if (phOn[${i}] > .5) { vec4 e = phV[${i}] * vec4(vW, 1.0); float z = -e.z;
+    if (z > .1) { vec4 q = phI[${i}]; float u = .5 + q.z + .5 * q.x * e.x / z, v = .5 - .5 * q.x * q.y * e.y / z + q.w;
+      if (u > .004 && u < .996 && v > .004 && v < .996 && z < texture2D(sh[${i}], vec2(u, 1.0 - v)).r + .045) {
+        vec3 r1 = normalize(vW - cameraPosition), r2 = normalize(vW - phP[${i}]); float w = exp(-(1.0 - dot(r1, r2)) * 45.0) / (1.0 + z * .3) + 1e-4;
+        acc += w * texture2D(ph[${i}], vec2(u, v)).rgb * phG[${i}]; ws += w; } } }`;
+function ibrMaterial(useMap, map) {
+  return new THREE.ShaderMaterial({ side: THREE.DoubleSide, transparent: true, vertexColors: !useMap, defines: useMap ? { IBR_MAP: 1 } : {},
+    uniforms: { baseMap: { value: map || null }, ph: { value: ibr.slots.map(s => s.tex) }, sh: { value: ibr.slots.map(s => s.rt.texture) }, phV: { value: ibr.slots.map(s => s.view) }, phI: { value: ibr.slots.map(s => s.intr) },
+      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1] }, opacity: { value: 1 } },
+    vertexShader: `varying vec3 vW; varying vec2 vUv2; varying vec3 vC2; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
+      #ifdef IBR_MAP
+      vUv2 = uv;
+      #else
+      vC2 = color;
+      #endif
+      gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[4]; uniform sampler2D sh[4]; uniform mat4 phV[4]; uniform vec4 phI[4]; uniform vec3 phP[4]; uniform float phOn[4]; uniform float phG[4]; uniform float opacity;
+      varying vec3 vW; varying vec2 vUv2; varying vec3 vC2;
+      void main(){ vec3 acc = vec3(0.0); float ws = 0.0;
+        ${[0, 1, 2, 3].map(SLOT).join('\n')}
+        #ifdef IBR_MAP
+        vec3 base = texture2D(baseMap, vUv2).rgb;
+        #else
+        vec3 base = vC2;
+        #endif
+        gl_FragColor = vec4((acc + base * .03) / (ws + .03), opacity);
+        #include <colorspace_fragment>
+      }` });
+}
+async function ibrStart(rec, T) {                                    // turn the live photo view on for a shown saved scan
+  ibr.on = false; ibr.rec = rec; ibr.T.copy(T); ibr.Ti.copy(T).invert(); for (const s of ibr.slots) { s.idx = -1; s.on = 0; }
+  const fr = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m);
+  if (ibr.rec !== rec || fr.length < 2) return;
+  ibr.frames = fr.map(f => { const m = new M4().fromArray(f.m); return { f, m, p: new V3().setFromMatrixPosition(m), d: new V3(-m.elements[8], -m.elements[9], -m.elements[10]).normalize() }; });
+  ibr.gains = new Map((rec.tex && rec.tex.gains) || []);
+  for (const o of meshG.children) { o.layers.enable(3); if (!o.userData.ibr) { o.userData.base = o.material; o.material = ibrMaterial(!!o.userData.tex, o.userData.tex ? o.material.map : null); o.userData.ibr = true; } }
+  ibr.on = true; ibr.t = 0; applySurf();
+}
+function ibrStop() { ibr.on = false; ibr.rec = null; ibr.frames = []; for (const s of ibr.slots) { s.idx = -1; s.on = 0; if (s.bmp) { s.bmp.close(); s.bmp = null; } } }
+async function ibrLoad(slot, k) {                                    // decode one photo into a slot and render that photo's depth view of the surface
+  const F = ibr.frames[k], f = F.f; ibr.loading = true;
+  try {
+    const b0 = await createImageBitmap(f.blob), w = Math.min(1024, b0.width), h = Math.round(w * b0.height / b0.width), bmp = await createImageBitmap(b0, { resizeWidth: w, resizeHeight: h }); b0.close();
+    if (!ibr.on) { bmp.close(); return; }
+    if (slot.bmp) slot.bmp.close(); slot.bmp = bmp; slot.tex.image = bmp; slot.tex.needsUpdate = true;
+    const Mw = ibr.T.clone().multiply(F.m), fx = 1 / Math.tan(f.hfov / 2), asp = w / h;
+    slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = ibr.gains.get(f.t) || 1; slot.idx = k;
+    /* the photo's own depth view (for occlusion), same projection as the photo */
+    const P = ibrCam.projectionMatrix, n = .05, fa = 30; P.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); ibrCam.projectionMatrixInverse.copy(P).invert();
+    ibrCam.matrixWorld.copy(Mw); ibrCam.matrixWorldInverse.copy(slot.view);
+    const prevT = renderer.getRenderTarget(), xrEn = renderer.xr.enabled, cc = new THREE.Color(), ca = renderer.getClearAlpha(); renderer.getClearColor(cc);
+    renderer.xr.enabled = false; scene.overrideMaterial = ibrDist; renderer.setRenderTarget(slot.rt); renderer.setClearColor(new THREE.Color(1000, 0, 0), 1); renderer.clear();
+    renderer.render(scene, ibrCam);
+    scene.overrideMaterial = null; renderer.setRenderTarget(prevT); renderer.xr.enabled = xrEn; renderer.setClearColor(cc, ca);
+    slot.on = 1;
+  } catch (e) { diagLog('ibr', e.message); }
+  ibr.loading = false;
+}
+function ibrUpdate(eyeCam) {                                         // pick the photos for where you are now (a few times a second), feed the shaders
+  if (!ibr.on) return;
+  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { U.phOn.value[k] = ibr.slots[k].on; U.phG.value[k] = ibr.slots[k].gain; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
+  if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
+  const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
+  const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
+  const want = new Set(sc.map(x => x[1])), have = new Set(ibr.slots.map(s => s.idx));
+  const missing = sc.find(x => !have.has(x[1])); if (!missing) return;
+  let slot = ibr.slots.find(s => s.idx < 0) || ibr.slots.filter(s => !want.has(s.idx)).sort((a, b) => b.idx - a.idx)[0]; if (!slot) return;
+  ibrLoad(slot, missing[1]);
 }
 
 /* ================= finding a saved scan again: match the walls around you to the saved walls (no anchor needed) =================
@@ -2425,7 +2505,7 @@ function openViewer(rec) {
   cloud.visible = true; layout.visible = false; applySurf();
   $('ui').classList.add('hide'); $('vbar').classList.add('on'); const info = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
   $('vInfo').textContent = info + ' · building surface…';
-  recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
+  recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); ibrStart(rec, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
 function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 3; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
@@ -2490,10 +2570,11 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); relocTick(); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
+    autoTick(dt); relocTick(); if (replayMode) ibrUpdate(renderer.xr.getCamera()); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
+    ibrUpdate(camera);
     tileSlice(12); tileFlush(); flushGeo(); flushFine(); tmat.uniforms.time.value = clockT; tmat.uniforms.style.value = pmat.uniforms.style.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tiles.visible = cloud.visible;
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
