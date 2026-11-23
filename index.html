@@ -124,7 +124,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { mapFull = false; meshClear(); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { mapFull = false; meshClear(); liveClear(); if (integ) integ.postMessage({ tsdfReset: true }); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -201,7 +201,7 @@ const fmat = pmat.clone(); fmat.uniforms.size.value = VSF * 1.25; fmat.uniforms.
 const fcloud = new THREE.Points(fg, fmat); fcloud.frustumCulled = false; scene.add(fcloud);
 function flushFine() {
   for (const n of ['time', 'scale', 'minC', 'floorY', 'photo', 'alpha', 'style']) fmat.uniforms[n].value = pmat.uniforms[n].value;
-  if (fmat.depthWrite !== pmat.depthWrite) { fmat.depthWrite = pmat.depthWrite; fmat.needsUpdate = true; } fcloud.visible = cloud.visible;
+  if (fmat.depthWrite !== pmat.depthWrite) { fmat.depthWrite = pmat.depthWrite; fmat.needsUpdate = true; }
   if (fHi < 0) return; const lo = Math.min(fLo, fNewLo), hi = Math.max(fHi, FN - 1);
   for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw', 'nrm']) { const at = fg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); at.addUpdateRange(lo * k, (hi - lo + 1) * k); at.needsUpdate = true; }
   fg.setDrawRange(0, FN); fNewLo = FN; fLo = Infinity; fHi = -1;
@@ -364,7 +364,7 @@ function tileFlush() {
 const LABEL_COL = { wall: 0x8fb6c9, floor: 0xb8956a, ceiling: 0xcfcfcf, table: 0xd9a54a, couch: 0xa070c0, door: 0x60c080, window: 0x70a8ff, bed: 0xc07070, storage: 0xb0b060, screen: 0x50d0d0, other: 0x9a9a9a };
 const layout = new THREE.Group(); layout.visible = false;   // Meta's layout is never drawn: it's reference data for calibration and checking
 const planes = new Map(), meshes = new Map();
-let showMode = 0;                                          // 0 points + layout, 1 points only, 2 layout only
+let showMode = 3;                                          // 0 dots, 1 solid points, 2 hidden, 3 live mesh
 function planeLine(e) {}
 function meshWire(e) {}
 function clearMeta() { metaSurf.base = new Set(); metaSurf.set = new Set(); metaSurf.n = 0; cov.done.clear(); lay.removed.clear(); lay.added.clear(); planes.clear(); meshes.clear(); metaToWorker(); }
@@ -833,11 +833,124 @@ function alignFrame(cam, V, list, n) {
   AL.done = true; if (bv > base * .95) best = C.findIndex(q => q.hfov === 78 && q.cx === 0 && q.cy === 0);     // no clear winner: keep the plain guess
   return Object.assign({ gain: base / bv }, C[best]);
 }
+
+/* ---------- TSDF: every 2 cm voxel near a surface stores its signed distance to it (truncated at 6 cm), averaged over frames ---------- */
+const TV = .02, BS = 8, B3 = 512, MU = .06, WMAX = 24, RB = 4;
+const TB = new Map(), TREG = new Map(), tDirty = new Map(), tMeshed = new Map();
+const bk3 = (i, j, k) => ((i + 8192) * 16384 + (j + 8192)) * 16384 + (k + 8192);
+const unbk = k => { const z = k % 16384 - 8192, r = (k - (z + 8192)) / 16384, y = r % 16384 - 8192, x = (r - (y + 8192)) / 16384 - 8192; return [x, y, z]; };
+function tBlock(bi, bj, bk, make) {
+  const k = bk3(bi, bj, bk); let b = TB.get(k);
+  if (!b && make) { b = { i: bi, j: bj, k: bk, d: new Float32Array(B3).fill(1), w: new Float32Array(B3), c: new Float32Array(B3 * 3), cw: new Float32Array(B3) }; TB.set(k, b);
+    const rk = bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)); let s = TREG.get(rk); if (!s) TREG.set(rk, s = new Set()); s.add(k); }
+  return b;
+}
+function tsdfIntegrate(c) {
+  const X = c.X, OX = X[12], OY = X[13], OZ = X[14], R = c.rays, nr = c.nr, touched = new Set(), step = BS * TV * .9, now = c.now;
+  const blockAt = (x, y, z, make) => { const b = tBlock(Math.floor(x / (BS * TV)), Math.floor(y / (BS * TV)), Math.floor(z / (BS * TV)), make); if (b) touched.add(b); };
+  for (let r = 0; r < nr; r++) {                                   // blocks around each surface hit, plus existing blocks the ray passes through (so moved things clear)
+    const px = R[r * 4], py = R[r * 4 + 1], pz = R[r * 4 + 2], dx = px - OX, dy = py - OY, dz = pz - OZ, L = Math.sqrt(dx * dx + dy * dy + dz * dz), ux = dx / L, uy = dy / L, uz = dz / L;
+    for (const o of [-MU, 0, MU]) blockAt(px + ux * o, py + uy * o, pz + uz * o, true);
+    if (r & 1) continue; for (let t = .3; t < L - MU; t += step) blockAt(OX + ux * t, OY + uy * t, OZ + uz * t, false);
+  }
+  const P = c.PRJ, N = c.NDI, R0 = c.R0, DW = c.DW, DH = c.DH, zf = c.zf, cam = c.cam, V = c.V, wm = c.moving ? .6 : 1;
+  for (const b of touched) {
+    let changed = false;
+    for (let v = 0; v < B3; v++) {
+      const wx = (b.i * BS + (v & 7) + .5) * TV, wy = (b.j * BS + ((v >> 3) & 7) + .5) * TV, wz = (b.k * BS + (v >> 6) + .5) * TV, ax = wx - OX, ay = wy - OY, az = wz - OZ;
+      const cx = X[0] * ax + X[1] * ay + X[2] * az, cy = X[4] * ax + X[5] * ay + X[6] * az, cz = X[8] * ax + X[9] * ay + X[10] * az, zv = -cz; if (zv < .15) continue;
+      const qw = P[3] * cx + P[7] * cy + P[11] * cz + P[15]; let vu = (P[0] * cx + P[4] * cy + P[8] * cz + P[12]) / qw * .5 + .5, vv = (P[1] * cx + P[5] * cy + P[9] * cz + P[13]) / qw * .5 + .5;
+      if (c.flip) vv = 1 - vv; let u = vu, w2 = vv; if (N) { u = N[0] * vu + N[4] * vv + N[12]; w2 = N[1] * vu + N[5] * vv + N[13]; }
+      const xi = Math.round(((u - R0[0]) / R0[2] - c.jx) * DW - .5), yi = Math.round(((w2 - R0[1]) / R0[3] - c.jy) * DH - .5); if (xi < 1 || yi < 1 || xi > DW - 2 || yi > DH - 2) continue;
+      const zm = zf[yi * DW + xi]; if (!(zm > .2 && zm < 4.5)) continue;
+      const sdf = zm - zv; if (sdf < -MU) continue;
+      const t = sdf > MU ? 1 : sdf / MU, w0 = b.w[v]; let wn = Math.max(.2, 1 - zv / 4.6) * wm;
+      if (t === 1 && b.d[v] < .5) wn = Math.max(wn, w0 * .45);                // seen straight through something stored: it moved, forget it fast
+      b.d[v] = (b.d[v] * w0 + t * wn) / (w0 + wn); b.w[v] = Math.min(WMAX, w0 + wn); changed = true;
+      if (cam && sdf < MU * .5) {                                   // colour from the camera, for voxels right at the surface
+        const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
+        if (ez < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * ex / -ez, cv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
+          if (cu > .01 && cu < .99 && cv > .01 && cv < .99) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, a = cu * 2 - 1, bb = cv * 2 - 1, q = wn * (1 - .75 * Math.min(1, (a * a + bb * bb) * .5)) * (1 - Math.abs(sdf) / MU);
+            const cw0 = b.cw[v], k2 = cw0 + q; if (k2 > 0) { const g = c.gain || 1; b.c[v * 3] += (Math.min(1, cam.data[pi] / 255 * g) - b.c[v * 3]) * q / k2; b.c[v * 3 + 1] += (Math.min(1, cam.data[pi + 1] / 255 * g) - b.c[v * 3 + 1]) * q / k2; b.c[v * 3 + 2] += (Math.min(1, cam.data[pi + 2] / 255 * g) - b.c[v * 3 + 2]) * q / k2; b.cw[v] = Math.min(30, k2); } } }
+      }
+    }
+    if (changed) tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), now);
+  }
+  return touched.size;
+}
+/* surface nets on the TSDF lattice, one region (4x4x4 blocks = 64 cm) at a time */
+const TOFF = [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]], TE = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+const TAX = [[1,0,0],[0,1,0],[0,0,1]], TRING = [[[0,0,0],[0,-1,0],[0,-1,-1],[0,0,-1]], [[0,0,0],[0,0,-1],[-1,0,-1],[-1,0,0]], [[0,0,0],[-1,0,0],[-1,-1,0],[0,-1,0]]];
+function meshRegions(rks, zones, floorY) {
+  let lk = -1, lb = null;
+  const look = (i, j, k) => { const bi = Math.floor(i / BS), bj = Math.floor(j / BS), bk = Math.floor(k / BS), key = bk3(bi, bj, bk); if (key !== lk) { lk = key; lb = TB.get(key) || null; } if (!lb) return -1; return (i - bi * BS) + (j - bj * BS) * BS + (k - bk * BS) * BS * BS; };
+  const memo = new Map(), VP = [], VN = [], VC = [], T = [], dd = new Float32Array(8), bs = new Array(8), vs = new Int32Array(8);
+  const inZ = (x, y, z) => { for (const q of zones) if ((x - q[0]) ** 2 + (y - q[1]) ** 2 + (z - q[2]) ** 2 < q[3] * q[3]) return true; return false; };
+  const cellVert = (i, j, k) => {
+    const key = bk3(i, j, k); let id = memo.get(key); if (id !== undefined) return id;
+    let pos = 0, neg = 0; id = -1;
+    for (let o = 0; o < 8; o++) { const v = look(i + TOFF[o][0], j + TOFF[o][1], k + TOFF[o][2]); if (v < 0 || lb.w[v] <= 0) { memo.set(key, -1); return -1; } bs[o] = lb; vs[o] = v; dd[o] = lb.d[v]; if (dd[o] > 0) pos++; else neg++; }
+    if (pos && neg) {
+      let sx = 0, sy = 0, sz = 0, m = 0;
+      for (const [a, b] of TE) { const fa = dd[a], fb = dd[b]; if ((fa > 0) === (fb > 0)) continue; const t = fa / (fa - fb); sx += TOFF[a][0] + (TOFF[b][0] - TOFF[a][0]) * t; sy += TOFF[a][1] + (TOFF[b][1] - TOFF[a][1]) * t; sz += TOFF[a][2] + (TOFF[b][2] - TOFF[a][2]) * t; m++; }
+      const x = (i + .5 + sx / m) * TV, y = (j + .5 + sy / m) * TV, z = (k + .5 + sz / m) * TV;
+      if (!inZ(x, y, z)) {
+        id = VP.length / 3; VP.push(x, y, z);
+        const gx = dd[1] + dd[3] + dd[5] + dd[7] - dd[0] - dd[2] - dd[4] - dd[6], gy = dd[2] + dd[3] + dd[6] + dd[7] - dd[0] - dd[1] - dd[4] - dd[5], gz = dd[4] + dd[5] + dd[6] + dd[7] - dd[0] - dd[1] - dd[2] - dd[3], gl = Math.hypot(gx, gy, gz) || 1;
+        VN.push(gx / gl, gy / gl, gz / gl);
+        let r = 0, g = 0, bl = 0, cw = 0; for (let o = 0; o < 8; o++) { const B = bs[o], v = vs[o], w = B.cw[v]; if (w > 0) { r += B.c[v * 3] * w; g += B.c[v * 3 + 1] * w; bl += B.c[v * 3 + 2] * w; cw += w; } }
+        if (cw > .05) VC.push(r / cw, g / cw, bl / cw); else { const h = Math.max(0, Math.min(1, (y - floorY) / 2.7)); VC.push((160 + 40 * h) / 255, (130 + 85 * h) / 255, (100 + 130 * h) / 255); }
+      }
+    }
+    memo.set(key, id); return id;
+  };
+  const out = [];
+  for (const rk of rks) {
+    const set = TREG.get(rk); VP.length = VN.length = VC.length = T.length = 0; memo.clear();
+    if (set) for (const bkk of set) { const b = TB.get(bkk); if (!b) continue;
+      for (let v = 0; v < B3; v++) { if (b.w[v] <= 0) continue; const i = b.i * BS + (v & 7), j = b.j * BS + ((v >> 3) & 7), k = b.k * BS + (v >> 6), f0 = b.d[v];
+        for (let a = 0; a < 3; a++) { const n = look(i + TAX[a][0], j + TAX[a][1], k + TAX[a][2]); if (n < 0 || lb.w[n] <= 0) continue; const f1 = lb.d[n]; if ((f0 > 0) === (f1 > 0)) continue;
+          const q0 = cellVert(i + TRING[a][0][0], j + TRING[a][0][1], k + TRING[a][0][2]); if (q0 < 0) continue; const q1 = cellVert(i + TRING[a][1][0], j + TRING[a][1][1], k + TRING[a][1][2]); if (q1 < 0) continue;
+          const q2 = cellVert(i + TRING[a][2][0], j + TRING[a][2][1], k + TRING[a][2][2]); if (q2 < 0) continue; const q3 = cellVert(i + TRING[a][3][0], j + TRING[a][3][1], k + TRING[a][3][2]); if (q3 < 0) continue;
+          if (f1 > f0) T.push(q0, q1, q2, q0, q2, q3); else T.push(q0, q2, q1, q0, q3, q2); } } }
+    out.push({ rk, P: new Float32Array(VP), N: new Float32Array(VN), C: new Float32Array(VC), I: new Uint32Array(T) });
+  }
+  return out;
+}
+function tsdfPack() {
+  const n = TB.size, keys = new Float64Array(n), d = new Int8Array(n * B3), w = new Uint8Array(n * B3), c = new Uint8Array(n * B3 * 3); let i = 0;
+  for (const [k, b] of TB) { keys[i] = k; for (let v = 0; v < B3; v++) { const o = i * B3 + v; d[o] = Math.round(Math.max(-1, Math.min(1, b.d[v])) * 127); w[o] = Math.min(255, Math.round(b.w[v] * 6)); c[o * 3] = b.c[v * 3] * 255; c[o * 3 + 1] = b.c[v * 3 + 1] * 255; c[o * 3 + 2] = b.c[v * 3 + 2] * 255; } i++; }
+  return { vs: TV, bs: BS, mu: MU, keys, d, w, c };
+}
+function tsdfUnpack(t, Tm) {                                        // load a saved TSDF; with a transform, resample voxel by voxel into this frame
+  const ident = !Tm || Tm.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6);
+  for (let i = 0; i < t.keys.length; i++) {
+    const [bi, bj, bk] = unbk(t.keys[i]);
+    if (ident) { const b = tBlock(bi, bj, bk, true); for (let v = 0; v < B3; v++) { const o = i * B3 + v; b.d[v] = t.d[o] / 127; b.w[v] = t.w[o] / 6; b.c[v * 3] = t.c[o * 3] / 255; b.c[v * 3 + 1] = t.c[o * 3 + 1] / 255; b.c[v * 3 + 2] = t.c[o * 3 + 2] / 255; b.cw[v] = t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0 ? 3 : 0; }
+      tDirty.set(bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)), 0); continue; }
+    for (let v = 0; v < B3; v++) { const o = i * B3 + v; if (!t.w[o]) continue;
+      const x = (bi * BS + (v & 7) + .5) * TV, y = (bj * BS + ((v >> 3) & 7) + .5) * TV, z = (bk * BS + (v >> 6) + .5) * TV;
+      const X = Tm[0] * x + Tm[4] * y + Tm[8] * z + Tm[12], Y = Tm[1] * x + Tm[5] * y + Tm[9] * z + Tm[13], Z = Tm[2] * x + Tm[6] * y + Tm[10] * z + Tm[14];
+      const gi = Math.floor(X / TV), gj = Math.floor(Y / TV), gk = Math.floor(Z / TV), b = tBlock(Math.floor(gi / BS), Math.floor(gj / BS), Math.floor(gk / BS), true), u = (gi - b.i * BS) + (gj - b.j * BS) * BS + (gk - b.k * BS) * BS * BS;
+      if (t.w[o] / 6 > b.w[u]) { b.d[u] = t.d[o] / 127; b.w[u] = t.w[o] / 6; b.c[u * 3] = t.c[o * 3] / 255; b.c[u * 3 + 1] = t.c[o * 3 + 1] / 255; b.c[u * 3 + 2] = t.c[o * 3 + 2] / 255; b.cw[u] = 3; }
+      tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), 0); }
+  }
+}
+function concatParts(list) {
+  let nv = 0, ni = 0; for (const m of list) { nv += m.P.length / 3; ni += m.I.length; }
+  const P = new Float32Array(nv * 3), N = new Float32Array(nv * 3), C = new Float32Array(nv * 3), I = new Uint32Array(ni); let ov = 0, oi = 0;
+  for (const m of list) { P.set(m.P, ov * 3); N.set(m.N, ov * 3); C.set(m.C, ov * 3); for (let k = 0; k < m.I.length; k++) I[oi + k] = m.I[k] + ov; ov += m.P.length / 3; oi += m.I.length; }
+  return { P, N, C, I };
+}
 let OC = null, OCX = null;
 onmessage = e => {
   const d = e.data;
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
   if (d.resetKnown) { HK.fill(0); hN = 0; FK.clear(); return; }
+  if (d.tsdfReset) { TB.clear(); TREG.clear(); tDirty.clear(); tMeshed.clear(); return; }
+  if (d.tsdfLoad) { tsdfUnpack(d.tsdfLoad, d.T); return; }
+  if (d.tsdfDump) { const t = tsdfPack(); postMessage({ tsdfDump: d.tsdfDump, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
+  if (d.tsdfMeshAll) { const all = concatParts(meshRegions([...TREG.keys()], d.zones || [], d.floorY || 0)); postMessage({ meshAll: d.tsdfMeshAll, m: all }, [all.P.buffer, all.N.buffer, all.C.buffer, all.I.buffer]); return; }
   if (d.resetFine) return;
   if (d.knownFine) { for (const k of d.knownFine) FK.add(k); return; }
   if (d.metaSet) { MS = new Set(d.metaSet); ME.clear(); MA.clear(); return; }
@@ -935,9 +1048,40 @@ onmessage = e => {
   let align = null;
   if (!F && cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer]);
+  let meshes = null, tsdfBlocks = 0, tms = 0;
+  if (!F && d.tsdf && d.PRJ) {
+    const t0 = performance.now(), now = t0;
+    tsdfBlocks = tsdfIntegrate({ X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
+    const due = []; for (const [rk, t] of tDirty) if (now - (tMeshed.get(rk) || -1e9) > 600) due.push(rk);
+    due.sort((a, b) => tDirty.get(b) - tDirty.get(a)); const pick = due.slice(0, 3);
+    if (pick.length) { meshes = meshRegions(pick, d.zones || [], d.floorY || 0); for (const rk of pick) { tMeshed.set(rk, now); tDirty.delete(rk); } }
+    tms = performance.now() - t0;
+  }
+  postMessage({ P, C, np, nc, valid, meshes, tsdfBlocks, tms, regions: TREG.size, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer].concat(meshes ? meshes.flatMap(m => [m.P.buffer, m.N.buffer, m.C.buffer, m.I.buffer]) : []));
 };`;
-let integ = null; const applyQ = [];
+let integ = null; const applyQ = [], wReq = new Map(); let wReqN = 0, tsdfOn = true;
+function workerAsk(w, msg, key) { return new Promise(res => { const id = ++wReqN; wReq.set(id, res); msg[key] = id; w.postMessage(msg); }); }
+/* the live mesh: one small mesh per 64 cm region, replaced as the worker re-meshes it */
+const tsdfG = new THREE.Group(); scene.add(tsdfG); const liveM = new Map();
+const liveMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: .8 });
+function liveMeshes(list) {
+  for (const m of list) {
+    const old = liveM.get(m.rk); if (old) { tsdfG.remove(old); old.geometry.dispose(); liveM.delete(m.rk); }
+    if (!m.I.length) continue;
+    const g = new THREE.BufferGeometry(), CL = new Float32Array(m.C.length); for (let k = 0; k < CL.length; k++) { const c = m.C[k]; CL[k] = c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }
+    g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(m.N, 3)); g.setAttribute('color', new THREE.BufferAttribute(CL, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1));
+    const o = new THREE.Mesh(g, liveMat); o.frustumCulled = false; tsdfG.add(o); liveM.set(m.rk, o);
+  }
+  applySurf();
+}
+function liveClear() { for (const o of liveM.values()) { tsdfG.remove(o); o.geometry.dispose(); } liveM.clear(); }
+const tsdfDump = () => integ ? workerAsk(integ, {}, 'tsdfDump') : Promise.resolve(null);
+async function tsdfMeshOf(t, zones, floorY) {                       // mesh a saved TSDF in a throwaway worker (doesn't touch the live one)
+  const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
+  const m = await new Promise((res, rej) => { w.onmessage = e => { if (e.data.meshAll) res(e.data.m); }; w.onerror = e => rej(new Error(e.message || 'mesh worker failed'));
+    w.postMessage({ tsdfLoad: t }); w.postMessage({ tsdfMeshAll: 1, zones, floorY }); });
+  w.terminate(); return m;
+}
 function camAligned(a) {                                                       // the worker found how the camera image lines up with the depth
   colorCam.f = a.f; colorCam.cx = a.cx; colorCam.cy = a.cy; colorCam.aligned = true;
   try { localStorage.setItem('scanner.camAlign', JSON.stringify({ f: a.f, cx: a.cx, cy: a.cy })); } catch (e) {}
@@ -947,8 +1091,11 @@ function camAligned(a) {                                                       /
 function integWorker() {
   if (integ) return integ;
   integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
+  integ.onmessage = e => { const d = e.data;
+    if (d.tsdfDump || d.meshAll) { const f = wReq.get(d.tsdfDump || d.meshAll); wReq.delete(d.tsdfDump || d.meshAll); if (f) f(d.t || d.m); return; }
+    depth.wBusy = false; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
     if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
+    if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
     exposureMatch(d);
     if (d.moving) { lagTest(d); if (!depth.lagOK || (d.lagUsed || 0) !== (depth.lag || 0)) return;   // a moving frame is fused only once the lag is known
       for (let i = 0; i < d.np; i++) d.P[i * 11 + 3] *= .6; d.nc = 0; }                              // and counts for less, and never erases
@@ -966,6 +1113,8 @@ function postIntegration(M) {                                       // hand a de
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow,
     fine: !!M.fine, VSF, roi: M.roi || null, zone: M.zone || null,
+    PRJ: Array.from(inv.clone().invert().elements), NDI: cfg.nd && M.ndRaw ? Array.from((cfg.nd === 1 ? M.ndRaw : new M4().copy(M.ndRaw).invert()).elements) : null,
+    tsdf: !M.fine && tsdfOn && (!M.moving || (depth.lagOK && L === (depth.lag || 0))), zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), floorY: pmat.uniforms.floorY.value, gain: depth.expGain || 1,
     moving: M.moving, lagUsed: L, lagB: !M.fine && M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(lagRel(M, k, L).elements)) : null };
   depth.wBusy = true; depth.postT = performance.now();
   integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.bmp || cam.data.buffer] : []));
@@ -1070,7 +1219,8 @@ function snapshot() {
   };
 }
 async function saveScan(frame) {
-  const s = snapshot(); if (!s.points.length) { toast('Nothing captured yet'); return; }
+  const tsdf = await Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 4000))]);
+  const s = snapshot(); if (tsdf && tsdf.keys.length) s.tsdf = tsdf; if (!s.points.length) { toast('Nothing captured yet'); return; }
   const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
   if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
   /* a persistent anchor at the scan origin: next time, the headset relocates it and the scan snaps back into place */
@@ -1097,6 +1247,7 @@ function mergeRecord(rec, T) {
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
   fineIn(rec, T);
+  if (rec.tsdf && !viewer.on) integWorker().postMessage({ tsdfLoad: rec.tsdf, T: Array.from(T.elements) });
   flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); integWorker().postMessage({ knownFine: Float64Array.from(fmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
   toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
   if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(parts => { if (replayMode && parts.length) { showMesh(parts, Tm); toast('Surfaces ready'); } }).catch(e => toast('Surface build failed: ' + e.message)); }
@@ -1160,6 +1311,7 @@ function exportJSON(rec) {
     planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
     layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null,
+    tsdf: rec.tsdf ? { vs: rec.tsdf.vs, bs: rec.tsdf.bs, mu: rec.tsdf.mu, keys: b64(rec.tsdf.keys), d: b64(rec.tsdf.d), w: b64(rec.tsdf.w), c: b64(rec.tsdf.c) } : null,
     fineVoxel: rec.fineVoxel || null, zones: rec.zones || null, fpoints: rec.fpoints ? b64(rec.fpoints) : null, fcolors: rec.fcolors ? b64(rec.fcolors) : null, fnormals: rec.fnormals ? b64(rec.fnormals) : null, fcounts: rec.fcounts ? b64(rec.fcounts) : null };
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.json', new Blob([JSON.stringify(o)], { type: 'application/json' }));
 }
@@ -1229,7 +1381,8 @@ function exportGLBraw(rec) {
   download((rec.name || 'scan').replace(/\W+/g, '-') + '.glb', new Blob([head.buffer, jb, new Uint8Array(jpad).fill(32), bh.buffer, ...chunks], { type: 'model/gltf-binary' }));
 }
 function parseJSON(o) {
-  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, fineVoxel: o.fineVoxel || null, zones: o.zones || null, fpoints: o.fpoints ? unb64(o.fpoints, Float32Array) : null, fcolors: o.fcolors ? unb64(o.fcolors, Uint8Array) : null, fnormals: o.fnormals ? unb64(o.fnormals, Int8Array) : null, fcounts: o.fcounts ? unb64(o.fcounts, Uint16Array) : null,
+  return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, tsdf: o.tsdf ? { vs: o.tsdf.vs, bs: o.tsdf.bs, mu: o.tsdf.mu, keys: unb64(o.tsdf.keys, Float64Array), d: unb64(o.tsdf.d, Int8Array), w: unb64(o.tsdf.w, Uint8Array), c: unb64(o.tsdf.c, Uint8Array) } : null,
+    fineVoxel: o.fineVoxel || null, zones: o.zones || null, fpoints: o.fpoints ? unb64(o.fpoints, Float32Array) : null, fcolors: o.fcolors ? unb64(o.fcolors, Uint8Array) : null, fnormals: o.fnormals ? unb64(o.fnormals, Int8Array) : null, fcounts: o.fcounts ? unb64(o.fcounts, Uint16Array) : null,
     layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
     planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
 }
@@ -1298,11 +1451,12 @@ function gatherRec(P0, N0, C0, floorY, zones) {
   return [P, Nn, C];
 }
 async function recMesh(rec) {
-  if (rec.meshCache && rec.meshCache.v === 1) return rec.meshCache.parts;
-  const parts = [], g = gatherRec(rec.points, rec.normals, rec.colors, rec.floorY, rec.zones || []);
-  if (g) parts.push(await meshPoints(...g, rec.voxelSize || VS));
+  if (rec.meshCache && rec.meshCache.v === 2) return rec.meshCache.parts;
+  const parts = [];
+  if (rec.tsdf && rec.tsdf.keys.length) parts.push(await tsdfMeshOf(rec.tsdf, rec.zones || [], rec.floorY || 0));   // the fused distance field gives the cleanest surface
+  else { const g = gatherRec(rec.points, rec.normals, rec.colors, rec.floorY, rec.zones || []); if (g) parts.push(await meshPoints(...g, rec.voxelSize || VS)); }
   if (rec.fpoints && rec.fpoints.length) { const f = gatherRec(rec.fpoints, rec.fnormals, rec.fcolors, rec.floorY, []); if (f) parts.push(Object.assign(await meshPoints(...f, rec.fineVoxel || VSF), { fine: true })); }
-  rec.meshCache = { v: 1, parts }; if (parts.length && !String(rec.id).startsWith('file-')) DB.put(rec).catch(() => {});
+  rec.meshCache = { v: 2, parts }; if (parts.length && !String(rec.id).startsWith('file-')) DB.put(rec).catch(() => {});
   return parts;
 }
 const meshG = new THREE.Group(); scene.add(meshG); let surfOn = true;
@@ -1317,10 +1471,11 @@ function showMesh(parts, T) {
   applySurf();
 }
 function meshClear() { for (const o of meshG.children) o.geometry.dispose(); meshG.clear(); }
-function applySurf() {                                          // surface mesh when there is one, otherwise the point map
-  const m = surfOn && meshG.children.length > 0;
+function applySurf() {                                          // saved surface mesh, else the live mesh (in mesh mode), else the point map
+  const m = surfOn && meshG.children.length > 0, live = !m && showMode === 3 && liveM.size > 0;
   meshG.visible = m && reality !== 2; meshMat.opacity = reality === 1 ? .55 : 1; meshMat.depthWrite = reality !== 1;
-  cloud.visible = !m && showMode !== 2 && reality !== 2;
+  tsdfG.visible = live && reality !== 2;
+  cloud.visible = !m && !live && showMode !== 2 && reality !== 2; fcloud.visible = !(m && meshG.children.length > 1) && showMode !== 2 && reality !== 2;
   const vb = document.getElementById('vSurf'); if (vb) vb.textContent = m ? 'Show points' : 'Show surface';
 }
 function gatherForMesh(fine, zones) {                              // confirmed points with normals, colours (camera or height tint), zones split coarse/fine
@@ -1578,7 +1733,7 @@ const BTN = () => page === 0 ? [
   { id: 'more', label: 'More  ›', big: true }
 ] : [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
-  { id: 'view', label: ['Points: dots', 'Points: solid', 'Points: hidden'][showMode] },
+  { id: 'view', label: ['Show: dots', 'Show: solid points', 'Show: nothing', 'Show: live mesh'][showMode] },
   { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
@@ -1598,7 +1753,7 @@ function diagSnapshot() {
   return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps),
     session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
-      lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, exposure: depth.expGain, noWorker: !!depth.noWorker },
+      lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
     map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
@@ -1673,6 +1828,7 @@ function drawPanel() {
       'depth   ' + (depth.tooFast ? 'paused: too fast' : depth.status) + ' · lag ' + (depth.lag || 0) + (depth.lagOK ? ' ✓' : ''),
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · cover ' + cov.done.size + '/' + metaSurf.n + ' · edits −' + lay.removed.size + ' +' + lay.added.size,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
+      'mesh    ' + liveM.size + ' regions · fuse ' + (depth.tsdfMs || 0).toFixed(0) + ' ms',
       'clean   ' + cleaned.toLocaleString() + ' strays · ' + erased.toLocaleString() + ' moved-away erased · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
       'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') + ' · exposure ×' + (depth.expGain || 1).toFixed(2) : ''),
             ...(scanErr ? ['ERROR   ' + scanErr] : [])
@@ -1699,7 +1855,7 @@ async function press(id, frame) {
   if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
-  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
+  if (id === 'view') { showMode = (showMode + 1) % 4; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
   if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
@@ -1817,7 +1973,7 @@ function openViewer(rec) {
   recMesh(rec).then(parts => { if (!viewer.on || viewer.id !== rec.id) return; showMesh(parts, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 0; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 3; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
 $('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
   download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
