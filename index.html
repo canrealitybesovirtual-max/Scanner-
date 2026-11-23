@@ -123,16 +123,16 @@ const pmat = new THREE.ShaderMaterial({
   vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       float d = -mv.z, fresh = exp(-(time - born) * 1.6);
-      ok = step(minC, cnt) * step(.35, d);                                                                // nothing right in front of your eyes
+      ok = step(style < .5 ? 3.0 : minC, cnt) * step(.35, d);                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
       float px = size * scale / max(.05, d);
-      gl_PointSize = ok * (style < .5 ? clamp(px * .45, 1.5, 6.0) * (1.0 + fresh) : clamp(px * (1.0 + photo * .8), 1.0, 40.0));
+      gl_PointSize = ok * (style < .5 ? clamp(px * .35, 1.2, 4.0) * (1.0 + fresh * .5) : clamp(px * (1.0 + photo * .8), 1.0, 40.0));
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
       vec3 base = style < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
       base *= .7 + .3 * clamp(cnt / 24.0, 0.0, 1.0);                                                      // well-seen surfaces brighter
       base = mix(base, col, step(.01, cw));                                                               // real colour from the passthrough camera
       base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * step(3.0, cnt) * (style < .5 ? .45 : .5));     // seen from one angle only: amber hint
       vC = mix(base, vec3(.25, .95, 1.0), fresh);
-      va = style < .5 ? .55 + .45 * fresh : 1.0;
+      va = style < .5 ? .32 + .3 * fresh : 1.0;
       if (photo > .5) { vC = cw > .01 ? col : base * .7; va = 1.0; } }`,
   fragmentShader: `uniform float photo, alpha, style; varying vec3 vC; varying float ok, va;
     void main(){ if (ok < .5) discard; if (photo > .5 || style < .5) { vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; }
@@ -342,9 +342,62 @@ function sampleDepth(frame, ref, session, tNow) {
     inv: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).invert(), PE: new M4().fromArray(info.projectionMatrix || view.projectionMatrix).elements,
     xf: new M4().fromArray((info.transform || view.transform).matrix),
     nd: new M4(),
+    projI: info.projectionMatrix ? new M4().fromArray(info.projectionMatrix).invert() : null, xfI: info.transform ? new M4().fromArray(info.transform.matrix) : null,
+    projV: new M4().fromArray(view.projectionMatrix).invert(), xfV: new M4().fromArray(view.transform.matrix),
+    ndRaw: info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix) : null,
     near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
     head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
   };
+}
+function depthModes(M) {
+  const { near, far, r2m } = M;
+  return {
+    mm: rw => rw * r2m, metres: rw => rw * M.rvm,
+    ndc: rw => rw <= 0 || rw >= 1 ? 0 : isFinite(far) ? 2 * near * far / (far + near - (rw * 2 - 1) * (far - near)) : near / (1 - rw),
+    reversed: rw => rw <= 0 ? 0 : isFinite(far) ? near * far / (near + rw * (far - near)) : near / rw,
+    u16: rw => rw * 65535 * r2m
+  };
+}
+/* ---- self-calibration: which projection / alignment / flip / encoding puts the same surface in the same place from two viewpoints ---- */
+const CAL_PAIRS = 16, DEF_CFG = { nd: 0, flip: false, src: 'info' }, CPU_CFG = { nd: 0, flip: false, src: 'view' };
+function calCandidates(M, modes) {
+  const out = [], isId = m => !m || m.elements.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-4);
+  const nds = isId(M.ndRaw) ? [0] : [0, 1, 2], srcs = M.projI ? ['info', 'view'] : ['view'];
+  for (const mode of modes) for (const nd of nds) for (const flip of [false, true]) for (const src of srcs) out.push({ mode, nd, flip, src });
+  return out;
+}
+const _ndI = new M4();
+function backproject(M, cfg, x, y, z, out) {                         // depth pixel (x, y) at distance z → world point, under one geometry guess
+  const u = (x + .5) / DW + M.jx, v = (y + .5) / DH + M.jy; let vu = u, vv = v;
+  if (cfg.nd && M.ndRaw) { const n = (cfg.nd === 1 ? _ndI.copy(M.ndRaw).invert() : M.ndRaw).elements; vu = n[0] * u + n[4] * v + n[12]; vv = n[1] * u + n[5] * v + n[13]; }
+  if (cfg.flip) vv = 1 - vv;
+  const inv = cfg.src === 'info' ? M.projI : M.projV, xf = cfg.src === 'info' ? M.xfI : M.xfV;
+  _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(inv); out.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w).multiplyScalar(z / -(_q.z / _q.w));
+  return out.applyMatrix4(xf);
+}
+function calibrateStep(M, raws, modes) {
+  const cal = depth.cal, MODES = depthModes(M), cur = { M, raws: raws.slice() };
+  if (cal.prev) {
+    const A = cal.prev, qa = new THREE.Quaternion().setFromRotationMatrix(A.M.xfV), qb = new THREE.Quaternion().setFromRotationMatrix(M.xfV);
+    const rot = qa.angleTo(qb), mv = new V3().setFromMatrixPosition(A.M.xfV).distanceTo(new V3().setFromMatrixPosition(M.xfV));
+    if ((rot > .03 || mv > .02) && rot < .45 && mv < .4) {
+      const cands = calCandidates(M, modes), p = new V3(), G = .05, key = v => Math.floor(v.x / G) + ',' + Math.floor(v.y / G) + ',' + Math.floor(v.z / G);
+      for (const c of cands) {
+        const f = MODES[c.mode], set = new Set(); let hit = 0, tot = 0;
+        for (let y = 2; y < DH - 2; y += 2) for (let x = 2; x < DW - 2; x += 2) { const z = f(A.raws[y * DW + x]); if (z > .3 && z < 4) set.add(key(backproject(A.M, c, x, y, z, p))); }
+        for (let y = 2; y < DH - 2; y += 4) for (let x = 2; x < DW - 2; x += 4) { const z = f(raws[y * DW + x]); if (z > .3 && z < 4) { tot++; if (set.has(key(backproject(M, c, x, y, z, p)))) hit++; } }
+        const k = JSON.stringify(c); cal.score.set(k, (cal.score.get(k) || 0) + (tot > 50 ? hit / tot : 0));
+      }
+      cal.pairs++;
+    }
+  }
+  cal.prev = cur;
+  if (cal.pairs >= CAL_PAIRS) {
+    let best = null, bs = -1, second = -1; for (const [k, v] of cal.score) { if (v > bs) { second = bs; bs = v; best = k; } else if (v > second) second = v; }
+    depth.cfg = JSON.parse(best); depth.cfgScore = bs / cal.pairs; cal.locked = true; cal.prev = null;
+    try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {}
+    clearMap(); toast('Depth calibrated (' + Math.round(depth.cfgScore * 100) + '% agreement): scanning');
+  }
 }
 function integrateDepth() {
   const M = depth.meta; depth.meta = null; if (!M) return;
@@ -357,20 +410,23 @@ function integrateDepth() {
     /* the sensor's encoding isn't announced reliably: try each and keep the one that gives sensible room distances */
     const raws = depth.raws || (depth.raws = new Float32Array(DW * DH)); let flagged = 0;
     for (let k = 0; k < DW * DH; k++) { const o = k * 4; raws[k] = lumA ? (B[o] + B[o + 1] * 256) : (B[o] * 65536 + B[o + 1] * 256 + B[o + 2]) / 16777215; if (!lumA && B[o + 3] > 127) { raws[k] *= 32; flagged++; } }
-    const MODES = {
-      mm: rw => rw * r2m,                                                                  // luminance-alpha millimetres
-      metres: rw => rw * M.rvm,                                                           // float metres
-      ndc: rw => rw <= 0 || rw >= 1 ? 0 : isFinite(far) ? 2 * near * far / (far + near - (rw * 2 - 1) * (far - near)) : near / (1 - rw),
-      reversed: rw => rw <= 0 ? 0 : isFinite(far) ? near * far / (near + rw * (far - near)) : near / rw,
-      u16: rw => rw * 65535 * r2m                                                          // 16-bit raw units
-    };
+    const MODES = depthModes(M);
     const cands = lumA ? ['mm'] : flagged ? ['metres'] : ['ndc', 'u16', 'reversed', 'metres'];          // ties go to the earlier, likelier one
     if (!depth.mode || !cands.includes(depth.mode) || depth.frames % 40 === 0) {
       let best = null, bs = -1;
       for (const m of cands) { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } if (sc > bs) { bs = sc; best = m; } }
       depth.mode = best;
     }
-    const f = MODES[depth.mode]; depth.modeName = depth.mode;
+    /* calibration first: nothing goes into the map until the geometry is known */
+    if (!depth.cal.locked && depth.frames > 15) {
+      const plaus = cands.map(m => { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } return [m, sc]; }).sort((a, b) => b[1] - a[1]);
+      const modes = plaus.filter(p => p[1] >= plaus[0][1] * .6).slice(0, 2).map(p => p[0]);
+      calibrateStep(M, raws, modes); depth.frames++;
+      depth.status = depth.cal.locked ? 'calibrated' : 'CALIBRATING ' + depth.cal.pairs + '/' + CAL_PAIRS + ' · look around slowly';
+      return;
+    }
+    if (depth.cfg && depth.cfg.mode && cands.includes(depth.cfg.mode)) depth.mode = depth.cfg.mode;
+    const f = MODES[depth.mode]; depth.modeName = depth.mode + (depth.cfg ? ' · nd' + depth.cfg.nd + (depth.cfg.flip ? ' flip' : '') + ' ' + depth.cfg.src : '');
     for (let k = 0; k < DW * DH; k++) { const z = f(raws[k]); zs[k] = z; if (z > .2 && z < 4.5) valid++; }
     depth.rawSample = raws[(DH >> 1) * DW + (DW >> 1)];
   }
@@ -387,17 +443,19 @@ function integrateDepth() {
     if (!(z > .2 && z < 4.5)) continue;
     const tol = .035 * z;                                           // drop "flying pixels" on depth edges
     if (Math.abs(zs[k - 1] - z) > tol || Math.abs(zs[k + 1] - z) > tol || Math.abs(zs[k - DW] - z) > tol || Math.abs(zs[k + DW] - z) > tol) continue;
-    const u = (x + .5) / DW + j.x, v = (y + .5) / DH + j.y;
-    let vu = n[0] * u + n[4] * v + n[12], vv = n[1] * u + n[5] * v + n[13];
-    if (depth.flipY) vv = 1 - vv;
-    _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(_inv); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
+    const cfg = M.cpu ? CPU_CFG : (depth.cfg || DEF_CFG), src = cfg.src === 'info' && M.projI ? 'info' : 'view';
+    const u = (x + .5) / DW + j.x, v = (y + .5) / DH + j.y; let vu = u, vv = v;
+    if (cfg.nd && M.ndRaw) { const nn = (cfg.nd === 1 ? _ndI.copy(M.ndRaw).invert() : M.ndRaw).elements; vu = nn[0] * u + nn[4] * v + nn[12]; vv = nn[1] * u + nn[5] * v + nn[13]; }
+    if (cfg.flip) vv = 1 - vv;
+    _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(M.cpu ? _inv : src === 'info' ? M.projI : M.projV); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
     _p.multiplyScalar(z / -_p.z);
+    if (!M.cpu) _xf.copy(src === 'info' ? M.xfI : M.xfV);
     /* how squarely the surface faces the sensor, from the depth slope: grazing looks count far less */
     const gx = (zs[k + 1] - zs[k - 1]) / (2 * z * fpx), gy = (zs[k + DW] - zs[k - DW]) / (2 * z * fpy), cosA = 1 / Math.sqrt(1 + gx * gx + gy * gy);
     if (cosA < .3) continue;
     const q = Math.max(0, 1 - z / 4.6) * cosA, w = Math.max(.25, q * q * 3);
     const vx = _p.x, vy = _p.y, vz = _p.z;
-    _p.applyMatrix4(_xf);
+    _p.applyMatrix4(_xf); depth.cam.setFromMatrixPosition(_xf);
     if (inBody(_p.x, _p.y, _p.z)) continue;
     if (M.fwdY < -.6) { if (_p.y > M.head.y + .1) up++; else if (_p.y < M.head.y - .3) down++; }
     const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
@@ -412,7 +470,7 @@ function integrateDepth() {
   }
   /* looking down but the surface lands above your head: the depth image is upside down. Fix it once and start clean */
   if (M.fwdY < -.6 && up + down > 300) { depth.flipVotes = (depth.flipVotes || 0) + (up > down * 2 ? 1 : down > up * 2 ? -1 : 0);
-    if (depth.flipVotes >= 3 && depth.flipAuto < 2) { depth.flipY = !depth.flipY; depth.flipAuto++; depth.flipVotes = 0; clearMap(); toast('Depth image was upside down: corrected automatically'); } }
+    if (false) { depth.flipY = !depth.flipY; depth.flipAuto++; depth.flipVotes = 0; clearMap(); toast('Depth image was upside down: corrected automatically'); } }
   const ms = performance.now() - t0; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
   depth.rate = Math.max(.07, depth.ms * 4 / 1000);                    // keep integration under ~25% of the frame budget
   depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms' + (DR.isInt ? ' · int' : '');
@@ -813,7 +871,7 @@ const BTN = () => [
   { id: 'view', label: ['Points: dots', 'Points: solid', 'Points: hidden'][showMode] },
   { id: 'color', label: colorCam.on ? 'Camera colour: ON' : 'Camera colour: OFF', on: colorCam.on },
   ...(replayMode ? [{ id: 'reality', label: ['Showing: captured', 'Showing: blend', 'Showing: real'][reality], on: true }] : []),
-  { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
+  { id: 'recal', label: 'Recalibrate depth' },
   { id: 'save', label: 'Save scan' },
   { id: 'clear', label: 'Clear map' },
   { id: 'exit', label: 'Exit' }
@@ -861,7 +919,7 @@ async function press(id, frame) {
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s saved room layout (check it is this house)' : 'Ignoring the Quest\'s saved room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; }
-  if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
+  if (id === 'recal') { depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly for a few seconds'); }
   if (id === 'save') saveScan(frame);
   if (id === 'clear') { clearMap(); currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
@@ -910,7 +968,8 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; DR.sync = null; useMeta = false; clearMeta();
+    depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null;
+    try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; useMeta = false; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
     depth.status = hasDepth ? 'starting' : 'NOT GRANTED by the browser (Quest settings > browser permissions; update Horizon OS)';
     depth.diag = 'usage ' + (s.depthUsage || '-') + ' · format ' + (s.depthDataFormat || '-') + ' · feats ' + feats.filter(f => /depth|mesh|plane|anchor|unbounded/.test(f)).join(',');
