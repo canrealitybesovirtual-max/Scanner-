@@ -30,16 +30,30 @@ button.primary{background:var(--accent);color:var(--accent-ink);border-color:var
 button:disabled{opacity:.45;cursor:not-allowed}
 #st{margin-top:12px;font-size:12px;color:var(--muted);min-height:1.4em}
 #scans{margin:14px 0 0;display:flex;flex-direction:column;gap:6px}
-.scan{display:flex;gap:6px;align-items:stretch;flex-wrap:wrap;border-top:1px solid var(--rule);padding-top:8px}
-.scan .n{flex:1 1 100%;padding:2px 0 4px;font-size:13px}
+.scan{display:grid;grid-template-columns:84px 1fr;gap:8px 12px;border-top:1px solid var(--rule);padding-top:10px;align-items:start}
+.scan.live{grid-template-columns:1fr}
+.scan .thumb{width:84px;height:63px;object-fit:cover;background:var(--rule);display:block}
+.scan .n{padding:0;font-size:14px;min-width:0}
 .scan .n small{display:block;color:var(--muted);font-size:11px}
-.scan button{padding:6px 10px;font-size:12px}
+.scan .n .st{color:var(--accent)}
+.scan .acts{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start}
+.scan button{padding:7px 11px;font-size:12px}
+.scan details{position:relative}
+.scan summary{list-style:none;cursor:pointer;border:1px solid var(--rule);padding:7px 11px;font-size:12px;user-select:none}
+.scan summary::-webkit-details-marker{display:none}
+.scan details[open] summary{background:var(--rule)}
+.scan .menu{display:flex;flex-direction:column;gap:4px;position:absolute;left:0;top:calc(100% + 4px);z-index:3;background:var(--card);border:1px solid var(--rule);padding:6px;min-width:16em;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.scan details:last-child .menu{left:auto;right:0}
+#scans:has(details[open]){padding-bottom:15em}
+.scan .menu button{text-align:left}
+.scan button.danger{color:#d9534f;border-color:currentColor}
 #vbar{position:fixed;left:12px;right:12px;top:10px;display:none;gap:8px;z-index:4;align-items:center;flex-wrap:wrap}
 #vbar.on{display:flex}
+body.viewing{background:radial-gradient(ellipse at 50% 35%,#3a4045 0%,#1a1d20 55%,#0d0f10 100%)}
 #vbar span{color:#ddd;text-shadow:0 1px 3px #000;font-size:13px}
 #vbar button{background:rgba(20,22,24,.8);color:#eee;border-color:#444;padding:7px 12px;font-size:13px}
 input[type=file]{display:none}
-.chk{display:block;margin:12px 0 4px;font-size:14px;color:#c9c6bd}.chk input{width:18px;height:18px;vertical-align:-3px;margin-right:6px}
+.chk{display:block;margin:12px 0 4px;font-size:14px;color:var(--ink)}.chk input{width:18px;height:18px;vertical-align:-3px;margin-right:6px}
 </style>
 </head>
 <body>
@@ -52,7 +66,8 @@ input[type=file]{display:none}
     <li>Walk slowly. Look at every surface from 0.5–3 m away, including floors, ceilings, under tables and behind doors.</li>
     <li>Surfaces take on their real colours from the headset camera as you scan. New detail flashes briefly; amber means look again from another angle.</li>
     <li>Left hand holds the control panel. Point and pull the right trigger to press a button.</li>
-    <li>Saves stay in this browser on the headset. Export a file to keep a copy.</li>
+    <li>Scan room by room. Scans that overlap (a doorway, a rescan) join into one house by themselves after you finish.</li>
+    <li>Saves stay in this browser on the headset. Use Export on a scan to keep a copy.</li>
   </ul>
   <div class="btns">
     <button id="bAR" class="primary" type="button" disabled>Checking headset…</button>
@@ -64,7 +79,7 @@ input[type=file]{display:none}
   <div id="scans"></div>
   <div id="st"></div>
 </div></div>
-<div id="vbar"><button id="vBack" type="button">← Back</button><button id="vSurf" type="button">Show points</button><span id="vInfo"></span></div>
+<div id="vbar"><button id="vBack" type="button">← Back</button><button id="vSurf" type="button">Show points</button><button id="vCut" type="button">Cut away ceiling</button><button id="vTop" type="button">Top view</button><span id="vInfo"></span></div>
 
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
 <script type="module">
@@ -147,9 +162,10 @@ pg.setDrawRange(0, 0);
 /* point styles: 0 = scan dots (small, see-through, your real room stays visible), 1 = solid 2 cm tiles, 2 = photo walk-through */
 const pmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false,
-  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, nearCut: { value: .35 }, zones: { value: Array.from({ length: 8 }, () => new THREE.Vector4()) }, nz: { value: 0 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; attribute float tl; uniform vec4 zones[8]; uniform int nz; uniform float nearCut; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC, vVC, vVN; varying float ok, va, vPS, vR;
-    void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
+  uniforms: { cutY: { value: 1e9 }, time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, nearCut: { value: .35 }, zones: { value: Array.from({ length: 8 }, () => new THREE.Vector4()) }, nz: { value: 0 } },
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; attribute vec3 nrm; attribute float tl; uniform vec4 zones[8]; uniform int nz; uniform float nearCut; uniform float time, scale, size, minC, floorY, photo, style, cutY; varying vec3 vC, vVC, vVN; varying float ok, va, vPS, vR;
+    void main(){ if ((modelMatrix * vec4(position, 1.0)).y > cutY) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }   // viewer: ceiling cut away
+      vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
       float d = -mv.z, fresh = exp(-(time - born) * 1.6);
       ok = step(style < .5 ? 3.0 : minC, cnt) * step(nearCut, d) * (photo > .5 ? 1.0 : 1.0 - tl);
       for (int i = 0; i < 8; i++) if (i < nz && distance(position, zones[i].xyz) < zones[i].w) ok = 0.0;   // a detail scan owns this space                                           // dots: confirmed points only                                                                // nothing right in front of your eyes
@@ -279,10 +295,10 @@ for (let i = 0; i < 7; i++) tileGeo.setAttribute('iT' + i, new THREE.InstancedBu
 tileGeo.setAttribute('iBorn', new THREE.InstancedBufferAttribute(tileBorn, 1).setUsage(THREE.DynamicDrawUsage));
 const tmat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, side: THREE.DoubleSide,
-  uniforms: { time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, zones: pmat.uniforms.zones, nz: pmat.uniforms.nz },
-  vertexShader: `uniform vec4 zones[8]; uniform int nz; attribute uvec4 iT0, iT1, iT2, iT3, iT4, iT5, iT6; attribute float iBorn; uniform float time, floorY, photo, style;
+  uniforms: { cutY: pmat.uniforms.cutY, time: { value: 0 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 }, zones: pmat.uniforms.zones, nz: pmat.uniforms.nz },
+  vertexShader: `uniform vec4 zones[8]; uniform int nz; attribute uvec4 iT0, iT1, iT2, iT3, iT4, iT5, iT6; attribute float iBorn; uniform float time, floorY, photo, style, cutY;
     flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
-    void main(){ vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * viewMatrix * wp;
+    void main(){ vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * viewMatrix * wp; if (wp.y > cutY) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
       t0 = iT0; t1 = iT1; t2 = iT2; t3 = iT3; t4 = iT4; t5 = iT5; t6 = iT6;
       vec3 n = normalize(mat3(instanceMatrix)[2]); vSz = vec2(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz)); vUv = uv;
       float h = clamp((wp.y - floorY) / 2.7, 0.0, 1.0); vFr = exp(-max(0.0, time - iBorn) * 1.4);
@@ -1510,7 +1526,7 @@ const DB = (() => {
     delDepth: id => tx('depth', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; }),
     putIfSame: rec => tx('scans', 'readwrite', s => { const out = { result: false }, g = s.get(rec.id); g.onsuccess = () => { const cur = g.result; if (cur && cur.date === rec.date) { s.put(rec); out.result = true; } }; return out; }),   // one transaction: no newer save can slip in between
     adopt: (from, to) => Promise.all(['frames', 'depth'].map(st => tx(st, 'readwrite', s => { const q = s.index('scan').openCursor(IDBKeyRange.only(from)); q.onsuccess = () => { const c = q.result; if (!c) return; const v = Object.assign({}, c.value, { scan: to, k: to + c.value.k.slice(from.length) }); s.put(v); c.delete(); c.continue(); }; return null; }))),
-    depthKeys: id => tx('depth', 'readonly', s => s.index('scan').getAllKeys(id)), getFrame: k => tx('frames', 'readonly', s => s.get(k)), getDepth: k => tx('depth', 'readonly', s => s.get(k)),
+    depthKeys: id => tx('depth', 'readonly', s => s.index('scan').getAllKeys(id)), firstFrame: id => tx('frames', 'readonly', s => { const out = { result: null }, q = s.index('scan').openCursor(IDBKeyRange.only(id)); q.onsuccess = () => { if (q.result) out.result = q.result.value; }; return out; }), getFrame: k => tx('frames', 'readonly', s => s.get(k)), getDepth: k => tx('depth', 'readonly', s => s.get(k)),
     delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
   };
 })();
@@ -2303,7 +2319,7 @@ const SLOT = i => `if (phOn[${i}] > .5) { vec4 e = phV[${i}] * vec4(vW, 1.0); fl
 function ibrMaterial(useMap, map) {
   return new THREE.ShaderMaterial({ side: THREE.DoubleSide, transparent: true, vertexColors: !useMap, defines: useMap ? { IBR_MAP: 1 } : {},
     uniforms: { baseMap: { value: map || null }, ph: { value: ibr.slots.map(s => s.tex) }, sh: { value: ibr.slots.map(s => s.rt.texture) }, phV: { value: ibr.slots.map(s => s.view) }, phI: { value: ibr.slots.map(s => s.intr) },
-      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, phF: { value: [0, 0, 0, 0, 0, 0] }, phK: { value: [0, 0, 0, 0, 0, 0] }, opacity: { value: 1 } },
+      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, phF: { value: [0, 0, 0, 0, 0, 0] }, phK: { value: [0, 0, 0, 0, 0, 0] }, opacity: { value: 1 }, cutY: { value: 1e9 } },
     vertexShader: `varying vec3 vW; varying vec2 vUv2; varying vec3 vC2; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
       #ifdef IBR_MAP
       vUv2 = uv;
@@ -2311,9 +2327,9 @@ function ibrMaterial(useMap, map) {
       vC2 = color;
       #endif
       gl_Position = projectionMatrix * viewMatrix * w; }`,
-    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float phF[6]; uniform float phK[6]; uniform float opacity;
+    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float phF[6]; uniform float phK[6]; uniform float opacity; uniform float cutY;
       varying vec3 vW; varying vec2 vUv2; varying vec3 vC2;
-      void main(){ vec3 acc = vec3(0.0); float ws = 0.0;
+      void main(){ if (vW.y > cutY) discard; vec3 acc = vec3(0.0); float ws = 0.0;
         ${[0, 1, 2, 3, 4, 5].map(SLOT).join('\n')}
         #ifdef IBR_MAP
         vec3 base = texture2D(baseMap, vUv2).rgb;
@@ -2379,7 +2395,7 @@ function ibrUpdate(eyeCam) {                                         // pick the
   const kAct = ibr.k || IBR_K;
   for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k]; sl.fade = Math.min(1, (sl.fade || 0) + 1 / 20); }       // ~1/3 s fade-in for a newly loaded photo
   const mats = ibr.live ? (liveIbrMat ? [liveIbrMat] : []) : meshG.children.filter(o => o.userData.ibr).map(o => o.material);
-  for (const mt of mats) { const U = mt.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = ibr.live ? .9 : meshMat.opacity; mt.depthWrite = ibr.live ? true : meshMat.depthWrite; }
+  for (const mt of mats) { const U = mt.uniforms; U.cutY.value = viewer.on && viewer.cut ? viewer.cutY : 1e9; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = ibr.live ? .9 : meshMat.opacity; mt.depthWrite = ibr.live ? true : meshMat.depthWrite; }
   if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
   const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
   const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k, F]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
@@ -2949,6 +2965,10 @@ const hud = (() => {
   mesh.renderOrder = 60; scene.add(mesh); mesh.visible = false;
   return { c, g: c.getContext('2d'), t, mesh, key: '', moving: true, want: new V3(), eye: new V3() };
 })();
+function fitText(g, t, x, y, w, px, minPx, weight = '') {             // shrink a long line to fit, then trim with … (never cut mid-panel)
+  t = String(t); let f = px; g.font = weight + f + 'px system-ui, sans-serif'; while (f > minPx && g.measureText(t).width > w) { f--; g.font = weight + f + 'px system-ui, sans-serif'; }
+  if (g.measureText(t).width > w) { let a = 0, b = t.length; while (b - a > 1) { const m = (a + b) >> 1; if (g.measureText(t.slice(0, m) + '…').width <= w) a = m; else b = m; } t = t.slice(0, a) + '…'; }
+  g.fillText(t, x, y); }
 function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
 function followHud(dt) {                                         // trails your gaze gently and settles, so it never swims with your head
   const xc = renderer.xr.getCamera(); xc.getWorldPosition(hud.eye); hud.want.set(0, -.22, -.8).applyQuaternion(xc.getWorldQuaternion(_hq)).add(hud.eye);
@@ -2967,24 +2987,25 @@ function drawHud() {
   g.fillStyle = ph.cal ? '#f0d58a' : ph.title === 'Scanning' ? '#7fe3f0' : '#e8e6df';
   g.beginPath(); g.arc(58, 64, 12 + (ph.title === 'Scanning' ? 2 : 0), 0, 7); g.fill();
   g.font = '600 34px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(ph.title, 92, 54);
-  g.font = '26px system-ui, sans-serif'; g.fillStyle = toastT > 0 ? '#f0d58a' : '#b9c6cc'; g.fillText(show.slice(0, 48), 92, 92);
+  g.fillStyle = toastT > 0 ? '#f0d58a' : '#b9c6cc'; fitText(g, show, 92, 92, 768 - 92 - 40, 26, 19);
   if (ph.p != null) { rr(g, 560, 50, 170, 14, 7); g.fillStyle = 'rgba(255,255,255,.14)'; g.fill(); rr(g, 560, 50, Math.max(14, 170 * ph.p), 14, 7); g.fillStyle = ph.cal ? '#f0d58a' : '#7fe3f0'; g.fill(); }
   hud.t.needsUpdate = true;
 }
 function drawPanel() {
   const g = panel.g, W = 640, H = 800, ph = scanPhase();
+  const fit = (t, w) => { t = String(t); if (g.measureText(t).width <= w) return t; let a = 0, b = t.length; while (b - a > 1) { const m = (a + b) >> 1; if (g.measureText(t.slice(0, m) + '…').width <= w) a = m; else b = m; } return t.slice(0, a) + '…'; };   // never run off the panel
   const key = [page, panel.hover, ph.title, ph.sub, ph.p == null ? -1 : Math.round(ph.p * 100), confirmed >> 11, kf.n, lastSave ? Math.round((Date.now() - lastSave) / 5000) : 0, toastT > 0 ? toastMsg : '', scanErr, BTN().map(b => b.label).join(), page ? Math.floor(clockT) : 0].join('|');
   if (key === panel.key) return; panel.key = key; g.clearRect(0, 0, W, H);
   rr(g, 2, 2, W - 4, H - 4, 34); g.fillStyle = 'rgba(16,18,22,.94)'; g.fill();
   g.font = '600 34px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(ph.title, 32, 62);
-  g.font = '23px system-ui, sans-serif'; g.fillStyle = '#b9c6cc'; g.fillText(ph.sub.slice(0, 44), 32, 98);
+  g.fillStyle = '#b9c6cc'; fitText(g, ph.sub, 32, 98, W - 64, 23, 17);
   if (ph.p != null) { rr(g, 32, 118, W - 64, 12, 6); g.fillStyle = 'rgba(255,255,255,.12)'; g.fill(); rr(g, 32, 118, Math.max(12, (W - 64) * ph.p), 12, 6); g.fillStyle = ph.cal ? '#f0d58a' : '#7fe3f0'; g.fill(); }
   panel.buttons = []; const bs = BTN();
   if (page === 0) {
     g.font = '21px system-ui, sans-serif'; g.fillStyle = '#8a979d';
     const st = [confirmed.toLocaleString() + ' points', kf.n + ' photos', lastSave ? 'saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : 'not saved yet'];
     g.fillText(st.join('  ·  '), 32, 168);
-    if (scanErr) { g.fillStyle = '#ff8a7a'; g.fillText(('Problem: ' + scanErr).slice(0, 46), 32, 198); }
+    if (scanErr) { g.fillStyle = '#ff8a7a'; fitText(g, 'Problem: ' + scanErr, 32, 198, W - 64, 21, 15); }
     const pit = Math.min(98, Math.floor(540 / bs.length)), h = pit - 14;
     bs.forEach((b, i) => { const x = 32, y = 220 + i * pit, w = W - 64; panel.buttons.push({ ...b, x, y, w, h });
       rr(g, x, y, w, h, 22); g.fillStyle = panel.hover === i ? '#2e7d8b' : b.on ? '#1f525c' : '#262b30'; g.fill();
@@ -3000,13 +3021,13 @@ function drawPanel() {
       'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') + ' · exposure ×' + (depth.expGain || 1).toFixed(2) : ''),
             ...(scanErr ? ['ERROR   ' + scanErr] : [])
     ];
-    diag.forEach((l, i) => { g.fillStyle = /^ERROR/.test(l) ? '#ff8a7a' : '#8fc4ce'; g.fillText(l.slice(0, 60), 32, 166 + i * 24); });
+    diag.forEach((l, i) => { g.fillStyle = /^ERROR/.test(l) ? '#ff8a7a' : '#8fc4ce'; g.fillText(fit(l, W - 56), 32, 166 + i * 24); });
     const bw = 280, rows = Math.ceil(bs.length / 2), pit = Math.min(82, Math.floor(420 / rows)), bh = pit - 12;
     bs.forEach((b, i) => { const x = 32 + (i % 2) * (bw + 16), y = 340 + Math.floor(i / 2) * pit; panel.buttons.push({ ...b, x, y, w: bw, h: bh });
       rr(g, x, y, bw, bh, 18); g.fillStyle = panel.hover === i ? '#2e7d8b' : b.on ? '#1f525c' : '#262b30'; g.fill();
       g.font = '24px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 22, y + bh * .64); });
   }
-  if (toastT > 0) { g.font = '21px system-ui, sans-serif'; g.fillStyle = '#f0d58a'; g.fillText(toastMsg.slice(0, 50), 32, 786); }
+  if (toastT > 0) { g.font = '21px system-ui, sans-serif'; g.fillStyle = '#f0d58a'; fitText(g, toastMsg, 32, 786, W - 64, 21, 16); }
   panel.t.needsUpdate = true;
 }
 function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.gamepad.hapticActuators && src.gamepad.hapticActuators[0]; if (a) a.pulse(k, ms); } catch (e) {} }
@@ -3102,7 +3123,7 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); tune.on = false; pendingLoad = null; relocate = null; setTimeout(() => { const ids = [...autoPending]; autoPending.clear(); ids.forEach(autoEnqueue); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan().catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); tune.on = false; pendingLoad = null; relocate = null; setTimeout(() => { const ids = [...autoPending]; autoPending.clear(); ids.forEach(autoEnqueue); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan().catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); setTimeout(clear2D, 50); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
@@ -3137,7 +3158,7 @@ function purgeScan(x, full) { queueAnchorDelete(x.anchor && x.anchor.uuid, full,
 const fresh = async (r) => { if (autoRun.cur === r.id || autoQ.includes(r.id)) throw new Error('still processing this scan: wait for Ready'); const x = await DB.get(r.id); if (!x) throw new Error('scan no longer exists'); return x; };
 function listRows(el, all, lives) {
   for (const L of lives) { const ex = all.find(r => r.id === L.id); if (ex && ex.date >= L.at) { DB.delLive(L.id).catch(() => {}); continue; }
-    const row = document.createElement('div'); row.className = 'scan'; const n = document.createElement('div'); n.className = 'n'; n.textContent = (ex ? ex.name + ': newer unsaved scanning' : (L.name || 'Scan') + ': unsaved (the session ended early)');
+    const row = document.createElement('div'); row.className = 'scan live'; const n = document.createElement('div'); n.className = 'n'; n.textContent = (ex ? ex.name + ': newer unsaved scanning' : (L.name || 'Scan') + ': unsaved (the session ended early)');
     const sm = document.createElement('small'); sm.textContent = new Date(L.at).toLocaleString() + ' · ' + L.tsdf.keys.length + ' surface blocks · ' + (L.photos || 0) + ' photos'; n.appendChild(sm); row.appendChild(n);
     const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Recover'; b.addEventListener('click', () => recoverLive(L, ex).catch(e => $('st').textContent = 'Recover failed: ' + e.message)); row.appendChild(b);
     const d2 = document.createElement('button'); d2.type = 'button'; d2.textContent = 'Discard'; d2.addEventListener('click', async () => { await DB.delLive(L.id); listScans(); }); row.appendChild(d2); el.appendChild(row); }
@@ -3145,11 +3166,20 @@ function listRows(el, all, lives) {
   const h = document.createElement('div'); h.className = 'sub'; h.style.margin = '6px 0 0'; h.textContent = 'Saved on this device'; el.appendChild(h);
   for (const r of all) {
     const row = document.createElement('div'); row.className = 'scan';
+    const th = document.createElement('img'); th.className = 'thumb'; th.alt = ''; row.appendChild(th);
+    DB.firstFrame(r.id).then(f => { if (f && f.blob) { const u = URL.createObjectURL(f.blob); th.onload = () => URL.revokeObjectURL(u); th.src = u; } }).catch(() => {});
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
-    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : '') + (r.merged && r.merged.auto ? ' · joined automatically' : ''); n.appendChild(sm); row.appendChild(n);
-    const as = document.createElement('small'); as.dataset.auto = r.id; as.style.display = 'block'; as.style.color = '#7fe3f0'; as.textContent = r.auto ? (r.auto.error ? 'Processing stopped: ' + r.auto.error : 'Ready: ' + (r.refined ? 'refined, ' : '') + 'meshed' + (r.photoAlign ? ', photos matched' : '') + (r.tex ? ', photo-textured' : '') + ' ✓') : autoMsg.get(r.id) || ''; row.appendChild(as);
+    sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' points' + (r.anchor && r.anchor.m ? ' · anchored' : '') + (r.merged && r.merged.auto ? ' · joined automatically' : ''); n.appendChild(sm); row.appendChild(n);
+    DB.countFrames(r.id).then(k => { if (k) sm.textContent += ' · ' + k + ' photos'; }).catch(() => {});
+    const as = document.createElement('small'); as.dataset.auto = r.id; as.className = 'st'; as.textContent = r.auto ? (r.auto.error ? 'Processing stopped: ' + r.auto.error : 'Ready: ' + (r.refined ? 'refined, ' : '') + 'meshed' + (r.photoAlign ? ', photos matched' : '') + (r.tex ? ', photo-textured' : '') + ' ✓') : autoMsg.get(r.id) || ''; n.appendChild(as);
     if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
-    const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
+    const acts = document.createElement('div'); acts.className = 'acts'; const menus = {};
+    const menu = (title) => { const d = document.createElement('details'), su = document.createElement('summary'), m = document.createElement('div'); su.textContent = title; m.className = 'menu'; d.append(su, m); menus[title] = { d, m }; return m; };
+    const GROUP = { '.json': 'Export', '.ply': 'Export', '.glb': 'Export', 'Photos .zip': 'Export', 'Floor plan': 'Export', 'Merge with…': 'More', 'Refine': 'More', 'Match photos': 'More', 'Photo texture': 'More', 'Rename': 'More', 'Delete': 'More' };
+    const LABEL = { '.glb': '3D model (.glb)', '.ply': 'Points (.ply)', '.json': 'Full backup (.json)', 'Photos .zip': 'Photos + camera poses (.zip)', 'Floor plan': 'Floor plan with room sizes (.svg)', 'Merge with…': 'Join with another scan…', 'Refine': 'Refine again', 'Match photos': 'Re-match photos', 'Photo texture': 'Re-make photo texture', 'Continue scanning': 'Continue scanning' };
+    const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = LABEL[label] || label; b.addEventListener('click', e => { const d = b.closest('details'); if (d) d.open = false; fn(e); });
+      if (label === 'Walk through') b.className = 'primary'; if (label === 'Delete') b.className = 'danger';
+      const g = GROUP[label]; if (g) (menus[g] ? menus[g].m : menu(g)).appendChild(b); else acts.appendChild(b); };
     mk('Walk through', () => { pendingOpen = r; replayMode = true; if (!$('bAR').disabled) $('bAR').click(); else { replayMode = false; $('st').textContent = 'Walking through needs the Quest browser. Use View here.'; } });
     mk('Photos .zip', () => exportPhotos(r));
     mk('Continue scanning', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
@@ -3168,11 +3198,15 @@ function listRows(el, all, lives) {
       catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (!nm) return; try { const x = await fresh(r); x.name = nm; x.date = Date.now(); await DB.put(x); listScans(); } catch (e) { $('st').textContent = 'Rename: ' + e.message; } });
     mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor) queueAnchorDelete(r.anchor.uuid, listScans.full || [], r.id); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
+    const ORDER = ['3D model (.glb)', 'Floor plan with room sizes (.svg)', 'Photos + camera poses (.zip)', 'Points (.ply)', 'Full backup (.json)', 'Join with another scan…', 'Rename', 'Refine again', 'Re-match photos', 'Re-make photo texture', 'Delete'];
+    for (const g of ['Export', 'More']) if (menus[g]) { [...menus[g].m.children].sort((a, b) => ORDER.indexOf(a.textContent) - ORDER.indexOf(b.textContent)).forEach(b => menus[g].m.appendChild(b)); acts.appendChild(menus[g].d); }
+    row.appendChild(acts);
     el.appendChild(row);
   }
 }
+function applyCut() { const on = viewer.on && viewer.cut; renderer.clippingPlanes = on ? [new THREE.Plane(new V3(0, -1, 0), viewer.cutY)] : []; pmat.uniforms.cutY.value = on ? viewer.cutY : 1e9; if (typeof fmat !== 'undefined') fmat.uniforms.cutY.value = pmat.uniforms.cutY.value; }
 function openViewer(rec) {
-  closeViewer(); viewer.on = true; viewer.id = rec.id; renderer.setClearColor(0x111315, 1);
+  closeViewer(); viewer.on = true; viewer.id = rec.id; renderer.setClearColor(0, 0); document.body.classList.add('viewing');
   const g = new THREE.Group(); viewer.group = g; scene.add(g);
   clearMap(); currentId = null; pmat.uniforms.floorY.value = rec.floorY || 0; mergeRecord(rec, new M4()); flushGeo();
   showMode = 1; pmat.uniforms.style.value = 1; pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = CONF; pmat.depthWrite = true; tmat.depthWrite = true; pmat.needsUpdate = tmat.needsUpdate = true;
@@ -3180,23 +3214,32 @@ function openViewer(rec) {
   const n = rec.points.length / 3, geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(rec.points, 3)); geo.computeBoundingBox();
   if (false) for (const m of rec.meshes) { const mg = new THREE.BufferGeometry(); mg.setAttribute('position', new THREE.BufferAttribute(m.v, 3)); mg.setIndex(new THREE.BufferAttribute(m.i, 1)); const o = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ color: LABEL_COL[m.label] || 0x7fd0e0, wireframe: true, transparent: true, opacity: .08 })); o.matrixAutoUpdate = false; o.matrix.fromArray(m.m); g.add(o); }
   if (false) for (const p of rec.planes) { if (!p.poly || p.poly.length < 3) continue; const pts = p.poly.map(q => new V3(q.x, 0, q.z)); pts.push(pts[0].clone()); const o = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: LABEL_COL[p.label] || LABEL_COL.other })); o.matrixAutoUpdate = false; o.matrix.fromArray(p.m); g.add(o); }
-  const bb = geo.boundingBox; if (bb && isFinite(bb.min.x)) { bb.getCenter(viewer.target); viewer.dist = Math.max(3, bb.getSize(new V3()).length() * .8); }
+  { const P = rec.points, st = Math.max(1, Math.floor(n / 20000)), xs = [], ys = [], zs = []; for (let i = 0; i < n; i += st) { xs.push(P[i * 3]); ys.push(P[i * 3 + 1]); zs.push(P[i * 3 + 2]); }   // frame the house, not stray far points
+    const q = (A, f) => { A.sort((a, b) => a - b); return A[Math.min(A.length - 1, Math.floor(A.length * f))] || 0; };
+    if (xs.length) { const x0 = q(xs, .01), x1 = q(xs, .99), y0 = q(ys, .01), y1 = q(ys, .99), z0 = q(zs, .01), z1 = q(zs, .99);
+      viewer.target.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2); viewer.ext = Math.hypot(x1 - x0, z1 - z0); viewer.dist = Math.max(2.5, viewer.ext * .9);
+      viewer.cutY = Math.min(y1 - .3, (rec.floorY || y0) + 2.05); viewer.cut = y1 - y0 > 1.6 && viewer.ext > 2.5; viewer.pitch = viewer.cut ? .85 : .5; } }   // whole rooms: open like a dollhouse
+  applyCut(); $('vCut').textContent = viewer.cut ? 'Show ceiling' : 'Cut away ceiling';
   cloud.visible = true; layout.visible = false; applySurf();
   $('ui').classList.add('hide'); $('vbar').classList.add('on'); const info = rec.name + ' · ' + n.toLocaleString() + ' points · drag to orbit, scroll or pinch to zoom';
   $('vInfo').textContent = info + ' · building surface…';
   recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); ibrStart(rec, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = tune.saved ? tune.saved.showMode : 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
+document.addEventListener('click', e => document.querySelectorAll('.scan details[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }));   // one menu open at a time
+function clear2D() { renderer.setRenderTarget(null); renderer.setClearColor(0, 0); renderer.clear(); }   // the start page shows its own background, not the last 3D frame
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = tune.saved ? tune.saved.showMode : 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; viewer.cut = false; applyCut(); document.body.classList.remove('viewing'); renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; requestAnimationFrame(clear2D); }
 $('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
   download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
+$('vCut').addEventListener('click', () => { viewer.cut = !viewer.cut; applyCut(); $('vCut').textContent = viewer.cut ? 'Show ceiling' : 'Cut away ceiling'; });
+$('vTop').addEventListener('click', () => { const top = viewer.pitch < 1.3; viewer.pitch = top ? 1.52 : .85; if (top) { viewer.dist = Math.max(3, (viewer.ext || 5) * 1.15); if (!viewer.cut) $('vCut').click(); } $('vTop').textContent = top ? 'Angled view' : 'Top view'; });
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
 const cv = renderer.domElement, ptrs = new Map();
 cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.setPointerCapture(e.pointerId); });
 cv.addEventListener('pointermove', e => {
   if (!viewer.on || !ptrs.has(e.pointerId)) return; const p = ptrs.get(e.pointerId);
-  if (ptrs.size === 1) { viewer.yaw -= (e.clientX - p.x) * .006; viewer.pitch = Math.max(-1.4, Math.min(1.4, viewer.pitch + (e.clientY - p.y) * .006)); }
+  if (ptrs.size === 1) { viewer.yaw -= (e.clientX - p.x) * .006; viewer.pitch = Math.max(-1.4, Math.min(1.55, viewer.pitch + (e.clientY - p.y) * .006)); }
   else if (ptrs.size === 2) { const [a, b] = [...ptrs.values()], d0 = Math.hypot(a.x - b.x, a.y - b.y); p.x = e.clientX; p.y = e.clientY; const [c, d] = [...ptrs.values()], d1 = Math.hypot(c.x - d.x, c.y - d.y); viewer.dist = Math.max(.5, viewer.dist * d0 / Math.max(1, d1)); return; }
   p.x = e.clientX; p.y = e.clientY;
 });
