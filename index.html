@@ -591,16 +591,18 @@ function camFrame(vp, forWorker) {
   if (performance.now() - c.t > 90 || !c.data) { c.ctx.drawImage(c.video, 0, 0, c.w, c.h); c.data = c.ctx.getImageData(0, 0, c.w, c.h).data; c.t = performance.now(); }
   return { data: c.data, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy };
 }
+function motionTick(vp, tNow) {                                    // head speed, every frame (not only when a depth frame is taken)
+  const m = vp.transform.matrix, q = new THREE.Quaternion().setFromRotationMatrix(new M4().fromArray(m)), pos = new V3(m[12], m[13], m[14]), mo = depth.motion || (depth.motion = { q: q.clone(), p: pos.clone(), t: tNow, spin: 0, lin: 0 });
+  const dt = tNow - mo.t; if (dt < 1e-3) return; const a = Math.min(1, dt / .08);           // ~80 ms smoothing, frame-rate independent
+  mo.spin += (mo.q.angleTo(q) / dt - mo.spin) * a; mo.lin += (mo.p.distanceTo(pos) / dt - mo.lin) * a; mo.q.copy(q); mo.p.copy(pos); mo.t = tNow;
+  const moving = mo.spin > .45 || mo.lin > .6; depth.steady = !moving; depth.movingNow = moving; depth.tooFast = mo.spin > 1.2 || mo.lin > 1.5 || (moving && !depth.lagOK);
+}
 function sampleDepth(frame, ref, session, tNow) {
   if ((!depth.binding && !depth.cpu) || !scanning || DR.sync || depth.meta) return;
   const vp = frame.getViewerPose(ref); if (!vp) return;
-  /* the depth image trails the head slightly: integrating while you turn smears surfaces into streaks, so only take it when you're steady */
-  { const m = vp.transform.matrix, q = new THREE.Quaternion().setFromRotationMatrix(new M4().fromArray(m)), pos = new V3(m[12], m[13], m[14]), mo = depth.motion || (depth.motion = { q: q.clone(), p: pos.clone(), t: tNow, spin: 0, lin: 0 });
-    const dt = Math.max(1e-3, tNow - mo.t); mo.spin = mo.spin * .6 + (mo.q.angleTo(q) / dt) * .4; mo.lin = mo.lin * .6 + (mo.p.distanceTo(pos) / dt) * .4; mo.q.copy(q); mo.p.copy(pos); mo.t = tNow;
-    const moving = mo.spin > .45 || mo.lin > .6, canMove = depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15 && !depth.noWorker && !depth.cpu;
-    depth.tooFast = mo.spin > 1.2 || mo.lin > 1.5 || (moving && !depth.lagOK);
-    if (moving && (!canMove || mo.spin > 1.2 || mo.lin > 1.5)) { depth.steady = false; return; }   // moving frames only once the lag is measured (or to measure it)
-    depth.steady = !moving; depth.movingNow = moving; }
+  /* the depth image trails the head slightly: integrating while you turn smears surfaces into streaks, so only take it when you're steady (motionTick keeps this current every frame) */
+  { const mo = depth.motion; if (!mo) return; const moving = mo.spin > .45 || mo.lin > .6, canMove = depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15 && !depth.noWorker && !depth.cpu;
+    if (moving && (!canMove || mo.spin > 1.2 || mo.lin > 1.5)) return; }   // moving frames only once the lag is measured (or to measure it)
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   const freeze = (extra) => Object.assign({
     tNow, xf: new M4().fromArray(((info && info.transform) || view.transform).matrix), inv: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).invert(),
@@ -1393,6 +1395,7 @@ async function saveScan(frame) {
     } catch (e) { rec.anchor = null; }
   }
   await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed; autoEnqueue(rec.id);
+  if (navigator.storage && navigator.storage.persist && !saveScan.persisted) { saveScan.persisted = true; navigator.storage.persist().then(ok => diagLog('storage', ok ? 'persistent' : 'may be evicted')).catch(() => {}); }   // stop the browser deleting scans when space runs low
   toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
 }
 let pendingLoad = null;                                     // waits for the anchor to be found again
@@ -1481,11 +1484,11 @@ async function photoDepths(rec, frames, say, raw, scale) {
     if (!rt || rt.width !== w || rt.height !== h) { if (rt) rt.dispose(); rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.FloatType }); }
     cam.projectionMatrix.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
     cam.matrixWorld.fromArray(f.m); cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
-    renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(sc2, cam);
+    const xrEn = renderer.xr.enabled; renderer.xr.enabled = false; renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(sc2, cam); renderer.xr.enabled = xrEn;
     const px = new Float32Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
     const mm = new Uint16Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = px[((h - 1 - y) * w + x) * 4]; mm[y * w + x] = v > .05 && v < 60 ? Math.round(v * 1000) : 0; }   // top row first, like the photo
     out.push(raw ? { w, h, mm } : await png16(w, h, mm)); if (i % 8 === 7) await new Promise(r => setTimeout(r, 0)); }
-  renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose(); sc2.traverse(o => o.geometry && o.geometry.dispose());
+  renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose();   // (restores the headset's own target) sc2.traverse(o => o.geometry && o.geometry.dispose());
   return out;
 }
 async function exportPhotos(rec) {
@@ -1968,6 +1971,8 @@ async function alignPhotos(rec, say = () => {}) {
       depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }); });
   w.terminate();
   if (!(res.edge1 < res.edge0 - .05 || res.rms1 < res.rms0)) throw new Error('photo matching did not improve (edges ' + (res.edge0 || 0).toFixed(2) + ' px, colour ' + res.rms0.toFixed(3) + ')');
+  { const Em = new M4().fromArray(res.E), off = new V3().setFromMatrixPosition(Em).length(), rot = new THREE.Quaternion().setFromRotationMatrix(Em).angleTo(new THREE.Quaternion()) * 180 / Math.PI;
+    if (off > .1 || rot > 6 || Math.abs(res.s) > .18) throw new Error('implausible camera calibration rejected (' + (off * 100).toFixed(0) + ' cm, ' + rot.toFixed(1) + '°)'); }
   for (const p of res.photos) { const f = frames[p.k];
     if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
     f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.k1 = p.k1; f.gain = p.gain; f.aligned = true; await DB.putFrame(f); }
@@ -1975,7 +1980,7 @@ async function alignPhotos(rec, say = () => {}) {
   try { localStorage.setItem('scanner.camCal', JSON.stringify({ E: res.E, s: res.s, cx: res.cx, cy: res.cy, k1: res.k1, at: Date.now() })); } catch (e) {}
   colorCam.E = new M4().fromArray(res.E); const fp = res.photos[res.photos.length - 1]; colorCam.f = 1 / Math.tan(fp.hfov / 2); colorCam.cx = fp.cx; colorCam.cy = fp.cy; colorCam.k1 = res.k1 || 0; colorCam.aligned = true;
   rec.photoAlign = { at: Date.now(), rms0: res.rms0, rms1: res.rms1, edge0_px: res.edge0, edge1_px: res.edge1, used: res.used, offset_cm: Math.hypot(res.E[12], res.E[13], res.E[14]) * 100 };
-  delete rec.tex; await putIfSame(rec);
+  if (!rec.live) { delete rec.tex; await putIfSame(rec); }
   return res;
 }
 
@@ -2157,6 +2162,14 @@ async function relocTick() {
   R.last = res;
   if (res.ok) { relocate = null; finishContinue(R.rec, new M4().fromArray(res.A)); toast('Found your last scan · ' + Math.round(res.overlap * 100) + '% overlap'); diagLog('reloc', JSON.stringify({ fit: res.wallFit, ratio: res.ratio, overlap: res.overlap, tries: R.tries })); return; }
   if (R.tries > 30 && R.guess) { relocate = null; finishContinue(R.rec, R.guess); toast('Using the saved anchor (walls did not confirm it)'); }
+}
+function onRefReset(ev) {                                          // Quest re-centred or lost tracking: the headset's world jumped
+  poseHist.length = 0; camPoseHist.length = 0; depth.motion = null; kf.has = false; diagLog('tracking', 'reference space reset' + (ev.transform ? ' (with transform)' : ' (no transform)'));
+  if (ev.transform) { setD(Dm.clone().multiply(new M4().fromArray(ev.transform.matrix))); toast('Tracking re-centred: your scan stayed in place'); return; }   // old = T·new, so D' = D·T
+  if (!scanning || replayMode || confirmed < 2000) { clearMap(); toast('Tracking was reset: starting fresh here'); return; }
+  toast('Tracking was reset: saving, then re-finding your place…'); scanning = false;
+  saveScan(lastFrame).then(async () => { const rec = await DB.get(currentId); clearMap(); cont = null; sessionT0 = Date.now(); relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null }; scanning = true; })
+    .catch(e => { scanning = true; toast('Could not save after the reset: ' + e.message); });
 }
 function finishContinue(rec, A) { mergeRecord(Object.assign({}, rec, { D: null }), A); }   // A: saved map frame -> this map frame
 
@@ -2400,6 +2413,7 @@ const BTN = () => page === 0 ? [
   { id: 'save', label: 'Save', big: true },
   { id: 'finish', label: 'Finish & save', on: true, big: true },
   ...(replayMode ? [{ id: 'reality', label: ['Captured', 'Blend', 'Real room'][reality], big: true }, { id: 'surf', label: surfOn ? 'Showing surfaces' : 'Showing points', big: true }] : []),
+  ...(sweep.on ? [{ id: 'skipsweep', label: 'Skip sweep', big: true }] : []),
   ...(relocate ? [{ id: 'skipreloc', label: relocate.guess ? 'Use saved anchor now' : 'Skip search: load here', big: true }] : []),
   ...(replayMode ? [] : [{ id: 'detail', label: det.on ? 'Finish detail' : 'Detail scan (object)', on: det.on, big: true }]),
   { id: 'more', label: 'More  ›', big: true }
@@ -2409,6 +2423,7 @@ const BTN = () => page === 0 ? [
   { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
   { id: 'drift', label: icpOn ? 'Drift fix ✓' : 'Drift fix', on: icpOn },
   { id: 'autodet', label: auto.detail ? 'Auto detail ✓' : 'Auto detail', on: auto.detail },
+  { id: 'sweeps', label: sweep.enabled ? 'Room sweeps ✓' : 'Room sweeps', on: sweep.enabled },
   { id: 'guide', label: auto.guide ? 'Guidance ✓' : 'Guidance', on: auto.guide },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
@@ -2430,14 +2445,18 @@ function diagSnapshot() {
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, clock: colorCam.clock || null, latencyMs: colorCam.lat != null ? Math.round(colorCam.lat) : null, k1: colorCam.k1 || 0, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
-    map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
+    storage: diag.storage || null, map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
 }
-function diagSave() { try { localStorage.setItem('scanner.diag', JSON.stringify(diagSnapshot())); } catch (e) {} }
+async function storageInfo() { try { const e = await navigator.storage.estimate(), p = navigator.storage.persisted ? await navigator.storage.persisted() : null; diag.storage = { usedMB: Math.round(e.usage / 1e6), quotaMB: Math.round(e.quota / 1e6), persisted: p }; } catch (err) {} }
+storageInfo();
+function diagSave() { storageInfo(); try { localStorage.setItem('scanner.diag', JSON.stringify(diagSnapshot())); } catch (e) {} }
 /* where the scan is up to, in plain words (shown on the floating status bar and the wrist) */
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
+  if (sweep.on && !replayMode) { const d = sweep.steps.filter(s => s.done).length; return { title: 'Room sweep', sub: sweep.msg + ' · ' + d + '/' + sweep.steps.length, p: d / sweep.steps.length }; }
+  if (sweep.calibrating) return { title: 'Scanning', sub: 'Calibrating the camera from the sweep… keep scanning', p: coverage() };
   if (relocate && workerPathReady()) { const L = relocate.last; return { title: 'Finding your last scan', sub: !L ? 'Look around at the walls' : L.need ? 'Look at more of the walls around you' : 'Matching… ' + Math.round((L.wallFit || 0) * 100) + '% fit · keep looking around', p: L && !L.need ? Math.min(1, (L.wallFit || 0) / .5) : Math.min(1, ((L && L.wallCells) || 0) / 100) }; }
   if (det.on && !replayMode) return { title: det.auto ? 'Detail scan (auto)' : 'Detail scan', sub: (depth.tooFast ? 'Slow down · ' : '') + fconf.toLocaleString() + ' fine points · circle it 30–60 cm away', p: null };
   if (mapFull) return { title: 'Map full', sub: 'Finish & save, then start a new scan for the next area', p: 1 };
@@ -2460,7 +2479,8 @@ function gazeBins(o, f) {                                         // which direc
   b[pi * 12 + yi] = 1; return b;
 }
 function updateGuide() {
-  guide.dir = null; guide.text = '';
+  if (!sweep.on) { guide.dir = null; guide.text = ''; }
+  if (sweep.on) return;                                            // the sweep sets its own guidance
   if (!auto.guide || !scanning || replayMode || det.on || !depth.cal || !depth.cal.locked) return;
   const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()), f = xc.getWorldDirection(new V3()), b = gazeBins(o, f);
   let dir = null; const c = coverage();
@@ -2491,6 +2511,8 @@ function drawGuideArrow() {                                       // a small che
 function autoTick(dt) {
   auto.tick += dt; if (auto.tick < .2) return; const step = auto.tick; auto.tick = 0;
   if (!renderer.xr.isPresenting || replayMode || !scanning || !workerPathReady()) return;
+  if (sweep.enabled && !sweep.on && !relocate && !det.on) { const o = renderer.xr.getCamera().getWorldPosition(new V3());
+    if (!sweep.centres.length ? !cont : sweep.centres.every(c => c.distanceTo(o) > 2.8)) sweepStart(sweep.centres.length ? 'room' : 'first'); }
   /* close-ups: hold your gaze on something small and near for ~1.5 s and a detail zone opens around it; look away and it closes */
   if (auto.detail) {
     const h = gazeHit(.95);
@@ -2501,7 +2523,41 @@ function autoTick(dt) {
     } else { auto.dwellT = 0; auto.dwellP = null; }
   }
   /* saving: every 3 minutes of new scanning, while you're steady */
-  if (confirmed > 2000 && confirmed !== savedConf && clockT - auto.lastSave > 180 && depth.steady !== false && !finishing) { auto.lastSave = clockT; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(() => {}); }
+  if (confirmed > 2000 && confirmed !== savedConf && clockT - auto.lastSave > 180 && depth.steady !== false && !finishing) { auto.lastSave = clockT; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(e => { toast('Auto-save failed: ' + (e && e.name === 'QuotaExceededError' ? 'headset storage is full' : e.message)); diagLog('save', e && e.message); }); }
+}
+
+
+/* ================= room sweep: floor, ceiling and all the way round before the detail scan =================
+   It gives the depth calibration, the camera calibration and the drift correction everything they need early, then the
+   camera is calibrated from these photos straight away so the rest of the scan gets accurate colour and photos. */
+const sweep = { on: false, steps: [], centres: [], msg: '', calibrating: false, enabled: true };
+function sweepStart(why) {
+  const xc = renderer.xr.getCamera(), f = xc.getWorldDirection(new V3()), y0 = Math.atan2(f.x, -f.z);
+  sweep.steps = [{ k: 'floor', t: 0, need: 1.2, txt: 'Look down at the floor' }, { k: 'ceiling', t: 0, need: 1.2, txt: 'Look up at the ceiling' }]
+    .concat(Array.from({ length: 8 }, (_, j) => ({ k: 'wall', yaw: y0 + j * Math.PI / 4, t: 0, need: .8, txt: 'Turn slowly: wall ' + (j + 1) + ' of 8' })));
+  sweep.on = true; sweep.centres.push(xc.getWorldPosition(new V3())); toast(why === 'room' ? 'New room: quick sweep first' : 'Room sweep: floor, ceiling, then all the way round');
+}
+function sweepTick() {
+  const nowS = performance.now() / 1000, dt = Math.min(.25, nowS - (sweep.last || nowS)); sweep.last = nowS;
+  if (!sweep.on) return; const xc = renderer.xr.getCamera(), f = xc.getWorldDirection(new V3()), pitch = Math.asin(Math.max(-1, Math.min(1, f.y))), yaw = Math.atan2(f.x, -f.z);
+  if (depth.steady !== false) for (const st of sweep.steps) { if (st.done) continue;
+    const hit = st.k === 'floor' ? pitch < -.8 : st.k === 'ceiling' ? pitch > .75 : Math.abs(pitch) < .5 && Math.abs(Math.atan2(Math.sin(yaw - st.yaw), Math.cos(yaw - st.yaw))) < Math.PI / 8;
+    if (hit) { st.t += dt; if (st.t >= st.need) { st.done = true; kf.has = false; buzz(rightCtl.c && rightCtl.c.userData.src, .3, 20); } } }
+  const left = sweep.steps.filter(s => !s.done);
+  if (!left.length) { sweep.on = false; toast('Room swept: calibrating the camera…'); calibrateCameraLive(); return; }
+  /* point at the nearest step still to do */
+  const dirOf = st => st.k === 'floor' ? new V3(f.x * .3, -1, f.z * .3).normalize() : st.k === 'ceiling' ? new V3(f.x * .3, 1, f.z * .3).normalize() : new V3(Math.sin(st.yaw), 0, -Math.cos(st.yaw));
+  const nxt = left.sort((a, b) => f.angleTo(dirOf(a)) - f.angleTo(dirOf(b)))[0]; guide.dir = dirOf(nxt); guide.text = nxt.txt; sweep.msg = nxt.txt;
+}
+async function calibrateCameraLive() {                               // photo-match the sweep photos against the live surface, in the background
+  if (!colorCam.on || !currentId || sweep.calibrating) return; sweep.calibrating = true;
+  try {
+    const t = await tsdfDump(); if (!t || !t.keys.length) throw new Error('no surface yet');
+    const m = await tsdfMeshOf(t, det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), pmat.uniforms.floorY.value); if (!m.I.length) throw new Error('no surface yet');
+    const a = await alignPhotos({ id: currentId, live: true, meshCache: { v: 2, parts: [m] } }, msg => sweep.msg = msg);
+    toast('Camera calibrated: colours and photos locked in (' + Math.round(new V3().setFromMatrixPosition(new M4().fromArray(a.E)).length() * 100) + ' cm offset)');
+  } catch (e) { toast('Camera calibration later: ' + e.message); diagLog('livecal', e.message); }
+  sweep.calibrating = false;
 }
 
 /* ================= after saving: refine, mesh and photo-texture by themselves, one scan at a time ================= */
@@ -2597,8 +2653,10 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'skipsweep') { sweep.on = false; toast('Sweep skipped'); }
   if (id === 'skipreloc' && relocate) { const R = relocate; relocate = null; finishContinue(R.rec, R.guess || new M4()); toast(R.guess ? 'Placed by the saved anchor' : 'Loaded where you started this session'); }
   if (id === 'autodet') { auto.detail = !auto.detail; }
+  if (id === 'sweeps') { sweep.enabled = !sweep.enabled; if (!sweep.enabled) sweep.on = false; }
   if (id === 'guide') { auto.guide = !auto.guide; updateGuide(); }
   if (id === 'drift') { icpOn = !icpOn; toast(icpOn ? 'Drift correction on' : 'Drift correction off'); }
   if (id === 'surf') { surfOn = !surfOn; applySurf(); }
@@ -2619,7 +2677,7 @@ async function press(id, frame) {
     try { await saveScan(frame); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
     setTimeout(() => { finishing = false; xrSession && xrSession.end(); }, 2500);
   }
-  if (id === 'clear') { clearMap(); cont = null; relocate = null; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -2673,7 +2731,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    clearMap(); cont = null; relocate = null; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
+    clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
@@ -2766,8 +2824,8 @@ renderer.setAnimationLoop((t, frame) => {
   if (frame) {
     try {
     lastFrame = frame;
-    if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
-    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); camPoseHist.push({ t, m: Float32Array.from(vp0.transform.matrix) }); if (camPoseHist.length > 60) camPoseHist.shift(); } }
+    if (!refSpace) { refSpace = renderer.xr.getReferenceSpace(); if (refSpace && refSpace.addEventListener) refSpace.addEventListener('reset', onRefReset); }
+    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { motionTick(vp0, clockT); poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); camPoseHist.push({ t, m: Float32Array.from(vp0.transform.matrix) }); if (camPoseHist.length > 60) camPoseHist.shift(); } }
     camPump();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
@@ -2789,7 +2847,7 @@ renderer.setAnimationLoop((t, frame) => {
     tileSlice(fps < 65 ? .8 : 1.6); tileFlush();
     tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
     if (scanning && N) cleanSlice(4000);
-    if (clockT - depth.lastT > depth.rate || depth.steady === false) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
+    if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
     { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
     if (underOn && scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
@@ -2798,7 +2856,7 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); relocTick(); if (replayMode) ibrUpdate(renderer.xr.getCamera()); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
+    autoTick(dt); sweepTick(); relocTick(); if (replayMode) ibrUpdate(renderer.xr.getCamera()); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
