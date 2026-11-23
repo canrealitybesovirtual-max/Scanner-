@@ -71,6 +71,7 @@ input[type=file]{display:none}
 import * as THREE from 'three';
 const $ = id => document.getElementById(id);
 const M4 = THREE.Matrix4, V3 = THREE.Vector3;
+const srcURLs = new Map(); function srcWorker(src) { let u = srcURLs.get(src); if (!u) srcURLs.set(src, u = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))); return new Worker(u); }   // one blob URL per worker source
 
 /* ================= renderer (transparent: the headset shows your real house through it) ================= */
 const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true, alpha: true });
@@ -155,7 +156,7 @@ const pmat = new THREE.ShaderMaterial({
       float px = size * scale / max(.05, d);
       /* solid / walk-through: each point is a small disc lying on its surface, so neighbours close into a skin */
       vR = size * (.66 + .3 * photo); vVC = mv.xyz;
-      float nl0 = length(nrm); vec3 vn = nl0 > 1e-4 ? normalize(mat3(viewMatrix) * (nrm / nl0)) : -normalize(mv.xyz); if (dot(vn, mv.xyz) > 0.0) vn = -vn; vVN = vn;
+      float nl0 = length(nrm); vec3 vn = nl0 > 1e-4 ? normalize(normalMatrix * (nrm / nl0)) : -normalize(mv.xyz); if (dot(vn, mv.xyz) > 0.0) vn = -vn; vVN = vn;
       vPS = style < .5 && photo < .5 ? clamp(px * .45, 1.4, 5.0) * (1.0 + fresh * .5) : clamp(2.2 * vR * scale / max(.05, d) + 1.0, 1.0, 96.0);
       gl_PointSize = ok * vPS;
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
@@ -210,8 +211,9 @@ const fcloud = new THREE.Points(fg, fmat); fcloud.frustumCulled = false; mapRoot
 function flushFine() {
   for (const n of ['time', 'scale', 'minC', 'floorY', 'photo', 'alpha', 'style']) fmat.uniforms[n].value = pmat.uniforms[n].value;
   if (fmat.depthWrite !== pmat.depthWrite) { fmat.depthWrite = pmat.depthWrite; fmat.needsUpdate = true; }
-  if (fHi < 0) return; const lo = Math.min(fLo, fNewLo), hi = Math.max(fHi, FN - 1);
-  for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw', 'nrm']) { const at = fg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); at.addUpdateRange(lo * k, (hi - lo + 1) * k); at.needsUpdate = true; }
+  if (fHi < 0 && fNewLo >= FN) return;
+  for (const n of ['position', 'cnt', 'born', 'ang', 'col', 'cw', 'nrm']) { const at = fg.attributes[n], k = at.itemSize;   // changed ids and new ids as two ranges, not everything in between
+    if (fHi >= 0 && fLo < Math.min(fNewLo, FN)) at.addUpdateRange(fLo * k, (Math.min(fHi, fNewLo - 1) - fLo + 1) * k); if (fNewLo < FN) at.addUpdateRange(fNewLo * k, (FN - fNewLo) * k); at.needsUpdate = true; }
   fg.setDrawRange(0, FN); fNewLo = FN; fLo = Infinity; fHi = -1;
 }
 function fineClear() { fmap.clear(); FN = 0; fconf = 0; fNewLo = 0; fLo = Infinity; fHi = -1; fg.setDrawRange(0, 0); det.zones = []; det.on = false; det.cur = null; zonesSync(); }
@@ -222,7 +224,7 @@ function zonesSync() {                                         // tell the coars
 }
 /* the depth-image region (texture uv) that covers a zone, so the detail read spends every sample on it */
 function zoneROI(zone, proj, xf, cfg, ndRaw) {
-  const iv = new M4().copy(xf).invert(), p = new V3(), q = new THREE.Vector4(); let u0 = 1, u1 = 0, v0 = 1, v1 = 0, ok = 0;
+  const iv = new M4().multiplyMatrices(Dm, xf).invert(), p = new V3(), q = new THREE.Vector4(); let u0 = 1, u1 = 0, v0 = 1, v1 = 0, ok = 0;
   const NDf = cfg.nd && ndRaw ? (cfg.nd === 1 ? ndRaw.elements : new M4().copy(ndRaw).invert().elements) : null;   // inverse of what backprojection applies
   for (let i = 0; i < 8; i++) {
     p.set(zone.c.x + (i & 1 ? 1 : -1) * zone.r, zone.c.y + (i & 2 ? 1 : -1) * zone.r, zone.c.z + (i & 4 ? 1 : -1) * zone.r).applyMatrix4(iv);
@@ -253,13 +255,13 @@ function startDetail(auto) {                                     // aim: the fir
 function endDetail() { det.on = false; det.cur = null; zonesSync(); toast('Detail kept: ' + fconf.toLocaleString() + ' fine points'); }
 function flushGeo() {
   /* new points: one contiguous block of positions; changed points: sorted, merged into a few short ranges */
-  const pa = pg.attributes.position; pa.clearUpdateRanges();
+  const pa = pg.attributes.position;
   if (N > newLo) { pa.addUpdateRange(newLo * 3, (N - newLo) * 3); pa.needsUpdate = true; }
   if (dlist.length) {
     dlist.sort((x, y) => x - y);
     let gap = 48, ranges = [];
     for (;;) { ranges = []; let a = dlist[0], b = a; for (let i = 1; i < dlist.length; i++) { const v = dlist[i]; if (v - b <= gap) b = v; else { ranges.push([a, b]); a = b = v; } } ranges.push([a, b]); if (ranges.length <= 256) break; gap *= 4; }
-    for (const n of ['cnt', 'born', 'ang', 'col', 'cw', 'nrm', 'tl']) { const at = pg.attributes[n], k = at.itemSize; at.clearUpdateRanges(); for (const [a, b] of ranges) at.addUpdateRange(a * k, (b - a + 1) * k); at.needsUpdate = true; }
+    for (const n of ['cnt', 'born', 'ang', 'col', 'cw', 'nrm', 'tl']) { const at = pg.attributes[n], k = at.itemSize; for (const [a, b] of ranges) at.addUpdateRange(a * k, (b - a + 1) * k); at.needsUpdate = true; }
     for (const [a, b] of ranges) pa.addUpdateRange(a * 3, (b - a + 1) * 3); pa.needsUpdate = true;
     for (const id of dlist) dmark[id] = 0; dlist = [];
   }
@@ -287,7 +289,7 @@ const tmat = new THREE.ShaderMaterial({
       vB = style < .5 && photo < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
       vSh = .62 + .38 * abs(dot(n, normalize(vec3(.35, .9, .45))));
       bool col = iT6.w > 0u; va = photo > .5 || style > .5 ? 1.0 : col ? .62 : .16;
-      vec3 tc = (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz; for (int i = 0; i < 8; i++) if (i < nz && distance(tc, zones[i].xyz) < zones[i].w - .09) gl_Position = vec4(0.0); }`,   // only tiles wholly inside a zone
+      vec3 tc = instanceMatrix[3].xyz; for (int i = 0; i < 8; i++) if (i < nz && distance(tc, zones[i].xyz) < zones[i].w - .09) gl_Position = vec4(0.0); }`,   // only tiles wholly inside a zone
   fragmentShader: `uniform float alpha, photo, style; flat varying uvec4 t0, t1, t2, t3, t4, t5, t6; varying vec3 vB; varying vec2 vUv, vSz; varying float va, vSh, vFr;
     uint W[28];
     vec3 tex(int i, int j) { int k = (clamp(j, 0, 5) * 6 + clamp(i, 0, 5)) * 3; vec3 c;
@@ -405,10 +407,10 @@ function layoutEditsIn(e, T) {
   applyLayoutEdits();
 }
 function buildMetaSurf() {                                       // sample every Meta triangle and plane every ~4 cm into a voxel set
-  const S = new Set(), a = new V3(), b = new V3(), c = new V3(), p = new V3(), mm = new M4();
-  const tri = () => { const l = Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a)), n = Math.min(60, Math.ceil(l / .04)); for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) { const u = i / n, v = j / n; p.set(0, 0, 0).addScaledVector(a, 1 - u - v).addScaledVector(b, u).addScaledVector(c, v); S.add(mkey(p.x, p.y, p.z)); } };
-  for (const e of meshes.values()) { if (!e.v) continue; mm.copy(e.m); for (let t = 0; t < e.i.length; t += 3) { a.fromArray(e.v, e.i[t] * 3).applyMatrix4(mm); b.fromArray(e.v, e.i[t + 1] * 3).applyMatrix4(mm); c.fromArray(e.v, e.i[t + 2] * 3).applyMatrix4(mm); tri(); } }
-  for (const e of planes.values()) { const P = e.poly; if (!P || P.length < 3) continue; for (let t = 1; t < P.length - 1; t++) { a.set(P[0].x, 0, P[0].z).applyMatrix4(e.m); b.set(P[t].x, 0, P[t].z).applyMatrix4(e.m); c.set(P[t + 1].x, 0, P[t + 1].z).applyMatrix4(e.m); tri(); } }
+  const S = new Set(), a = new V3(), b = new V3(), c = new V3(), p = new V3(), mm = new M4(); metaSurf.D0 = Dm.clone();   // stored in the map frame, like every point it is compared with
+  const tri = () => { const l = Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a)), n = Math.max(1, Math.min(150, Math.ceil(l / .04))); for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) { const u = i / n, v = j / n; p.set(0, 0, 0).addScaledVector(a, 1 - u - v).addScaledVector(b, u).addScaledVector(c, v); S.add(mkey(p.x, p.y, p.z)); } };
+  for (const e of meshes.values()) { if (!e.v) continue; mm.multiplyMatrices(Dm, e.m); for (let t = 0; t < e.i.length; t += 3) { a.fromArray(e.v, e.i[t] * 3).applyMatrix4(mm); b.fromArray(e.v, e.i[t + 1] * 3).applyMatrix4(mm); c.fromArray(e.v, e.i[t + 2] * 3).applyMatrix4(mm); tri(); } }
+  for (const e of planes.values()) { const P = e.poly; if (!P || P.length < 3) continue; for (let t = 1; t < P.length - 1; t++) { mm.multiplyMatrices(Dm, e.m); a.set(P[0].x, 0, P[0].z).applyMatrix4(mm); b.set(P[t].x, 0, P[t].z).applyMatrix4(mm); c.set(P[t + 1].x, 0, P[t + 1].z).applyMatrix4(mm); tri(); } }
   metaSurf.base = S; metaSurf.dirty = false; applyLayoutEdits();
 }
 function syncLayout(frame, ref) {
@@ -515,7 +517,7 @@ function readDepth(info, isArr, layer, lumA, jx, jy, fmtName, roi = [0, 0, 1, 1]
   glBack();                                               // hand GL back to three.js, keeping the headset's target
 }
 const depth = { vi: 0, frames: 0, head: new V3(), vinv: new M4(), cam: new V3(), binding: null, status: 'off', flipY: false, lastT: 0, rate: .08, zs: new Float32Array(DW * DH) };
-const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4(), _c = new V3();
+const _inv = new M4(), _xf = new M4(), _nd = new M4(), _p = new V3(), _q = new THREE.Vector4(), _c = new V3(), _pm = new V3(), _cm = new V3();
 const grips = [];
 function handsNow() { const out = []; for (const g of grips) if (g.visible !== false && g.matrixWorld) { const v = new V3().setFromMatrixPosition(g.matrixWorld); if (v.lengthSq() > 1e-6) out.push(v); } return out; }
 
@@ -528,13 +530,15 @@ try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if
 try { const a = JSON.parse(localStorage.getItem('scanner.camAlign') || 'null'); if (a && !new URLSearchParams(location.search).get('hfov')) { colorCam.f = a.f; colorCam.cx = a.cx; colorCam.cy = a.cy; colorCam.aligned = true; } } catch (e) {}
 colorCam.cv.width = 512; colorCam.cv.height = 288; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
 async function toggleColor() {
-  if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); if (colorCam.video) colorCam.video.remove(); colorCam.status = 'off'; return; }
+  if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); if (colorCam.video) colorCam.video.remove(); colorCam.video = null; if (colorCam.bmp) { colorCam.bmp.close(); colorCam.bmp = null; } kf.want = null; colorCam.status = 'off'; return; }
+  if (toggleColor.busy) return; toggleColor.busy = true;
   try {
     const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 1280, height: 720 }, audio: false });
     const v = colorCam.video = document.createElement('video'); v.muted = true; v.playsInline = true; v.srcObject = st; v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none'; document.body.appendChild(v); await v.play();
     colorCam.w = 512; colorCam.h = Math.max(64, Math.round(512 * (v.videoHeight || 288) / (v.videoWidth || 512))); colorCam.cv.width = colorCam.w; colorCam.cv.height = colorCam.h;   // keep the real aspect (Quest gives 4:3 or 16:9)
     colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight; startFrameClock(v);
   } catch (e) { colorCam.status = 'unavailable (' + (e.name || e.message) + ')'; toast('Camera colour needs Horizon OS v74+ and camera permission'); }
+  finally { toggleColor.busy = false; }
 }
 const kf = { cv: document.createElement('canvas'), busy: false, t: 0, pos: new V3(), q: new THREE.Quaternion(), prevQ: new THREE.Quaternion(), prevT: 0, has: false, n: 0 };
 /* the camera image is older than the head pose of the frame we're in: pair every image with the head pose at its own capture time */
@@ -581,8 +585,8 @@ function captureKeyframe(tCap, want) {
   if (kf.sh.length > 8 && sharp < med * .55) { kf.blurred = (kf.blurred || 0) + 1; return; }   // clearly blurrier than this camera's usual frames
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
-  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(head).elements), m: Array.from(Dm.clone().multiply(head).multiply(colorCam.E || new M4()).elements), k1: colorCam.k1 || 0, camLatMs: tCap != null ? Math.round(performance.now() - tCap) : null, w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(head.elements) };
-  kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); const m = new M4().fromArray(rec.m); kfMem.push({ f: rec, m, p: new V3().setFromMatrixPosition(m), d: new V3(-m.elements[8], -m.elements[9], -m.elements[10]).normalize() }); if (kfMem.length > 1500) kfMem.shift(); } kf.busy = false; }, 'image/jpeg', .88);
+  const sc = scanId(), rec = { scan: sc, k: sc + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(head).elements), m: Array.from(Dm.clone().multiply(head).multiply(colorCam.E || new M4()).elements), k1: colorCam.k1 || 0, camLatMs: tCap != null ? Math.round(performance.now() - tCap) : null, w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(head.elements) };
+  kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => { kf.n++; delete rec.blob; }).catch(() => {}); const m = new M4().fromArray(rec.m); kfMem.push({ f: rec, m, p: new V3().setFromMatrixPosition(m), d: new V3(-m.elements[8], -m.elements[9], -m.elements[10]).normalize() }); if (kfMem.length > 1500) kfMem.shift(); } kf.busy = false; }, 'image/jpeg', .88);
 }
 function camPump() {                                            // keep one fresh, downscaled camera bitmap ready (decoded asynchronously)
   const c = colorCam; if (!c.on || c.noBmp || c.pending || !c.video || c.video.readyState < 2 || performance.now() - (c.bt || 0) < 90 || typeof createImageBitmap === 'undefined') return;
@@ -704,7 +708,7 @@ function calCandidates(M, modes) {
 const _ndI = new M4();
 function backproject(M, cfg, x, y, z, out) {                         // depth pixel (x, y) at distance z → world point, under one geometry guess
   const u = (x + .5) / DW + M.jx, v = (y + .5) / DH + M.jy; let vu = u, vv = v;
-  if (cfg.nd && M.ndRaw) { const n = (cfg.nd === 1 ? _ndI.copy(M.ndRaw).invert() : M.ndRaw).elements; vu = n[0] * u + n[4] * v + n[12]; vv = n[1] * u + n[5] * v + n[13]; }
+  if (cfg.nd && M.ndRaw) { const n = (cfg.nd === 1 ? (M.ndInv || (M.ndInv = new M4().copy(M.ndRaw).invert())) : M.ndRaw).elements; vu = n[0] * u + n[4] * v + n[12]; vv = n[1] * u + n[5] * v + n[13]; }
   if (cfg.flip) vv = 1 - vv;
   const inv = cfg.src === 'info' ? M.projI : M.projV, xf = cfg.src === 'info' ? M.xfI : M.xfV;
   _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(inv); out.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w).multiplyScalar(z / -(_q.z / _q.w));
@@ -715,7 +719,7 @@ function metaAgreement(M, raws, cfg, f, step) {
   const p = new V3(); let hit = 0, tot = 0;
   for (let y = 2; y < DH - 2; y += step) for (let x = 2; x < DW - 2; x += step) {
     const z = f(raws[y * DW + x]); if (!(z > .3 && z < 4)) continue; tot++;
-    backproject(M, cfg, x, y, z, p);
+    backproject(M, cfg, x, y, z, p).applyMatrix4(Dm);
     const ix = Math.floor(p.x / MG), iy = Math.floor(p.y / MG), iz = Math.floor(p.z / MG);
     if (metaNear(ix, iy, iz)) hit++;
   }
@@ -735,11 +739,12 @@ function calibrateStep(M, raws, modes) {
     return;
   }
   const cal = depth.cal, MODES = depthModes(M), cur = { M, raws: raws.slice() };
-  if (cal.prev) {
-    const A = cal.prev, qa = new THREE.Quaternion().setFromRotationMatrix(A.M.xfV), qb = new THREE.Quaternion().setFromRotationMatrix(M.xfV);
+  const si = M.swap ? 1 : 0;
+  if (cal.prev && cal.prev[si]) {
+    const A = cal.prev[si], qa = new THREE.Quaternion().setFromRotationMatrix(A.M.xfV), qb = new THREE.Quaternion().setFromRotationMatrix(M.xfV);
     const rot = qa.angleTo(qb), mv = new V3().setFromMatrixPosition(A.M.xfV).distanceTo(new V3().setFromMatrixPosition(M.xfV));
     if ((rot > .03 || mv > .02) && rot < .45 && mv < .4 && !!A.M.swap === !!M.swap) {
-      const cands = calCandidates(M, modes), p = new V3(), G = .05, key = v => Math.floor(v.x / G) + ',' + Math.floor(v.y / G) + ',' + Math.floor(v.z / G);
+      const cands = calCandidates(M, modes), p = new V3(), G = .05, key = v => (Math.floor(v.x / G) + 5000) * 1e8 + (Math.floor(v.y / G) + 5000) * 1e4 + Math.floor(v.z / G) + 5000;
       for (const c of cands) {
         const f = MODES[c.mode], set = new Set(); let hit = 0, tot = 0;
         for (let y = 2; y < DH - 2; y += 2) for (let x = 2; x < DW - 2; x += 2) { const z = f(A.raws[y * DW + x]); if (z > .3 && z < 4) set.add(key(backproject(A.M, c, x, y, z, p))); }
@@ -749,9 +754,10 @@ function calibrateStep(M, raws, modes) {
       cal.pairs++;
     }
   }
-  cal.prev = cur;
+  (cal.prev || (cal.prev = []))[si] = cur;
   if (cal.pairs >= CAL_PAIRS) {
     let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (m > bs) { bs = m; best = k; } }
+    if (bs < .3) { cal.pairs = 0; cal.score.clear(); toast('Depth calibration unclear (' + Math.round(bs * 100) + '%): move your head slowly side to side'); return; }   // never lock (and save) a bad guess
     depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.method = 'two views'; cal.locked = true; cal.prev = null;
     try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {}
     resetLiveMap(); toast('Depth calibrated (' + Math.round(depth.cfgScore * 100) + '% agreement): scanning');
@@ -808,7 +814,7 @@ function integrateDepth() {
     if (Math.abs(zs[k - 1] - z) > tol || Math.abs(zs[k + 1] - z) > tol || Math.abs(zs[k - DW] - z) > tol || Math.abs(zs[k + DW] - z) > tol) continue;
     const cfg = M.cpu ? CPU_CFG : (depth.cfg || DEF_CFG), src = cfg.src === 'info' && M.projI ? 'info' : 'view';
     const u = (x + .5) / DW + j.x, v = (y + .5) / DH + j.y; let vu = u, vv = v;
-    if (cfg.nd && M.ndRaw) { const nn = (cfg.nd === 1 ? _ndI.copy(M.ndRaw).invert() : M.ndRaw).elements; vu = nn[0] * u + nn[4] * v + nn[12]; vv = nn[1] * u + nn[5] * v + nn[13]; }
+    if (cfg.nd && M.ndRaw) { const nn = (cfg.nd === 1 ? (M.ndInv || (M.ndInv = new M4().copy(M.ndRaw).invert())) : M.ndRaw).elements; vu = nn[0] * u + nn[4] * v + nn[12]; vv = nn[1] * u + nn[5] * v + nn[13]; }
     if (cfg.flip) vv = 1 - vv;
     _q.set(vu * 2 - 1, vv * 2 - 1, -1, 1).applyMatrix4(M.cpu ? _inv : src === 'info' ? M.projI : M.projV); _p.set(_q.x / _q.w, _q.y / _q.w, _q.z / _q.w);
     _p.multiplyScalar(z / -_p.z);
@@ -821,19 +827,17 @@ function integrateDepth() {
     _p.applyMatrix4(_xf); depth.cam.setFromMatrixPosition(_xf);
     if (inBody(_p.x, _p.y, _p.z)) continue;
     if (M.fwdY < -.6) { if (_p.y > M.head.y + .1) up++; else if (_p.y < M.head.y - .3) down++; }
-    const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
+    _pm.copy(_p).applyMatrix4(Dm); const id = addSighting(_pm.x, _pm.y, _pm.z, tNow, w, _cm.copy(depth.cam).applyMatrix4(Dm));   // headset world -> map
     if (id >= 0 && cam && cam.data && w > .3) {                // colour it from the passthrough camera frame
       _c.copy(_p).applyMatrix4(vinv);
       if (_c.z < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * _c.x / -_c.z, cv = .5 - .5 * cam.f * cam.asp * _c.y / -_c.z + cam.cy;
         if (cu > 0 && cu < 1 && cv > 0 && cv < 1) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, d = cam.data; tint(id, d[pi] / 255, d[pi + 1] / 255, d[pi + 2] / 255, q); } }
     }
     /* the ray passed through empty air before the surface: wear down anything that was there (ghosts, people walking past) */
-    for (const f of [.45, .7, .88]) { const t = f * z; if (z - t < .08) continue; _c.set(vx * f, vy * f, vz * f).applyMatrix4(_xf); if (!inBody(_c.x, _c.y, _c.z)) carve(_c.x, _c.y, _c.z, .35 * w); }
+    for (const f of [.45, .7, .88]) { const t = f * z; if (z - t < .08) continue; _c.set(vx * f, vy * f, vz * f).applyMatrix4(_xf); if (!inBody(_c.x, _c.y, _c.z)) { _c.applyMatrix4(Dm); carve(_c.x, _c.y, _c.z, .35 * w); } }
     added++;
   }
   /* looking down but the surface lands above your head: the depth image is upside down. Fix it once and start clean */
-  if (M.fwdY < -.6 && up + down > 300) { depth.flipVotes = (depth.flipVotes || 0) + (up > down * 2 ? 1 : down > up * 2 ? -1 : 0);
-    if (false) { depth.flipY = !depth.flipY; depth.flipAuto++; depth.flipVotes = 0; clearMap(); toast('Depth image was upside down: corrected automatically'); } }
   const ms = performance.now() - t0; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
   depth.rate = Math.max(.07, depth.ms * 4 / 1000);                    // keep integration under ~25% of the frame budget
   depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms' + (DR.isInt ? ' · int' : '');
@@ -870,7 +874,7 @@ function alignFrame(cam, V, list, n) {
   for (let c = 0; c < C.length; c++) { let v = 0, m = 0;
     for (let sl = 0; sl < used; sl++) { const o = (c * S + sl) * 5, nn = AL.acc[o]; if (nn < 3) continue; const r = AL.acc[o + 1], g = AL.acc[o + 2], b = AL.acc[o + 3]; v += (AL.acc[o + 4] - (r * r + g * g + b * b) / nn) / nn; m++; }
     if (m < 250) continue; v /= m; if (v < bv) { bv = v; best = c; } if (C[c].hfov === 78 && C[c].cx === 0 && C[c].cy === 0) base = v; }
-  if (best < 0) return null;
+  if (best < 0 || base === 1e9) return null;                        // keep collecting until the plain guess can be scored too
   AL.done = true; if (bv > base * .95) best = C.findIndex(q => q.hfov === 78 && q.cx === 0 && q.cy === 0);     // no clear winner: keep the plain guess
   return Object.assign({ gain: base / bv }, C[best]);
 }
@@ -880,6 +884,9 @@ const TV = .02, BS = 8, B3 = 512, MU = .06, WMAX = 24, RB = 4;
 let TB = new Map(), TREG = new Map(); const tDirty = new Map(), tMeshed = new Map();
 const bk3 = (i, j, k) => ((i + 8192) * 16384 + (j + 8192)) * 16384 + (k + 8192);
 const unbk = k => { const z = k % 16384 - 8192, r = (k - (z + 8192)) / 16384, y = r % 16384 - 8192, x = (r - (y + 8192)) / 16384 - 8192; return [x, y, z]; };
+function dirtyB(bi, bj, bk, t) { const ri = Math.floor(bi / RB), rj = Math.floor(bj / RB), rk = Math.floor(bk / RB), li = bi - ri * RB, lj = bj - rj * RB, lk = bk - rk * RB; tDirty.set(bk3(ri, rj, rk), t);
+  if (li === 0) tDirty.set(bk3(ri - 1, rj, rk), t); else if (li === RB - 1) tDirty.set(bk3(ri + 1, rj, rk), t); if (lj === 0) tDirty.set(bk3(ri, rj - 1, rk), t); else if (lj === RB - 1) tDirty.set(bk3(ri, rj + 1, rk), t);
+  if (lk === 0) tDirty.set(bk3(ri, rj, rk - 1), t); else if (lk === RB - 1) tDirty.set(bk3(ri, rj, rk + 1), t); }
 function tBlock(bi, bj, bk, make) {
   const k = bk3(bi, bj, bk); let b = TB.get(k);
   if (!b && make) { b = { i: bi, j: bj, k: bk, t: 0, d: new Int16Array(B3).fill(32767), w: new Uint8Array(B3), c: new Uint16Array(B3 * 3), cw: new Uint8Array(B3) }; TB.set(k, b);
@@ -888,7 +895,7 @@ function tBlock(bi, bj, bk, make) {
 }
 function tsdfPrune(now) {                                          // free-space-only blocks carry no surface: drop them to keep whole-house scans small
   for (const [k, b] of TB) { if (now - b.t < 4000) continue; let surf = false; for (let v = 0; v < B3; v++) if (b.w[v] && b.d[v] < 32000) { surf = true; break; }
-    if (surf) continue; TB.delete(k); const rk = bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), set = TREG.get(rk); if (set) set.delete(k); tDirty.set(rk, now); }
+    if (surf) continue; TB.delete(k); const rk = bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), set = TREG.get(rk); if (set) set.delete(k); dirtyB(b.i, b.j, b.k, now); }
 }
 function tsdfIntegrate(c) {
   const X = c.X, OX = X[12], OY = X[13], OZ = X[14], R = c.rays, nr = c.nr, touched = new Set(), step = BS * TV * .9, now = c.now;
@@ -921,7 +928,7 @@ function tsdfIntegrate(c) {
               b.cw[v] = Math.min(240, Math.max(1, Math.round(k2 * 8))); } } }
       }
     }
-    b.t = now; if (changed) tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), now);
+    b.t = now; if (changed) dirtyB(b.i, b.j, b.k, now);
   }
   return touched.size;
 }
@@ -972,17 +979,32 @@ function tsdfPack() {
 function tsdfUnpack(t, Tm) {                                        // load a saved TSDF; with a transform, resample voxel by voxel into this frame
   const ws = 8 / (t.wscale || 6);
   const ident = !Tm || Tm.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6);
-  for (let i = 0; i < t.keys.length; i++) {
-    const [bi, bj, bk] = unbk(t.keys[i]);
-    if (ident) { const b = tBlock(bi, bj, bk, true); for (let v = 0; v < B3; v++) { const o = i * B3 + v; b.d[v] = Math.round(t.d[o] / 127 * 32767); b.w[v] = Math.min(255, Math.round(t.w[o] * ws)); b.c[v * 3] = t.c[o * 3] * 257; b.c[v * 3 + 1] = t.c[o * 3 + 1] * 257; b.c[v * 3 + 2] = t.c[o * 3 + 2] * 257; b.cw[v] = t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0 ? 24 : 0; }
-      tDirty.set(bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)), 0); continue; }
-    for (let v = 0; v < B3; v++) { const o = i * B3 + v; if (!t.w[o]) continue;
-      const x = (bi * BS + (v & 7) + .5) * TV, y = (bj * BS + ((v >> 3) & 7) + .5) * TV, z = (bk * BS + (v >> 6) + .5) * TV;
-      const X = Tm[0] * x + Tm[4] * y + Tm[8] * z + Tm[12], Y = Tm[1] * x + Tm[5] * y + Tm[9] * z + Tm[13], Z = Tm[2] * x + Tm[6] * y + Tm[10] * z + Tm[14];
-      const gi = Math.floor(X / TV), gj = Math.floor(Y / TV), gk = Math.floor(Z / TV), b = tBlock(Math.floor(gi / BS), Math.floor(gj / BS), Math.floor(gk / BS), true), u = (gi - b.i * BS) + (gj - b.j * BS) * BS + (gk - b.k * BS) * BS * BS;
-      if (t.w[o] * ws > b.w[u]) { b.d[u] = Math.round(t.d[o] / 127 * 32767); b.w[u] = Math.min(255, Math.round(t.w[o] * ws)); b.c[u * 3] = t.c[o * 3] * 257; b.c[u * 3 + 1] = t.c[o * 3 + 1] * 257; b.c[u * 3 + 2] = t.c[o * 3 + 2] * 257; b.cw[u] = 24; }
-      tDirty.set(bk3(Math.floor(b.i / RB), Math.floor(b.j / RB), Math.floor(b.k / RB)), 0); }
-  }
+  const put = (b, u, d, w, r, g, bl, hasC) => {                       // fuse into what is already there: weighted mean distance, colour where seen
+    const w0 = b.w[u]; if (!w0) { b.d[u] = d; b.w[u] = w; } else { b.d[u] = Math.round((b.d[u] * w0 + d * w) / (w0 + w)); b.w[u] = Math.min(255, w0 + w); }
+    if (hasC) { const c0 = b.cw[u]; if (!c0) { b.c[u * 3] = r; b.c[u * 3 + 1] = g; b.c[u * 3 + 2] = bl; } else { b.c[u * 3] = (b.c[u * 3] + r) >> 1; b.c[u * 3 + 1] = (b.c[u * 3 + 1] + g) >> 1; b.c[u * 3 + 2] = (b.c[u * 3 + 2] + bl) >> 1; } b.cw[u] = 24; } };
+  if (ident) { for (let i = 0; i < t.keys.length; i++) { const [bi, bj, bk] = unbk(t.keys[i]), b = tBlock(bi, bj, bk, true);
+      for (let v = 0; v < B3; v++) { const o = i * B3 + v; if (!t.w[o]) continue; put(b, v, Math.round(t.d[o] / 127 * 32767), Math.min(255, Math.round(t.w[o] * ws)), t.c[o * 3] * 257, t.c[o * 3 + 1] * 257, t.c[o * 3 + 2] * 257, t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0); }
+      tDirty.set(bk3(Math.floor(bi / RB), Math.floor(bj / RB), Math.floor(bk / RB)), 0); } return; }
+  const SK = new Map(); for (let i = 0; i < t.keys.length; i++) SK.set(t.keys[i], i);
+  const Ti = inv4r(Tm), want = new Set(), E = BS * TV;
+  for (let i = 0; i < t.keys.length; i++) { const [bi, bj, bk] = unbk(t.keys[i]); let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;   // target blocks this source block lands in
+    for (let c = 0; c < 8; c++) { const x = (bi + (c & 1)) * E, y = (bj + ((c >> 1) & 1)) * E, z = (bk + (c >> 2)) * E, X = Tm[0] * x + Tm[4] * y + Tm[8] * z + Tm[12], Y = Tm[1] * x + Tm[5] * y + Tm[9] * z + Tm[13], Z = Tm[2] * x + Tm[6] * y + Tm[10] * z + Tm[14];
+      x0 = Math.min(x0, X); x1 = Math.max(x1, X); y0 = Math.min(y0, Y); y1 = Math.max(y1, Y); z0 = Math.min(z0, Z); z1 = Math.max(z1, Z); }
+    for (let a = Math.floor(x0 / E); a <= Math.floor(x1 / E); a++) for (let b2 = Math.floor(y0 / E); b2 <= Math.floor(y1 / E); b2++) for (let c2 = Math.floor(z0 / E); c2 <= Math.floor(z1 / E); c2++) want.add(bk3(a, b2, c2)); }
+  let lk = -1, li;                                                   // last source block looked up (neighbouring voxels share it)
+  const src = (gi, gj, gk) => { const bi = Math.floor(gi / BS), bj = Math.floor(gj / BS), bk = Math.floor(gk / BS), k = bk3(bi, bj, bk); if (k !== lk) { lk = k; li = SK.get(k); } if (li === undefined) return -1; const o = li * B3 + (gi - bi * BS) + (gj - bj * BS) * BS + (gk - bk * BS) * BS * BS; return t.w[o] ? o : -1; };
+  const co = new Int32Array(8), cf = new Float32Array(8);
+  for (const k of want) { const [ti, tj, tk] = unbk(k); let b = null;
+    for (let v = 0; v < B3; v++) { const x = (ti * BS + (v & 7) + .5) * TV, y = (tj * BS + ((v >> 3) & 7) + .5) * TV, z = (tk * BS + (v >> 6) + .5) * TV;
+      const fx = (Ti[0] * x + Ti[4] * y + Ti[8] * z + Ti[12]) / TV - .5, fy = (Ti[1] * x + Ti[5] * y + Ti[9] * z + Ti[13]) / TV - .5, fz = (Ti[2] * x + Ti[6] * y + Ti[10] * z + Ti[14]) / TV - .5;
+      const i0 = Math.floor(fx), j0 = Math.floor(fy), k0 = Math.floor(fz), ax = fx - i0, ay = fy - j0, az = fz - k0; let ok = true;
+      for (let c = 0; c < 8 && ok; c++) { const o = src(i0 + (c & 1), j0 + ((c >> 1) & 1), k0 + (c >> 2)); if (o < 0) ok = false; co[c] = o; cf[c] = ((c & 1) ? ax : 1 - ax) * (((c >> 1) & 1) ? ay : 1 - ay) * ((c >> 2) ? az : 1 - az); }
+      if (!ok) continue;                                             // trilinear only where all 8 source voxels were observed
+      let d = 0, w = 0, r = 0, g = 0, bl = 0, cs = 0; for (let c = 0; c < 8; c++) { const o = co[c], f = cf[c]; d += t.d[o] * f; w += t.w[o] * f; if (t.c[o * 3] + t.c[o * 3 + 1] + t.c[o * 3 + 2] > 0) { r += t.c[o * 3] * f; g += t.c[o * 3 + 1] * f; bl += t.c[o * 3 + 2] * f; cs += f; } }
+      if (!b) b = tBlock(ti, tj, tk, true);
+      put(b, v, Math.round(d / 127 * 32767), Math.max(1, Math.min(255, Math.round(w * ws))), cs > .3 ? Math.round(r / cs * 257) : 0, cs > .3 ? Math.round(g / cs * 257) : 0, cs > .3 ? Math.round(bl / cs * 257) : 0, cs > .3); }
+    if (b) tDirty.set(bk3(Math.floor(ti / RB), Math.floor(tj / RB), Math.floor(tk / RB)), 0); }
+
 }
 function concatParts(list) {
   let nv = 0, ni = 0; for (const m of list) { nv += m.P.length / 3; ni += m.I.length; }
@@ -1131,7 +1153,7 @@ function loopClose(frames, Xs, report) {
     const R = [C + kx * kx * V, ky * kx * V + kz * Sn, kz * kx * V - ky * Sn, 0, kx * ky * V - kz * Sn, C + ky * ky * V, kz * ky * V + kx * Sn, 0, kx * kz * V + ky * Sn, ky * kz * V - kx * Sn, C + kz * kz * V, 0, 0, 0, 0, 1];
     return mul4([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, c[0] + tx, c[1] + ty, c[2] + tz, 1], mul4(R, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -c[0], -c[1], -c[2], 1])); };
   let maxShift = 0;
-  const out = Xs.map((X, i) => { const s2 = Math.min(S - 1, Math.floor(i / SEG)), u = (i % SEG) / SEG, nb = Math.min(S - 1, s2 + 1), xs = x[s2].map((v, k) => v + (x[nb][k] - v) * u), seg = segs[s2] || segs.find(Boolean);
+  const out = Xs.map((X, i) => { const fc = (i + .5) / SEG - .5, s2 = Math.max(0, Math.min(S - 1, Math.floor(fc))), nb = Math.min(S - 1, s2 + 1), u = Math.max(0, Math.min(1, fc - s2)), xs = x[s2].map((v, k) => v + (x[nb][k] - v) * u);   // between segment centres
     maxShift = Math.max(maxShift, Math.hypot(xs[0], xs[1], xs[2])); return mul4(corrOf(xs, C0), X); });
   return { Xs: out, loops: edges.length, maxShift };
 }
@@ -1158,7 +1180,7 @@ onmessage = e => {
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
   if (d.resetKnown) { HK.fill(0); hN = 0; FK.clear(); return; }
   if (d.tsdfReset) { TB.clear(); TREG.clear(); tDirty.clear(); tMeshed.clear(); return; }
-  if (d.refine) { const res = refine(d.frames, d.tsdf, m => postMessage({ refineMsg: m })); const t = tsdfPack(); postMessage({ refined: d.refine, loops: res.loops, loopShift: res.loopShift, t, corr: res.corr, median: res.median, aligned: res.aligned }); return; }
+  if (d.refine) { const res = refine(d.frames, d.tsdf, m => postMessage({ refineMsg: m })); const t = tsdfPack(); postMessage({ refined: d.refine, loops: res.loops, loopShift: res.loopShift, t, corr: res.corr, median: res.median, aligned: res.aligned }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
   if (d.tsdfLoad) { tsdfUnpack(d.tsdfLoad, d.T); return; }
   if (d.mergeTsdf) { TB = new Map(); TREG = new Map(); tsdfUnpack(d.mergeTsdf[0], null); tsdfUnpack(d.mergeTsdf[1], d.mergeTsdf[2]); const t = tsdfPack(); postMessage({ merged: d.mergeId, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
   if (d.tsdfDump) { const t = tsdfPack(); postMessage({ tsdfDump: d.tsdfDump, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
@@ -1302,7 +1324,7 @@ function liveCull() {                                               // regions f
 function liveClear() { for (const o of liveM.values()) { tsdfG.remove(o); o.geometry.dispose(); } liveM.clear(); }
 const tsdfDump = () => integ ? workerAsk(integ, {}, 'tsdfDump') : Promise.resolve(null);
 async function tsdfMeshOf(t, zones, floorY) {                       // mesh a saved TSDF in a throwaway worker (doesn't touch the live one)
-  const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
+  const w = srcWorker(INTEG_SRC);
   const m = await new Promise((res, rej) => { w.onmessage = e => { if (e.data.meshAll) res(e.data.m); }; w.onerror = e => rej(new Error(e.message || 'mesh worker failed'));
     w.postMessage({ tsdfLoad: t }); w.postMessage({ tsdfMeshAll: 1, zones, floorY }); });
   w.terminate(); return m;
@@ -1315,14 +1337,14 @@ function camAligned(a) {                                                       /
 }
 function integWorker() {
   if (integ) return integ;
-  integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
+  integ = srcWorker(INTEG_SRC);
   integ.onmessage = e => { const d = e.data;
     if (d.tsdfDump || d.meshAll) { const f = wReq.get(d.tsdfDump || d.meshAll); wReq.delete(d.tsdfDump || d.meshAll); if (f) f(d.t || d.m); return; }
     depth.wBusy = false; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
-    if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
+    if (d.gen !== (depth.gen || 0)) return; if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add);
     if (d.corr) { setD(rigidify(new M4().fromArray(d.corr)).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
     if (d.track) { depth.track = d.track; depth.trackOK = (depth.trackOK || 0) * .9 + (d.track.ok ? .1 : 0); }
-    if (d.raw && scanning && !replayMode) { if (!currentId) currentId = 'scan-' + Date.now(); DB.putDepth(Object.assign(d.raw, { scan: currentId, k: currentId + '/d' + d.raw.tCap, t: d.raw.tCap })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
+    if (d.raw && scanning && !replayMode) { const sc = scanId(); DB.putDepth(Object.assign(d.raw, { scan: sc, k: sc + '/d' + d.raw.tCap, t: d.raw.tCap })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
     if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
     exposureMatch(d);
     if (d.moving) { lagTest(d); if (!depth.lagOK || (d.lagUsed || 0) !== (depth.lag || 0)) return;   // a moving frame is fused only once the lag is known
@@ -1389,8 +1411,8 @@ function cleanSlice(budget) {
     if (cnt[id] < CONF) {                                             // never confirmed (noise) or erased: fade, then free the slot
       if (vkey[id] < 0) continue; const idle = performance.now() / 1000 - seenT[id];
       // erased and gone 3 s, or never confirmed in 20 s: free the slot
-      if (idle > (cnt[id] <= .01 ? 3 : 20)) { vmap.delete(vkey[id]); const ix = Math.floor(pos[id * 3] / VS), iy = Math.floor(pos[id * 3 + 1] / VS), iz = Math.floor(pos[id * 3 + 2] / VS), c = cells.get(ckey(ix, iy, iz));
-        if (c) { const j = c.ids.indexOf(id); if (j >= 0) c.ids.splice(j, 1); } vkey[id] = -1; tl[id] = 0; cw[id] = 0; markDirty(id); freeIds.push(id); recycled++; if (mapFull) mapFull = false; }
+      if (idle > (cnt[id] <= .01 ? 3 : 20)) { vmap.delete(vkey[id]); const [ix, iy, iz] = unkey(vkey[id]), c = cells.get(ckey(ix, iy, iz));
+        if (c) { const j = c.ids.indexOf(id); if (j >= 0) c.ids.splice(j, 1); } vkey[id] = -1; cnt[id] = 0; tl[id] = 0; cw[id] = 0; markDirty(id); freeIds.push(id); recycled++; if (mapFull) mapFull = false; }
       continue; }
     if (cnt[id] >= 10) continue;
     const ix = Math.floor(pos[id * 3] / VS), iy = Math.floor(pos[id * 3 + 1] / VS), iz = Math.floor(pos[id * 3 + 2] / VS);
@@ -1418,15 +1440,18 @@ const DB = (() => {
   const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => {
     const r = indexedDB.open('house-scanner', 4);
     r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('live')) d.createObjectStore('live', { keyPath: 'id' }); };
-    r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error);
+    r.onsuccess = () => { db = r.result; db.onversionchange = () => { db.close(); db = null; }; res(db); }; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error('close the scanner in other tabs'));
   });
-  const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
+  const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onabort = t.onerror = ev => rej(t.error || (ev && ev.target && ev.target.error) || new Error('storage write aborted')); }));
   return {
     put: o => tx('scans', 'readwrite', s => s.put(o)), all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => tx('scans', 'readwrite', s => s.delete(id)),
     putFrame: o => tx('frames', 'readwrite', s => s.put(o)), frames: id => tx('frames', 'readonly', s => s.index('scan').getAll(id)), countFrames: id => tx('frames', 'readonly', s => s.index('scan').count(id)),
     putLive: o => tx('live', 'readwrite', s => s.put(o)), allLive: () => tx('live', 'readonly', s => s.getAll()), delLive: id => tx('live', 'readwrite', s => s.delete(id)),
     putDepth: o => tx('depth', 'readwrite', s => s.put(o)), depthFrames: id => tx('depth', 'readonly', s => s.index('scan').getAll(id)), countDepth: id => tx('depth', 'readonly', s => s.index('scan').count(id)),
     delDepth: id => tx('depth', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; }),
+    putIfSame: rec => tx('scans', 'readwrite', s => { const out = { result: false }, g = s.get(rec.id); g.onsuccess = () => { const cur = g.result; if (cur && cur.date === rec.date) { s.put(rec); out.result = true; } }; return out; }),   // one transaction: no newer save can slip in between
+    adopt: (from, to) => Promise.all(['frames', 'depth'].map(st => tx(st, 'readwrite', s => { const q = s.index('scan').openCursor(IDBKeyRange.only(from)); q.onsuccess = () => { const c = q.result; if (!c) return; const v = Object.assign({}, c.value, { scan: to, k: to + c.value.k.slice(from.length) }); s.put(v); c.delete(); c.continue(); }; return null; }))),
+    depthKeys: id => tx('depth', 'readonly', s => s.index('scan').getAllKeys(id)), getFrame: k => tx('frames', 'readonly', s => s.get(k)), getDepth: k => tx('depth', 'readonly', s => s.get(k)),
     delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
   };
 })();
@@ -1459,27 +1484,30 @@ function snapshot() {
     floorY: pmat.uniforms.floorY.value, layoutEdits: layoutEditsOut(), ...fineOut()
   };
 }
-async function saveScan(frame) {
-  if (cont && !cont.moved && cont.M && currentId === cont.rec.id) { cont.moved = true; const I4 = cont.M.elements.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6); if (!I4) await moveOldFrames(currentId, cont.M, sessionT0); }
+function scanId() { return currentId || (currentId = 'scan-' + Date.now()); }
+let anchorPose = null, lastSaveId = null;                                             // the origin anchor's pose, refreshed by the frame loop (an XRFrame is dead after an await)
+async function saveScan() {
+  let moveNow = false;
+  if (cont && !cont.moved && cont.M && currentId === cont.rec.id) { moveNow = true; cont.moved = true; const I4 = cont.M.elements.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6); if (!I4) await moveOldFrames(currentId, cont.M, sessionT0).catch(e => { cont.moved = false; throw e; }); }
   const tsdf = await Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 4000))]);
   const s = snapshot(); if (tsdf && tsdf.keys.length) s.tsdf = tsdf; s.D = Array.from(Dm.elements); if (!s.points.length) { toast('Nothing captured yet'); return; }
-  const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
-  if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
+  const id = scanId(), rec = Object.assign(s, { id, date: Date.now() });
+  if (relocate) rec.name = (relocate.rec.name || 'House scan') + ' · new part';   // not yet placed in the old scan: kept as its own scan (Merge with… joins them)
+  else { const old = await DB.get(id).catch(() => null); rec.name = old ? old.name : (cont ? cont.rec.name : 'House scan'); }
   /* a persistent anchor at the scan origin: next time, the headset relocates it and the scan snaps back into place */
   if (originAnchor && originAnchor.requestPersistentHandle) {
     try {
       if (!anchorUUID) anchorUUID = await originAnchor.requestPersistentHandle();
-      const ap = frame && frame.getPose(originAnchor.anchorSpace, refSpace);
-      rec.anchor = { uuid: anchorUUID, m: ap ? Array.from(ap.transform.matrix) : null };
+      rec.anchor = { uuid: anchorUUID, m: anchorPose ? anchorPose.slice() : null };
     } catch (e) { rec.anchor = null; }
   }
-  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed; DB.delLive(rec.id).catch(() => {}); autoEnqueue(rec.id);
+  await DB.put(rec); lastSave = Date.now(); lastSaveId = id; savedConf = confirmed; DB.delLive(rec.id).catch(() => {}); autoEnqueue(rec.id);
   if (navigator.storage && navigator.storage.persist && !saveScan.persisted) { saveScan.persisted = true; navigator.storage.persist().then(ok => diagLog('storage', ok ? 'persistent' : 'may be evicted')).catch(() => {}); }   // stop the browser deleting scans when space runs low
   toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
 }
 let pendingLoad = null;                                     // waits for the anchor to be found again
 async function loadIntoSession(rec) {
-  currentId = rec.id; let T = new M4();
+  const s0 = xrSession; if (!s0) return; currentId = replayMode ? rec.id : null; let T = new M4();
   if (!replayMode) {                                               // continuing: find the old scan in what you see now, then load it exactly there
     relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null };
     if (rec.anchor && rec.anchor.uuid && rec.anchor.m && xrSession.restorePersistentAnchor) {
@@ -1495,9 +1523,7 @@ async function loadIntoSession(rec) {
 /* continuing a saved scan: remember how it was placed, so recalibration can reload it and its old photos/depth frames can be moved into this session's frame on save */
 let cont = null, sessionT0 = 0;
 function resetLiveMap() { clearMap(); if (cont) mergeRecord(cont.rec, cont.T0, true); }
-async function putIfSame(rec) {                                     // background jobs never overwrite a newer save of the same scan
-  const cur = await DB.get(rec.id).catch(() => null); if (cur && cur.date !== rec.date) return false; await DB.put(rec); return true;
-}
+function putIfSame(rec) { return DB.putIfSame(rec); }               // background jobs never overwrite a newer save, and never bring back a deleted scan
 async function moveOldFrames(id, M, before) {                       // old photos and depth frames -> this session's map frame
   const m4 = new M4(); let n = 0;
   for (const f of await DB.frames(id).catch(() => [])) if (f.t < before) { f.m = Array.from(m4.copy(M).multiply(new M4().fromArray(f.m)).elements); if (f.m0) f.m0 = Array.from(m4.copy(M).multiply(new M4().fromArray(f.m0)).elements); await DB.putFrame(f); n++; }
@@ -1537,7 +1563,8 @@ async function zipMany(files) {                                    // stored (un
     const data = new Uint8Array(await f.blob.arrayBuffer()), nm = new TextEncoder().encode(f.name), crc = CRC(data);
     const lh = new DataView(new ArrayBuffer(30)); lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true);
     const ch = new DataView(new ArrayBuffer(46)); ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
-    parts.push(lh.buffer, nm, data); central.push(ch.buffer, nm); off += 30 + nm.length + data.length;
+    parts.push(lh.buffer, nm, f.blob); central.push(ch.buffer, nm); off += 30 + nm.length + data.length;   // the Blob, not the bytes: memory stays one file at a time
+    if (off > 0xFFFFFFFF || central.length / 2 > 65535) throw new Error('export too large for one zip (over 4 GB or 65,535 files)');
   }
   const cl = central.reduce((a, x) => a + (x.byteLength ?? x.length), 0);
   const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cl, true); end.setUint32(16, off, true);
@@ -1558,7 +1585,7 @@ async function photoDepths(rec, frames, say, raw, scale) {
   const sc2 = new THREE.Scene(), out = []; for (const m of parts) { if (!m.I.length) continue; const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1)); const o = new THREE.Mesh(g, ibrDist); o.frustumCulled = false; sc2.add(o); }
   const cam = new THREE.PerspectiveCamera(); cam.matrixAutoUpdate = false; cam.matrixWorldAutoUpdate = false;
   let rt = null; const prevT = renderer.getRenderTarget(), cc = new THREE.Color(), ca = renderer.getClearAlpha(); renderer.getClearColor(cc);
-  for (let i = 0; i < frames.length; i++) { const f = frames[i]; if (i % 20 === 0) say('depth ' + (i + 1) + ' / ' + frames.length);
+  try { for (let i = 0; i < frames.length; i++) { const f = frames[i]; if (i % 20 === 0) say('depth ' + (i + 1) + ' / ' + frames.length);
     const w = Math.max(16, Math.round(f.w * (scale || .5))), h = Math.max(16, Math.round(f.h * (scale || .5))), fx = 1 / Math.tan(f.hfov / 2), asp = f.w / f.h, n = .05, fa = 30;
     if (!rt || rt.width !== w || rt.height !== h) { if (rt) rt.dispose(); rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.FloatType }); }
     cam.projectionMatrix.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
@@ -1566,8 +1593,8 @@ async function photoDepths(rec, frames, say, raw, scale) {
     const xrEn = renderer.xr.enabled; renderer.xr.enabled = false; renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(sc2, cam); renderer.xr.enabled = xrEn;
     const px = new Float32Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
     const mm = new Uint16Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = px[((h - 1 - y) * w + x) * 4]; mm[y * w + x] = v > .05 && v < 60 ? Math.round(v * 1000) : 0; }   // top row first, like the photo
-    out.push(raw ? { w, h, mm } : await png16(w, h, mm)); if (i % 8 === 7) await new Promise(r => setTimeout(r, 0)); }
-  renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose();   // (restores the headset's own target) sc2.traverse(o => o.geometry && o.geometry.dispose());
+    out.push(raw ? { w, h, mm } : await png16(w, h, mm)); if (i % 8 === 7) await new Promise(r => setTimeout(r, 0)); } }
+  finally { renderer.xr.enabled = !!xrSession || renderer.xr.enabled; renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose(); sc2.traverse(o => o.geometry && o.geometry.dispose()); }   // restores the headset's own target
   return out;
 }
 async function exportPhotos(rec) {
@@ -1601,7 +1628,7 @@ async function download(name, blob) {
 }
 function exportJSON(rec) {
   const o = { format: 'house-scanner/1', name: rec.name, date: rec.date, voxelSize: rec.voxelSize, floorY: rec.floorY, points: b64(rec.points), counts: rec.counts ? b64(rec.counts) : null,
-    planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null,
+    planes: rec.planes, meshes: rec.meshes.map(m => ({ label: m.label, m: m.m, v: b64(m.v), i: b64(m.i) })), anchor: rec.anchor || null, D: rec.D || null,
     masks: rec.masks ? b64(rec.masks) : null, colors: rec.colors ? b64(rec.colors) : null, normals: rec.normals ? b64(rec.normals) : null, understanding: rec.understanding || null,
     layoutEdits: rec.layoutEdits ? { cell: rec.layoutEdits.cell, removed: b64(rec.layoutEdits.removed), added: b64(rec.layoutEdits.added) } : null,
     tsdf: rec.tsdf ? { vs: rec.tsdf.vs, bs: rec.tsdf.bs, mu: rec.tsdf.mu, wscale: rec.tsdf.wscale || 6, keys: b64(rec.tsdf.keys), d: b64(rec.tsdf.d), w: b64(rec.tsdf.w), c: b64(rec.tsdf.c) } : null,
@@ -1632,19 +1659,22 @@ function plyBlob(rec) {
 /* offline refinement of a saved scan from its raw depth frames: re-align every frame to the consensus surface and re-fuse */
 async function refineScan(rec, say) {
   const st = { set textContent(m) { (say || (t => $('st').textContent = t))(m); } }; st.textContent = 'Loading depth frames…';
-  let fr = (await DB.depthFrames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
-  if (fr.length > 1200) { const k = fr.length / 1200; fr = Array.from({ length: 1200 }, (_, i) => fr[Math.floor(i * k)]); }   // a long scan: an even 1200 frames re-align the whole thing in reasonable time
+  let keys = (await DB.depthKeys(rec.id).catch(() => [])).sort((a, b) => +a.split('/d').pop() - +b.split('/d').pop());   // key ends with the capture time
+  if (keys.length > 1200) { const k = keys.length / 1200; keys = Array.from({ length: 1200 }, (_, i) => keys[Math.floor(i * k)]); }
+  let fr = []; for (const k of keys) { const d = await DB.getDepth(k).catch(() => null); if (d) fr.push(d); } fr.sort((a, b) => a.t - b.t);   // a long scan: an even 1200 frames re-align the whole thing in reasonable time
   if (fr.length < 20) { st.textContent = 'Not enough raw depth frames saved with this scan (' + fr.length + '). Scans made from now on keep them.'; return; }
-  const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' }))), t0 = performance.now();
+  const w = srcWorker(INTEG_SRC), t0 = performance.now();
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.refineMsg) st.textContent = 'Refining: ' + e.data.refineMsg + '…'; if (e.data.refined) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'refine failed'));
     st.textContent = 'Refining ' + fr.length + ' frames…'; w.postMessage({ refine: 1, frames: fr, tsdf: rec.tsdf || null }); }).catch(e => { st.textContent = 'Refine failed: ' + e.message; return null; });
   w.terminate(); if (!res) return;
   rec.tsdf = res.t; delete rec.meshCache; delete rec.tex; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, loops: res.loops || 0, loopShift_m: res.loopShift || 0, at: Date.now() };
-  /* photos: move each one by the correction of the depth frame taken closest to it */
+  if (!(await putIfSame(rec))) { st.textContent = 'Scan was saved again while refining: refine skipped'; return; }
+  /* photos and raw depth frames: move each by the correction of the depth frame taken closest to it (so Refine can run again) */
+  const near = t => { let lo = 0, hi = fr.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (fr[m].t < t) lo = m; else hi = m; } return Math.abs(fr[lo].t - t) <= Math.abs(fr[hi].t - t) ? lo : hi; };
+  for (const k of await DB.depthKeys(rec.id).catch(() => [])) { const d = await DB.getDepth(k).catch(() => null); if (!d || !d.X) continue; d.X = Array.from(new M4().fromArray(res.corr[near(d.t)]).multiply(new M4().fromArray(d.X)).elements); await DB.putDepth(d); }
   const kfs = await DB.frames(rec.id).catch(() => []); let moved = 0;
   for (const k of kfs) { let best = -1, bd = 2500; fr.forEach((f, i) => { const dt = Math.abs(f.t - k.t); if (dt < bd) { bd = dt; best = i; } });
     if (best >= 0) { const Cc = new M4().fromArray(res.corr[best]); k.m = Array.from(Cc.clone().multiply(new M4().fromArray(k.m)).elements); if (k.m0) k.m0 = Array.from(Cc.multiply(new M4().fromArray(k.m0)).elements); await DB.putFrame(k); moved++; } }
-  if (!(await putIfSame(rec))) { st.textContent = 'Scan was saved again while refining: refine skipped'; return; }
   st.textContent = 'Refined in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s: ' + res.aligned + '/' + fr.length + ' frames re-aligned (median shift ' + (res.median * 1000).toFixed(0) + ' mm), ' + moved + ' photos updated';
 }
 async function exportGLB(rec) {
@@ -1660,10 +1690,10 @@ async function exportGLBraw(rec) {
   const add = (arr, target) => { const b = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength); chunks.push(b); const pad = (4 - b.byteLength % 4) % 4; if (pad) chunks.push(new Uint8Array(pad)); views.push({ buffer: 0, byteOffset: off, byteLength: b.byteLength, ...(target ? { target } : {}) }); off += b.byteLength + pad; return views.length - 1; };
   const acc = (arr, type, ct, count, norm, mm) => { accs.push({ bufferView: add(arr, ct === 5125 ? 34963 : 34962), componentType: ct, count, type, ...(norm ? { normalized: true } : {}), ...(mm || {}) }); return accs.length - 1; };
   const bounds = P => { const mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9]; for (let i = 0; i < P.length; i += 3) for (let a = 0; a < 3; a++) { mn[a] = Math.min(mn[a], P[i + a]); mx[a] = Math.max(mx[a], P[i + a]); } return { min: mn, max: mx }; };
-  const n = rec.points.length / 3, C = new Uint8Array(n * 4);
+  const n = rec.points.length / 3, C = new Uint16Array(n * 4), L16 = v => Math.round(65535 * (v <= 10.31 ? v / 3294.6 : Math.pow((v / 255 + .055) / 1.055, 2.4)));   // glTF colours are linear
   for (let k = 0; k < n; k++) { const hc = rec.colors && rec.colors[k * 4 + 3], h = Math.max(0, Math.min(1, (rec.points[k * 3 + 1] - (rec.floorY || 0)) / 2.7));
-    C[k * 4] = hc ? rec.colors[k * 4] : 160 + 40 * h; C[k * 4 + 1] = hc ? rec.colors[k * 4 + 1] : 130 + 85 * h; C[k * 4 + 2] = hc ? rec.colors[k * 4 + 2] : 100 + 130 * h; C[k * 4 + 3] = 255; }
-  if (n) { meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5121, n, true) } }] }); nodes.push({ name: 'scan points', mesh: meshesG.length - 1 }); }
+    C[k * 4] = L16(hc ? rec.colors[k * 4] : 160 + 40 * h); C[k * 4 + 1] = L16(hc ? rec.colors[k * 4 + 1] : 130 + 85 * h); C[k * 4 + 2] = L16(hc ? rec.colors[k * 4 + 2] : 100 + 130 * h); C[k * 4 + 3] = 65535; }
+  if (n) { meshesG.push({ name: 'scan points', primitives: [{ mode: 0, attributes: { POSITION: acc(rec.points, 'VEC3', 5126, n, false, bounds(rec.points)), COLOR_0: acc(C, 'VEC4', 5123, n, true) } }] }); nodes.push({ name: 'scan points', mesh: meshesG.length - 1 }); }
   const extra = {};
   if (rec._texMesh) {                                                 // photo-textured surface (JPEG atlas)
     const T = rec._texMesh, jpg = new Uint8Array(await T.img.arrayBuffer()), iv = add(jpg);
@@ -1703,7 +1733,7 @@ function parseJSON(o) {
   return { id: 'file-' + Date.now(), name: o.name || 'Imported scan', date: o.date || Date.now(), voxelSize: o.voxelSize, floorY: o.floorY || 0, points: unb64(o.points, Float32Array), counts: o.counts ? unb64(o.counts, Uint16Array) : null, masks: o.masks ? unb64(o.masks, Uint32Array) : null, colors: o.colors ? unb64(o.colors, Uint8Array) : null, normals: o.normals ? unb64(o.normals, Int8Array) : null, tsdf: o.tsdf ? { vs: o.tsdf.vs, bs: o.tsdf.bs, mu: o.tsdf.mu, wscale: o.tsdf.wscale || 6, keys: unb64(o.tsdf.keys, Float64Array), d: unb64(o.tsdf.d, Int8Array), w: unb64(o.tsdf.w, Uint8Array), c: unb64(o.tsdf.c, Uint8Array) } : null,
     fineVoxel: o.fineVoxel || null, zones: o.zones || null, fpoints: o.fpoints ? unb64(o.fpoints, Float32Array) : null, fcolors: o.fcolors ? unb64(o.fcolors, Uint8Array) : null, fnormals: o.fnormals ? unb64(o.fnormals, Int8Array) : null, fcounts: o.fcounts ? unb64(o.fcounts, Uint16Array) : null,
     layoutEdits: o.layoutEdits ? { cell: o.layoutEdits.cell, removed: unb64(o.layoutEdits.removed, Float32Array), added: unb64(o.layoutEdits.added, Float32Array) } : null, understanding: o.understanding || null,
-    planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor };
+    planes: o.planes || [], meshes: (o.meshes || []).map(m => ({ label: m.label, m: m.m, v: unb64(m.v, Float32Array), i: unb64(m.i, Uint32Array) })), anchor: o.anchor, D: o.D || null };
 }
 
 
@@ -1754,7 +1784,7 @@ onmessage = e => {
   postMessage(out, [out.P.buffer, out.N.buffer, out.C.buffer, out.I.buffer]);
 };`;
 function meshPoints(P, Nn, C, cell, minW = .12) {
-  return new Promise((res, rej) => { const w = new Worker(URL.createObjectURL(new Blob([MESH_SRC], { type: 'text/javascript' })));
+  return new Promise((res, rej) => { const w = srcWorker(MESH_SRC);
     w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); rej(new Error(e.message || 'mesh worker failed')); };
     w.postMessage({ P, Nn, C, cell, minW }, [P.buffer, Nn.buffer, C.buffer]); });
 }
@@ -1789,7 +1819,8 @@ function showMesh(parts, T) {
     const o = new THREE.Mesh(g, meshMat); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; meshG.add(o); }
   applySurf();
 }
-function meshClear() { ibrStop(); for (const o of meshG.children) { o.geometry.dispose(); if (o.userData.tex) { o.material.map.dispose(); o.material.dispose(); } } meshG.clear(); }
+function meshClear() { ibrStop(); for (const o of meshG.children) { o.geometry.dispose(); const base = o.userData.base || o.material, map = base && base.map;
+    if (map) { if (map.image && map.image.close) map.image.close(); map.dispose(); } if (o.userData.tex && base) base.dispose(); if (o.userData.ibr) o.material.dispose(); } meshG.clear(); }
 function applySurf() {                                          // saved surface mesh, else the live mesh (in mesh mode), else the point map
   const m = surfOn && meshG.children.length > 0, live = !m && (showMode === 3 || showMode === 4) && liveM.size > 0;
   if (!m && !viewer.on && !replayMode) { if (showMode === 4 && kfMem.length) ibrStartLive(); else if (ibr.live) ibrStop(); }
@@ -1893,14 +1924,13 @@ async function recTexture(rec, say = () => {}) {
   if (!dms && !depths.length) throw new Error('no way to check occlusion for this scan');
   const Q = m.I.length / 6, opt = [[2048, 4], [4096, 4], [4096, 3], [4096, 2], [8192, 3], [8192, 2]].find(([a, t]) => Math.floor(a / (t + 2)) ** 2 >= Q);   // texel size adapts so a whole house fits
   if (!opt) throw new Error('mesh too large for one photo texture (' + Q + ' patches)'); const [A, Ts] = opt;
-  const w = new Worker(URL.createObjectURL(new Blob([BAKE_SRC], { type: 'text/javascript' })));
-  const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onerror = e => no(new Error(e.message || 'texture bake failed'));
-    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map((f, i) => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, k1: f.k1 || 0, sharp: f.sharp, t: f.t, dm: dms ? dms[i] : null })), depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }, dms ? dms.map(d => d.mm.buffer) : []); });
-  w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await putIfSame(rec).catch(() => {});
+  const w = srcWorker(BAKE_SRC);
+  const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onmessageerror = () => no(new Error('texture bake ran out of memory')); w.onerror = e => no(new Error(e.message || 'texture bake failed'));
+    setTimeout(() => no(new Error('texture bake timed out')), 900000); w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map((f, i) => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, k1: f.k1 || 0, sharp: f.sharp, t: f.t, dm: dms ? dms[i] : null })), depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }, dms ? dms.map(d => d.mm.buffer) : []); }).finally(() => w.terminate()); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await putIfSame(rec).catch(() => {});
   return tex;
 }
 async function showTexMesh(tex, T, extraParts) {
-  const bmp = await createImageBitmap(tex.img), t = new THREE.Texture(bmp); t.flipY = false; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; t.needsUpdate = true;
+  const bmp = await createImageBitmap(tex.img), t = new THREE.Texture(bmp); t.flipY = false; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; t.generateMipmaps = bmp.width <= 4096; if (!t.generateMipmaps) t.minFilter = THREE.LinearFilter; t.needsUpdate = true;
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(tex.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(tex.N, 3)); g.setAttribute('uv', new THREE.BufferAttribute(tex.U, 2)); g.setIndex(new THREE.BufferAttribute(tex.I, 1));
   showMesh(extraParts || [], T);                                    // detail zones keep their own coloured mesh
   const o = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: t, side: THREE.DoubleSide, transparent: true })); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; o.userData.tex = true; meshG.add(o); applySurf();
@@ -2042,29 +2072,28 @@ onmessage = async e => {
 };`;
 async function alignPhotos(rec, say = () => {}) {
   const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface');
-  const all = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m).sort((a, b) => a.t - b.t), depths = await DB.depthFrames(rec.id).catch(() => []);
+  const all = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m).sort((a, b) => a.t - b.t);
   if (all.length < 5) throw new Error('need at least 5 photos');
   const stride = Math.max(1, Math.ceil(all.length / 220)), frames = all.filter((_, i) => i % stride === 0);   // the solve uses an even subset; the result applies to all
-  say('rendering what each photo saw'); const dms = await photoDepths(rec, frames, m => say('occlusion ' + m), true, .2).catch(() => null);
+  say('rendering what each photo saw'); const dms = await photoDepths(rec, frames, m => say('occlusion ' + m), true, .2).catch(() => null), depths = dms ? [] : await DB.depthFrames(rec.id).catch(() => []);
   let E0 = null; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.E) E0 = c.E; } catch (e) {}
   if (!E0) E0 = new M4().elements.slice();
-  const w = new Worker(URL.createObjectURL(new Blob([PALIGN_SRC], { type: 'text/javascript' })));
+  const w = srcWorker(PALIGN_SRC);
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'photo matching failed'));
     let K10 = 0; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.k1) K10 = c.k1; } catch (e) {}
     w.postMessage({ P: m.P, N: m.N, E0, K10, W: 400,
       photos: frames.map((f, i) => ({ dm: dms ? dms[i] : null, blob: f.blob, m0: f.m0 || (f.E ? new M4().fromArray(f.m).multiply(new M4().fromArray(f.E).invert()).elements.slice() : f.m), hfov: f.hfov0 || f.hfov, cx: f.cx0 != null ? f.cx0 : f.cx, cy: f.cy0 != null ? f.cy0 : f.cy, t: f.t })),
-      depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }, dms ? dms.map(d => d.mm.buffer) : []); });
-  w.terminate();
+      depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }, dms ? dms.map(d => d.mm.buffer) : []); }).finally(() => w.terminate());
   if (!(res.edge1 < res.edge0 - .05 || res.rms1 < res.rms0)) throw new Error('photo matching did not improve (edges ' + (res.edge0 || 0).toFixed(2) + ' px, colour ' + res.rms0.toFixed(3) + ')');
   { const Em = new M4().fromArray(res.E), off = new V3().setFromMatrixPosition(Em).length(), rot = new THREE.Quaternion().setFromRotationMatrix(Em).angleTo(new THREE.Quaternion()) * 180 / Math.PI;
     if (off > .12 || rot > 8 || Math.abs(res.s) > .2) throw new Error('implausible camera calibration rejected (' + (off * 100).toFixed(0) + ' cm, ' + rot.toFixed(1) + '°)'); }
   const solved = new Map();
   for (const p of res.photos) { const f = frames[p.k];
-    if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
+    if (!f.m0) f.m0 = f.m; if (f.hfov0 == null) { f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
     f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.k1 = p.k1; f.gain = p.gain; f.aligned = true; solved.set(f.k, f); await DB.putFrame(f); }
   const sv = [...solved.values()], Em = new M4().fromArray(res.E);
   for (const f of all) { if (solved.has(f.k)) continue;                // the rest: same camera offset and lens, gain from the nearest solved photo in time
-    if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
+    if (!f.m0) f.m0 = f.m; if (f.hfov0 == null) { f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
     f.m = Array.from(new M4().fromArray(f.m0).multiply(Em).elements); f.hfov = 2 * Math.atan(Math.tan(f.hfov0 / 2) / (1 + res.s)); f.cx = f.cx0 + res.cx; f.cy = f.cy0 + res.cy; f.k1 = res.k1 || 0;
     let nb = sv[0], bd = 1e18; for (const g of sv) { const dt = Math.abs(g.t - f.t); if (dt < bd) { bd = dt; nb = g; } } f.gain = nb ? nb.gain : 1; f.aligned = true; await DB.putFrame(f); }
   /* the camera calibration carries over: future scans colour and photograph with it */
@@ -2078,28 +2107,31 @@ async function alignPhotos(rec, say = () => {}) {
 
 /* ================= whole house: merge separately scanned rooms, and draw a floor plan ================= */
 function relocArrays(SP, SN, LP, LN) {                              // wall-matching search between two point sets (same engine as Continue)
-  const w = new Worker(URL.createObjectURL(new Blob([RELOC_SRC], { type: 'text/javascript' })));
-  return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); }; w.postMessage({ SP, SN, LP, LN, guess: null }); });
+  const w = srcWorker(RELOC_SRC);
+  return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); }; w.postMessage({ SP, SN, LP, LN, guess: null, minCells: 30 }); });
 }
 async function mergeScans(A, B, say) {
   say('finding where the two scans overlap…');
   const BN = new Float32Array(B.points.length); if (B.normals) for (let i = 0; i < BN.length; i++) BN[i] = B.normals[i] / 127;
   const res = await relocArrays(A.points, A.normals || new Int8Array(A.points.length), B.points, BN);
   if (!res.ok && (res.wallFit || 0) > .6) throw new Error('the shared area matches in more than one place (too plain or symmetric). Scan a doorway or furniture that both scans see, then try again');
+  if (res.noSaved || res.need) throw new Error('one of the scans has too few walls with surface directions to match (' + Math.round(res.wallCells || 0) + ' wall cells)');
   if (!res.ok) throw new Error('no shared area found (' + Math.round((res.wallFit || 0) * 100) + '% fit). Scan the doorway or hall that connects them in both scans, then try again');
   const M = new M4().fromArray(res.A).invert(), Rn = new THREE.Matrix3().setFromMatrix4(M), v = new V3();   // B's frame -> A's frame
   const tP = P => { const o = new Float32Array(P.length); for (let i = 0; i < P.length; i += 3) { v.set(P[i], P[i + 1], P[i + 2]).applyMatrix4(M); o[i] = v.x; o[i + 1] = v.y; o[i + 2] = v.z; } return o; };
   const tN = Nn => { const o = new Int8Array(Nn.length); for (let i = 0; i < Nn.length; i += 3) { v.set(Nn[i], Nn[i + 1], Nn[i + 2]).applyMatrix3(Rn); o[i] = Math.round(v.x); o[i + 1] = Math.round(v.y); o[i + 2] = Math.round(v.z); } return o; };
   const cat = (T, a, b) => { if (!a && !b) return null; const x = a || new T(0), y = b || new T(0), o = new T(x.length + y.length); o.set(x); o.set(y, x.length); return o; };
+  const fcat = (T, w, key, fill) => { if (!A.fpoints && !B.fpoints) return null; const side = R => R[key] || new T((R.fpoints ? R.fpoints.length / 3 : 0) * w).fill(fill); return cat(T, side(A), side(B)); };
   say('joining the surfaces…');
   let tsdf = A.tsdf || null;
-  if (A.tsdf && B.tsdf) { const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-    tsdf = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.merged) ok(e.data.t); }; w.onerror = e => no(new Error(e.message || 'merge failed')); w.postMessage({ mergeTsdf: [A.tsdf, B.tsdf, Array.from(M.elements)], mergeId: 1 }); }); w.terminate(); }
+  if (A.tsdf && B.tsdf) { const w = srcWorker(INTEG_SRC);
+    tsdf = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.merged) ok(e.data.t); }; w.onerror = e => no(new Error(e.message || 'merge failed')); w.postMessage({ mergeTsdf: [A.tsdf, B.tsdf, Array.from(M.elements)], mergeId: 1 }); }).finally(() => w.terminate()); }
+  else if (A.tsdf || B.tsdf) tsdf = null;                           // only one has a surface: mesh both from points instead of losing one room
   const id = 'scan-' + Date.now(), nB = B.points.length / 3;
   const rec = { id, name: A.name + ' + ' + B.name, date: Date.now(), voxelSize: A.voxelSize, floorY: A.floorY || 0, D: A.D || null, anchor: A.anchor || null, layoutEdits: A.layoutEdits || null, planes: A.planes || [], meshes: A.meshes || [], understanding: null,
-    points: cat(Float32Array, A.points, tP(B.points)), counts: cat(Uint16Array, A.counts, B.counts || new Uint16Array(nB).fill(CONF)), masks: null, colors: cat(Uint8Array, A.colors || new Uint8Array(A.points.length / 3 * 4), B.colors || new Uint8Array(nB * 4)),
+    points: cat(Float32Array, A.points, tP(B.points)), counts: cat(Uint16Array, A.counts || new Uint16Array(A.points.length / 3).fill(CONF), B.counts || new Uint16Array(nB).fill(CONF)), masks: null, colors: cat(Uint8Array, A.colors || new Uint8Array(A.points.length / 3 * 4), B.colors || new Uint8Array(nB * 4)),
     normals: cat(Int8Array, A.normals || new Int8Array(A.points.length), B.normals ? tN(B.normals) : new Int8Array(B.points.length)), tsdf, fineVoxel: A.fineVoxel || B.fineVoxel || null,
-    fpoints: cat(Float32Array, A.fpoints, B.fpoints ? tP(B.fpoints) : null), fcolors: cat(Uint8Array, A.fcolors, B.fcolors), fnormals: cat(Int8Array, A.fnormals, B.fnormals ? tN(B.fnormals) : null), fcounts: cat(Uint16Array, A.fcounts, B.fcounts),
+    fpoints: cat(Float32Array, A.fpoints, B.fpoints ? tP(B.fpoints) : null), fcolors: fcat(Uint8Array, 4, 'fcolors', 0), fnormals: A.fpoints || B.fpoints ? cat(Int8Array, A.fnormals || new Int8Array(A.fpoints ? A.fpoints.length : 0), B.fnormals ? tN(B.fnormals) : new Int8Array(B.fpoints ? B.fpoints.length : 0)) : null, fcounts: fcat(Uint16Array, 1, 'fcounts', CONF),
     zones: (A.zones || []).concat((B.zones || []).map(z => { v.set(z[0], z[1], z[2]).applyMatrix4(M); return [v.x, v.y, v.z, z[3]]; })), merged: { from: [A.id, B.id], wallFit: res.wallFit, overlap: res.overlap } };
   say('copying photos and depth frames…'); const mm = (arr) => Array.from(M.clone().multiply(new M4().fromArray(arr)).elements);
   for (const [src, move] of [[A, false], [B, true]]) {
@@ -2121,10 +2153,11 @@ function floorPlan(rec) {
   const n = P.length / 3, hist = new Map(); for (let i = 0; i < n; i++) if (Nn[i * 3 + 1] > 100) { const k = Math.round(P[i * 3 + 1] / .04); hist.set(k, (hist.get(k) || 0) + 1); }
   let fy = null, bc = 0; for (const k of [...hist.keys()].sort((a, b) => a - b)) { const c = hist.get(k) + (hist.get(k - 1) || 0) + (hist.get(k + 1) || 0); if (c > bc * 1.5 && c > 200) { fy = k * .04; bc = c; } }
   if (fy == null) throw new Error('no floor found in this scan');
-  const G = .05; let x0 = 1e9, z0 = 1e9, x1 = -1e9, z1 = -1e9;
-  for (let i = 0; i < n; i++) { const y = P[i * 3 + 1] - fy; if (y < -.1 || y > 2.2) continue; x0 = Math.min(x0, P[i * 3]); x1 = Math.max(x1, P[i * 3]); z0 = Math.min(z0, P[i * 3 + 2]); z1 = Math.max(z1, P[i * 3 + 2]); }
+  const G = .05, xs = [], zs = []; for (let i = 0; i < n; i += Math.max(1, n >> 17)) { const y = P[i * 3 + 1] - fy; if (y < -.1 || y > 2.2) continue; xs.push(P[i * 3]); zs.push(P[i * 3 + 2]); }
+  const pc = (A, q) => A[Math.min(A.length - 1, Math.max(0, Math.floor(A.length * q)))]; xs.sort((a, b) => a - b); zs.sort((a, b) => a - b);   // stray far-away points can't blow up the grid
+  let x0 = pc(xs, .002) - .3, x1 = pc(xs, .998) + .3, z0 = pc(zs, .002) - .3, z1 = pc(zs, .998) + .3; if (x1 - x0 > 100) x1 = x0 + 100; if (z1 - z0 > 100) z1 = z0 + 100;
   const W = Math.ceil((x1 - x0) / G) + 3, H = Math.ceil((z1 - z0) / G) + 3, F = new Uint8Array(W * H), Wl = new Uint8Array(W * H), at = (x, z) => (Math.floor((z - z0) / G) + 1) * W + Math.floor((x - x0) / G) + 1;
-  for (let i = 0; i < n; i++) { const y = P[i * 3 + 1] - fy, ny = Nn[i * 3 + 1] / 127; if (ny > .8 && Math.abs(y) < .1) F[at(P[i * 3], P[i * 3 + 2])] = 1; else if (Math.abs(ny) < .4 && y > 1.05 && y < 1.95) Wl[at(P[i * 3], P[i * 3 + 2])] = 1; }   // walls: vertical surface between 1.05 and 1.95 m (above tables, sofas and counters, below door tops)
+  for (let i = 0; i < n; i++) { const y = P[i * 3 + 1] - fy, ny = Nn[i * 3 + 1] / 127; if (P[i * 3] < x0 || P[i * 3] > x1 || P[i * 3 + 2] < z0 || P[i * 3 + 2] > z1) continue; if (ny > .8 && Math.abs(y) < .1) F[at(P[i * 3], P[i * 3 + 2])] = 1; else if (Math.abs(ny) < .4 && y > 1.05 && y < 1.95) Wl[at(P[i * 3], P[i * 3 + 2])] = 1; }   // walls: vertical surface between 1.05 and 1.95 m (above tables, sofas and counters, below door tops)
   const dil = (A, r) => { const o = new Uint8Array(A.length); for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) { if (!A[z * W + x]) continue; for (let b = -r; b <= r; b++) for (let a = -r; a <= r; a++) { const xx = x + a, zz = z + b; if (xx >= 0 && zz >= 0 && xx < W && zz < H) o[zz * W + xx] = 1; } } return o; };
   const ero = (A, r) => { const inv = A.map(v => 1 - v), d = dil(inv, r); return d.map(v => 1 - v); };
   const Wd = dil(Wl, 1), Fc = ero(dil(F, 4), 4).map((v, i) => v && !Wd[i] ? 1 : 0);   // close small gaps, never through walls
@@ -2199,10 +2232,10 @@ let liveIbrMat = null;
 function ibrStartLive() {                                           // photo-paint the live mesh (map frame -> world through D⁻¹)
   if (ibr.live || !kfMem.length) return; ibrStop(); ibr.live = true; ibr.on = true; ibr.k = 3; ibr.rec = null; ibr.frames = kfMem; ibr.gains = new Map();   // scanning already keeps the headset busy: 3 photos at a time
   if (!liveIbrMat) liveIbrMat = ibrMaterial(false); for (const o of liveM.values()) { o.material = liveIbrMat; o.layers.enable(3); }
-  for (const sl of ibr.slots) { sl.idx = -1; sl.on = 0; } ibr.t = 0;
+  for (const sl of ibr.slots) { sl.idx = -1; sl.F = null; sl.on = 0; } ibr.t = 0;
 }
 async function ibrStart(rec, T) {                                    // turn the live photo view on for a shown saved scan
-  ibr.on = false; ibr.rec = rec; ibr.T.copy(T); ibr.Ti.copy(T).invert(); for (const s of ibr.slots) { s.idx = -1; s.on = 0; }
+  ibr.on = false; ibr.rec = rec; ibr.T.copy(T); ibr.Ti.copy(T).invert(); for (const s of ibr.slots) { s.idx = -1; s.F = null; s.on = 0; }
   const fr = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m);
   if (ibr.rec !== rec || fr.length < 2) return;
   ibr.frames = fr.map(f => { const m = new M4().fromArray(f.m); return { f, m, p: new V3().setFromMatrixPosition(m), d: new V3(-m.elements[8], -m.elements[9], -m.elements[10]).normalize() }; });
@@ -2210,19 +2243,20 @@ async function ibrStart(rec, T) {                                    // turn the
   for (const o of meshG.children) { o.layers.enable(3); if (!o.userData.ibr) { o.userData.base = o.material; o.material = ibrMaterial(!!o.userData.tex, o.userData.tex ? o.material.map : null); o.userData.ibr = true; } }
   ibr.on = true; ibr.t = 0; applySurf();
 }
-function ibrStop() { if (ibr.live) for (const o of liveM.values()) { o.material = liveMat; } ibr.live = false; ibr.on = false; ibr.rec = null; ibr.frames = []; for (const s of ibr.slots) { s.idx = -1; s.on = 0; if (s.bmp) { s.bmp.close(); s.bmp = null; } } }
+function ibrStop() { if (ibr.live) for (const o of liveM.values()) { o.material = liveMat; } ibr.live = false; ibr.on = false; ibr.rec = null; ibr.frames = []; for (const s of ibr.slots) { s.idx = -1; s.F = null; s.on = 0; if (s.bmp) { s.bmp.close(); s.bmp = null; } } }
 async function ibrLoad(slot, k) {                                    // decode one photo into a slot and render that photo's depth view of the surface
-  const F = ibr.frames[k], f = F.f; ibr.loading = true;
+  const F = ibr.frames[k], f = F.f; ibr.loading = true; let b0 = null;
   try {
-    const b0 = await createImageBitmap(f.blob), w = Math.min(1024, b0.width), h = Math.round(w * b0.height / b0.width), bmp = await createImageBitmap(b0, { resizeWidth: w, resizeHeight: h }); b0.close();
+    const blob = f.blob || ((await DB.getFrame(f.k).catch(() => null)) || {}).blob; if (!blob) throw new Error('photo missing');
+    b0 = await createImageBitmap(blob); const w = Math.min(1024, b0.width), h = Math.round(w * b0.height / b0.width), bmp = await createImageBitmap(b0, { resizeWidth: w, resizeHeight: h }); b0.close(); b0 = null;
     if (!ibr.on) { bmp.close(); return; }
     if (slot.bmp) slot.bmp.close(); slot.bmp = bmp; slot.tex.image = bmp; slot.tex.needsUpdate = true;
     const Mw = ibr.T.clone().multiply(F.m), fx = 1 / Math.tan(f.hfov / 2), asp = w / h;
-    slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = f.gain || ibr.gains.get(f.t) || 1; slot.k1 = f.k1 || 0; slot.idx = k;
+    slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = f.gain || ibr.gains.get(f.t) || 1; slot.k1 = f.k1 || 0; slot.idx = k; slot.F = F;
     ibrShadow(slot, F, fx, asp);
     slot.on = 1; slot.fade = 0;
   } catch (e) { diagLog('ibr', e.message); }
-  ibr.loading = false;
+  finally { ibr.loading = false; if (b0) b0.close(); }
 }
 function ibrShadow(slot, F, fx0, asp0) {                             // the photo's own depth view (for occlusion), same projection as the photo
   if (!F) return; const f = F.f, fx = fx0 || slot.intr.x, asp = asp0 || slot.intr.y, Mw = ibr.T.clone().multiply(F.m);
@@ -2239,8 +2273,8 @@ function ibrUpdate(eyeCam) {                                         // pick the
   if (!ibr.on) return;
   if (ibr.live) {                                                    // live: the map frame drifts a little (drift fix), so re-place photos every frame
     ibr.T.copy(mapRoot.matrix); ibr.Ti.copy(ibr.T).invert();
-    for (const sl of ibr.slots) if (sl.idx >= 0 && ibr.frames[sl.idx]) { const Mw = ibr.T.clone().multiply(ibr.frames[sl.idx].m); sl.view.copy(Mw).invert(); sl.pos.setFromMatrixPosition(Mw); }
-    if (clockT - (ibr.shT || 0) > .7 && !ibr.loading) { ibr.shT = clockT; const sl = ibr.slots[(ibr.shI = ((ibr.shI || 0) + 1) % IBR_K)]; if (sl.on) ibrShadow(sl, ibr.frames[sl.idx]); }   // the mesh keeps growing: refresh one occlusion map at a time
+    for (const sl of ibr.slots) if (sl.F) { const Mw = ibr.T.clone().multiply(sl.F.m); sl.view.copy(Mw).invert(); sl.pos.setFromMatrixPosition(Mw); }
+    if (clockT - (ibr.shT || 0) > .7 && !ibr.loading) { ibr.shT = clockT; const sl = ibr.slots[(ibr.shI = ((ibr.shI || 0) + 1) % IBR_K)]; if (sl.on) ibrShadow(sl, sl.F); }   // the mesh keeps growing: refresh one occlusion map at a time
   }
   /* frame-rate guard: blend fewer photos if the headset is struggling, more when there's headroom */
   if (renderer.xr.isPresenting) { ibr.slow = fps < 62 ? (ibr.slow || 0) + 1 : 0; ibr.fast = fps > 70 ? (ibr.fast || 0) + 1 : 0;
@@ -2252,11 +2286,11 @@ function ibrUpdate(eyeCam) {                                         // pick the
   for (const mt of mats) { const U = mt.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = ibr.live ? .9 : meshMat.opacity; mt.depthWrite = ibr.live ? true : meshMat.depthWrite; }
   if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
   const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
-  const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
-  for (const sl of ibr.slots) { const r2 = sc.findIndex(x => x[1] === sl.idx); sl.rank = r2 < 0 ? IBR_K : r2; }
-  const want = new Set(sc.map(x => x[1])), have = new Set(ibr.slots.map(s => s.idx));
-  const missing = sc.find(x => !have.has(x[1])); if (!missing) return;
-  let slot = ibr.slots.find(s => s.idx < 0) || ibr.slots.filter(s => !want.has(s.idx)).sort((a, b) => b.idx - a.idx)[0]; if (!slot) return;
+  const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k, F]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
+  for (const sl of ibr.slots) { const r2 = sc.findIndex(x => x[2] === sl.F); sl.rank = r2 < 0 ? IBR_K : r2; }
+  const want = new Set(sc.map(x => x[2])), have = new Set(ibr.slots.map(s => s.F));
+  const missing = sc.find(x => !have.has(x[2])); if (!missing) return;
+  let slot = ibr.slots.find(s => !s.F) || ibr.slots.filter(s => !want.has(s.F))[0]; if (!slot) return;
   ibrLoad(slot, missing[1]);
 }
 
@@ -2268,18 +2302,19 @@ function floorOf(P, N) { const h = new Map(); for (let i = 0; i < P.length / 3; 
   let best = null, bc = 0; const ks = [...h.keys()].sort((a, b) => a - b); for (const k of ks) { const c = h.get(k) + (h.get(k - 1) || 0) + (h.get(k + 1) || 0); if (c > bc * 1.5 && c > 40) { best = k; bc = c; } } return best == null ? null : best * .04; }
 function walls(P, N, fy) { const out = []; for (let i = 0; i < P.length / 3; i++) { if (Math.abs(N[i * 3 + 1]) > .35) continue; const y = P[i * 3 + 1] - fy; if (y < .25 || y > 2) continue; const l = Math.hypot(N[i * 3], N[i * 3 + 2]) || 1; out.push(P[i * 3], P[i * 3 + 2], N[i * 3] / l, N[i * 3 + 2] / l); } return out; }
 function cells(W, g) {                                             // 2D wall cells with their mean facing direction
-  const m = new Map(); for (let i = 0; i < W.length; i += 4) { const k = Math.floor(W[i] / g) * 100000 + Math.floor(W[i + 1] / g); let c = m.get(k); if (!c) m.set(k, c = [0, 0, 0]); c[0]++; c[1] += W[i + 2]; c[2] += W[i + 3]; }
-  const out = []; for (const [k, c] of m) { if (c[0] < 2) continue; const l = Math.hypot(c[1], c[2]); if (l < c[0] * .6) continue; const x = Math.floor(k / 100000), z = k - x * 100000; out.push((x + .5) * g, (z + .5) * g, c[1] / l, c[2] / l); } return out; }
+  const m = new Map(); for (let i = 0; i < W.length; i += 4) { const k = (Math.floor(W[i] / g) + 50000) * 100000 + Math.floor(W[i + 1] / g) + 50000; let c = m.get(k); if (!c) m.set(k, c = [0, 0, 0]); c[0]++; c[1] += W[i + 2]; c[2] += W[i + 3]; }
+  const out = []; for (const [k, c] of m) { if (c[0] < 2) continue; const l = Math.hypot(c[1], c[2]); if (l < c[0] * .6) continue; const xo = Math.floor(k / 100000), x = xo - 50000, z = k - xo * 100000 - 50000; out.push((x + .5) * g, (z + .5) * g, c[1] / l, c[2] / l); } return out; }
 const fineSet = (W, g) => { const s = new Set(); for (let i = 0; i < W.length; i += 4) { const x = Math.floor(W[i] / g), z = Math.floor(W[i + 1] / g); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) s.add((x + a) * 100000 + z + b); } return s; };
 const areaSet = (P, g) => { const s = new Set(); for (let i = 0; i < P.length / 3; i++) { const x = Math.floor(P[i * 3] / g), z = Math.floor(P[i * 3 + 2] / g); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) s.add((x + a) * 100000 + z + b); } return s; };
 function solve6(H, g) { const A = []; for (let i = 0; i < 6; i++) A.push(H.slice(i * 6, i * 6 + 6).concat([g[i]]));
   for (let c = 0; c < 6; c++) { let p = c; for (let r = c + 1; r < 6; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r; [A[c], A[p]] = [A[p], A[c]]; if (Math.abs(A[c][c]) < 1e-12) return null; for (let r = c + 1; r < 6; r++) { const f = A[r][c] / A[c][c]; for (let k = c; k < 7; k++) A[r][k] -= f * A[c][k]; } }
   const x = [0, 0, 0, 0, 0, 0]; for (let r = 5; r >= 0; r--) { let s = A[r][6]; for (let k = r + 1; k < 6; k++) s -= A[r][k] * x[k]; x[r] = s / A[r][r]; } return x; }
 onmessage = e => {
-  const { SP, SN, LP, LN, guess } = e.data, SNf = new Float32Array(SN.length); for (let i = 0; i < SN.length; i++) SNf[i] = SN[i] / 127;
+  const { SP, SN, LP, LN, guess, minCells } = e.data, SNf = new Float32Array(SN.length); for (let i = 0; i < SN.length; i++) SNf[i] = SN[i] / 127;
   const fS = floorOf(SP, SNf), fL = floorOf(LP, LN), dy = fS != null && fL != null ? fL - fS : 0, fy0 = fS != null ? fS : 0;
   const WS = walls(SP, SNf, fy0), WL = walls(LP, LN, fy0 + dy), CS = cells(WS, .2), CL = cells(WL, .2), FS = fineSet(WS, .05);
-  if (CL.length < 100) { postMessage({ ok: false, need: true, wallCells: CL.length / 4 }); return; }
+  if (CS.length / 4 < 25) { postMessage({ ok: false, noSaved: true }); return; }   // the saved scan has no usable walls (older scan without surface directions)
+  if (CL.length / 4 < (minCells || 100)) { postMessage({ ok: false, need: true, wallCells: CL.length / 4 }); return; }
   const FL = fineSet(WL, .05), OL = areaSet(LP, .2);               // live walls (fine) and the area the live session has seen
   const lw = [], sw = []; { const st = Math.max(1, Math.floor(WL.length / 4 / 700)); for (let i = 0; i < WL.length; i += 4 * st) lw.push(WL[i], WL[i + 1]); const s2 = Math.max(1, Math.floor(WS.length / 4 / 4000)); for (let i = 0; i < WS.length; i += 4 * s2) sw.push(WS[i], WS[i + 1]); }
   /* score both ways: live walls that land on saved walls, and saved walls (inside the area seen now) that land on live walls */
@@ -2337,7 +2372,7 @@ function relocSearch(rec, guess) {                                  // live conf
   const idx = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF && (nrm[i * 3] || nrm[i * 3 + 1] || nrm[i * 3 + 2])) idx.push(i);
   const st = Math.max(1, Math.floor(idx.length / 60000)), n = Math.ceil(idx.length / st), LP = new Float32Array(n * 3), LN = new Float32Array(n * 3);
   for (let k = 0, j = 0; k < idx.length; k += st, j++) { const i = idx[k], l = Math.hypot(nrm[i * 3], nrm[i * 3 + 1], nrm[i * 3 + 2]); LP.set(pos.subarray(i * 3, i * 3 + 3), j * 3); LN[j * 3] = nrm[i * 3] / l; LN[j * 3 + 1] = nrm[i * 3 + 1] / l; LN[j * 3 + 2] = nrm[i * 3 + 2] / l; }
-  const w = new Worker(URL.createObjectURL(new Blob([RELOC_SRC], { type: 'text/javascript' })));
+  const w = srcWorker(RELOC_SRC);
   return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); };
     w.postMessage({ SP: rec.points, SN: rec.normals || new Int8Array(rec.points.length), LP, LN, guess: guess ? Array.from(guess.elements) : null }); });
 }
@@ -2348,18 +2383,26 @@ async function relocTick() {
   R.busy = true; R.t = clockT; R.tries++;
   const res = await relocSearch(R.rec, R.guess); R.busy = false; if (relocate !== R) return;
   R.last = res;
+  if (res.noSaved) { relocate = null; finishContinue(R.rec, R.guess || new M4()); toast(R.guess ? 'Placed by the saved anchor (this scan has no wall directions)' : 'This older scan has no wall directions: loaded where you started'); return; }
   if (res.ok) { relocate = null; finishContinue(R.rec, new M4().fromArray(res.A)); toast('Found your last scan · ' + Math.round(res.overlap * 100) + '% overlap'); diagLog('reloc', JSON.stringify({ fit: res.wallFit, ratio: res.ratio, overlap: res.overlap, tries: R.tries })); return; }
   if (R.tries > 30 && R.guess) { relocate = null; finishContinue(R.rec, R.guess); toast('Using the saved anchor (walls did not confirm it)'); }
 }
 function onRefReset(ev) {                                          // Quest re-centred or lost tracking: the headset's world jumped
   poseHist.length = 0; camPoseHist.length = 0; depth.motion = null; kf.has = false; diagLog('tracking', 'reference space reset' + (ev.transform ? ' (with transform)' : ' (no transform)'));
   if (ev.transform) { setD(Dm.clone().multiply(new M4().fromArray(ev.transform.matrix))); toast('Tracking re-centred: your scan stayed in place'); return; }   // old = T·new, so D' = D·T
-  if (!scanning || replayMode || confirmed < 2000) { clearMap(); toast('Tracking was reset: starting fresh here'); return; }
-  toast('Tracking was reset: saving, then re-finding your place…'); scanning = false;
-  saveScan(lastFrame).then(async () => { const rec = await DB.get(currentId); clearMap(); cont = null; sessionT0 = Date.now(); relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null }; scanning = true; })
-    .catch(e => { scanning = true; toast('Could not save after the reset: ' + e.message); });
+  if (replayMode) { const id = currentId; clearMap(); toast('Tracking was reset: reloading the walk-through'); DB.get(id).then(rec => rec && loadIntoSession(rec)).catch(() => {}); return; }
+  if (relocate || confirmed < 2000 || confirmed === savedConf) { const R = relocate; clearMap(); cont = null; currentId = null;
+    if (R) { relocate = Object.assign(R, { t: clockT, tries: 0, busy: false, guess: null }); toast('Tracking was reset: still looking for your last scan'); }
+    else if (savedConf > 0 && lastSave) { DB.get(lastSaveId).then(rec => { if (rec) relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null }; }).catch(() => {}); toast('Tracking was reset: re-finding your place…'); }
+    else toast('Tracking was reset: starting fresh here'); return; }
+  toast('Tracking was reset: saving, then re-finding your place…'); const was = scanning; scanning = false;
+  saveScan().then(async () => { const rec = await DB.get(currentId); clearMap(); cont = null; currentId = null; sessionT0 = Date.now(); relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null }; scanning = was; })
+    .catch(e => { scanning = was; toast('Could not save after the reset: ' + e.message); });
 }
-function finishContinue(rec, A) { mergeRecord(Object.assign({}, rec, { D: null }), A); }   // A: saved map frame -> this map frame
+function finishContinue(rec, A) {
+  const tmp = currentId; currentId = rec.id; mergeRecord(Object.assign({}, rec, { D: null }), A);
+  if (tmp && tmp !== rec.id) DB.adopt(tmp, rec.id).then(() => Promise.all([DB.del(tmp), DB.delLive(tmp)])).catch(e => diagLog('adopt', e.message));   // photos taken while searching are already in this frame
+}   // A: saved map frame -> this map frame
 
 /* ================= understanding the house: floors, ceilings, walls, stairs, objects =================
    Works on the confirmed points (plus, when known, which directions each was seen from) and the
@@ -2716,11 +2759,11 @@ function autoTick(dt) {
   /* save as you go: the fused surface every ~45 s (packed in the worker, no frame hitch); a crash loses seconds, not the scan */
   const wallS = performance.now() / 1000; if (!auto.quick) auto.quick = wallS;
   if (currentId && depth.tsdfRegions > 20 && wallS - auto.quick > 45 && !finishing && !auto.quickBusy) { auto.quick = wallS; auto.quickBusy = true;
-    const id = currentId, name = cont ? cont.rec.name : 'House scan';
-    tsdfDump().then(t => t && t.keys.length ? DB.putLive({ id, name, tsdf: t, D: Array.from(Dm.elements), floorY: pmat.uniforms.floorY.value, zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), at: Date.now(), photos: kf.n }) : null)
+    const id = currentId, name = relocate ? relocate.rec.name + ' · new part' : cont ? cont.rec.name : 'House scan';
+    Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 6000))]).then(t => t && t.keys.length ? DB.putLive({ id, name, tsdf: t, D: Array.from(Dm.elements), floorY: pmat.uniforms.floorY.value, zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), at: Date.now(), photos: kf.n }) : null)
       .then(() => { diag.quickSaves = (diag.quickSaves || 0) + 1; }).catch(e => diagLog('quicksave', e.message)).finally(() => auto.quickBusy = false); }
   /* full save: every 3 minutes of new scanning, while you're steady */
-  if (confirmed > 2000 && confirmed !== savedConf && wallS - (auto.lastSaveW || (auto.lastSaveW = wallS)) > 180 && depth.steady !== false && !finishing) { auto.lastSaveW = wallS; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(e => { toast('Auto-save failed: ' + (e && e.name === 'QuotaExceededError' ? 'headset storage is full' : e.message)); diagLog('save', e && e.message); }); }
+  if (confirmed > 2000 && confirmed !== savedConf && wallS - (auto.lastSaveW || (auto.lastSaveW = wallS)) > 180 && depth.steady !== false && !finishing) { auto.lastSaveW = wallS; saveScan().then(() => toast('Auto-saved')).catch(e => { toast('Auto-save failed: ' + (e && e.name === 'QuotaExceededError' ? 'headset storage is full' : e.message)); diagLog('save', e && e.message); }); }
 }
 
 
@@ -2741,7 +2784,7 @@ function sweepTick() {
     const hit = st.k === 'floor' ? pitch < -.8 : st.k === 'ceiling' ? pitch > .75 : Math.abs(pitch) < .5 && Math.abs(Math.atan2(Math.sin(yaw - st.yaw), Math.cos(yaw - st.yaw))) < Math.PI / 8;
     if (hit) { st.t += dt; if (st.t >= st.need) { st.done = true; kf.has = false; buzz(rightCtl.c && rightCtl.c.userData.src, .3, 20); } } }
   const left = sweep.steps.filter(s => !s.done);
-  if (!left.length) { sweep.on = false; toast('Room swept: calibrating the camera…'); calibrateCameraLive(); if (!tune.saved) setTimeout(() => { if (scanning && !tune.on) tuneStart(); }, 4000); return; }
+  if (!left.length) { sweep.on = false; toast('Room swept: calibrating the camera…'); calibrateCameraLive(); if (!tune.saved) tuneStart.wait = true; return; }
   /* point at the nearest step still to do */
   const dirOf = st => st.k === 'floor' ? new V3(f.x * .3, -1, f.z * .3).normalize() : st.k === 'ceiling' ? new V3(f.x * .3, 1, f.z * .3).normalize() : new V3(Math.sin(st.yaw), 0, -Math.cos(st.yaw));
   const nxt = left.sort((a, b) => f.angleTo(dirOf(a)) - f.angleTo(dirOf(b)))[0]; guide.dir = dirOf(nxt); guide.text = nxt.txt; sweep.msg = nxt.txt;
@@ -2749,29 +2792,31 @@ function sweepTick() {
 async function calibrateCameraLive() {                               // photo-match the sweep photos against the live surface, in the background
   if (!colorCam.on || !currentId || sweep.calibrating) return; sweep.calibrating = true;
   try {
-    const t = await tsdfDump(); if (!t || !t.keys.length) throw new Error('no surface yet');
+    const t = await Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 6000))]); if (!t || !t.keys.length) throw new Error('no surface yet');
     const m = await tsdfMeshOf(t, det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), pmat.uniforms.floorY.value); if (!m.I.length) throw new Error('no surface yet');
     const a = await alignPhotos({ id: currentId, live: true, meshCache: { v: 2, parts: [m] } }, msg => sweep.msg = msg);
     const fresh = new Map((await DB.frames(currentId).catch(() => [])).map(f => [f.k, f]));   // the live photo mesh uses the corrected photos too
-    for (const e of kfMem) { const f = fresh.get(e.f.k); if (!f) continue; e.f = f; e.m = new M4().fromArray(f.m); e.p.setFromMatrixPosition(e.m); e.d.set(-e.m.elements[8], -e.m.elements[9], -e.m.elements[10]).normalize(); }
-    for (const sl of ibr.slots) { sl.idx = -1; sl.on = 0; }
+    for (const e of kfMem) { const f = fresh.get(e.f.k); if (!f) continue; delete f.blob; e.f = f; e.m = new M4().fromArray(f.m); e.p.setFromMatrixPosition(e.m); e.d.set(-e.m.elements[8], -e.m.elements[9], -e.m.elements[10]).normalize(); }
+    for (const sl of ibr.slots) { sl.idx = -1; sl.F = null; sl.on = 0; }
     toast('Camera calibrated: colours and photos locked in (' + Math.round(new V3().setFromMatrixPosition(new M4().fromArray(a.E)).length() * 100) + ' cm offset)');
   } catch (e) { toast('Camera calibration later: ' + e.message); diagLog('livecal', e.message); }
-  sweep.calibrating = false;
+  finally { sweep.calibrating = false; }
 }
 
 
 /* ================= self-test & tune: measure this headset, keep the best view that stays smooth ================= */
 const tune = { on: false, modes: [], i: 0, t0: 0, fps: [], res: {} };
 try { const t = JSON.parse(localStorage.getItem('scanner.tune') || 'null'); if (t && t.showMode != null) { showMode = t.showMode; tune.saved = t; } } catch (e) {}
-function tuneStart() { tune.modes = (kfMem.length ? [4, 3, 0] : [3, 0]); tune.i = 0; tune.res = {}; tune.on = true; tune.t0 = performance.now(); tune.fps = []; showMode = tune.modes[0]; applySurf(); toast('Self-test: hold still and look at the room for ~20 s'); }
+function setShow(m) { showMode = m; pmat.uniforms.style.value = m === 1 ? 1 : 0; pmat.depthWrite = m === 1; pmat.needsUpdate = true; tmat.depthWrite = m === 1; tmat.needsUpdate = true; applySurf(); }
+function tuneStart() { if (!xrSession) return; tuneStart.wait = false; tune.modes = (kfMem.length ? [4, 3, 0] : [3, 0]); tune.i = 0; tune.res = {}; tune.on = true; tune.t0 = clockT; tune.fps = []; setShow(tune.modes[0]); toast('Self-test: hold still and look at the room for ~20 s'); }
 function tuneTick() {
-  if (!tune.on) return; const now = performance.now(); if (now - tune.t0 < 1500) return;   // let each mode settle first
-  tune.fps.push(fps); if (now - tune.t0 < 6500) return;
+  if (tuneStart.wait && xrSession && scanning && !sweep.on && !sweep.calibrating && !tune.on && !det.on) tuneStart();   // after the first sweep, once camera calibration has finished
+  if (!tune.on) return; const now = clockT; if (now - tune.t0 < 1.5) return;   // let each mode settle first (frame clock: pauses with the headset)
+  tune.fps.push(fps); if (now - tune.t0 < 6.5 || tune.fps.length < 20) return;
   const f = tune.fps.slice().sort((a, b) => a - b)[tune.fps.length >> 1]; tune.res[tune.modes[tune.i]] = Math.round(f);
-  if (++tune.i < tune.modes.length) { showMode = tune.modes[tune.i]; applySurf(); tune.t0 = now; tune.fps = []; return; }
+  if (++tune.i < tune.modes.length) { setShow(tune.modes[tune.i]); tune.t0 = now; tune.fps = []; return; }
   tune.on = false; const pickM = tune.modes.find(m => tune.res[m] >= 58) ?? tune.modes.slice().sort((a, b) => tune.res[b] - tune.res[a])[0];
-  showMode = pickM; applySurf(); const prof = { showMode: pickM, fps: tune.res, depthNoise_cm: depth.track && depth.track.rms ? +(depth.track.rms * 100).toFixed(1) : null, cameraDelay_ms: colorCam.lat != null ? Math.round(colorCam.lat) : null, depthLag: depth.lag || 0, at: Date.now() };
+  setShow(pickM); const prof = { showMode: pickM, fps: tune.res, depthNoise_cm: depth.track && depth.track.rms ? +(depth.track.rms * 100).toFixed(1) : null, cameraDelay_ms: colorCam.lat != null ? Math.round(colorCam.lat) : null, depthLag: depth.lag || 0, at: Date.now() };
   try { localStorage.setItem('scanner.tune', JSON.stringify(prof)); } catch (e) {} tune.saved = prof; diagLog('tune', JSON.stringify(prof));
   toast('Tuned: ' + ['dots', 'solid points', 'nothing', 'live mesh', 'photo mesh'][pickM] + ' (' + tune.res[pickM] + ' fps)');
 }
@@ -2782,7 +2827,8 @@ function autoEnqueue(id) { if (!id) return; if (xrSession) { autoPending.add(id)
 function autoShow(id) { const el = document.querySelector('[data-auto="' + id + '"]'); if (el) el.textContent = autoMsg.get(id) || ''; }
 async function autoRun() {
   if (autoBusy || xrSession || !autoQ.length) return; autoBusy = true;
-  const id = autoQ.shift(), say = m => { autoMsg.set(id, m); autoShow(id); };
+  const id = autoQ.shift(), say = m => { if (xrSession) throw new Error('paused for scanning'); autoMsg.set(id, m); autoShow(id); };
+  autoRun.cur = id;
   try {
     let rec = await DB.get(id);
     if (rec && !(rec.auto && rec.auto.v === 1)) {
@@ -2794,8 +2840,8 @@ async function autoRun() {
       rec.auto = { v: 1, at: Date.now() }; if (!(await putIfSame(rec))) throw new Error('scan was saved again: will reprocess');
     }
     autoMsg.set(id, 'Ready ✓');
-  } catch (e) { autoMsg.set(id, 'Processing stopped: ' + e.message); try { const rec = await DB.get(id); if (rec && !/saved again/.test(e.message)) { rec.auto = { v: 1, error: e.message }; await putIfSame(rec); } } catch (_) {} }
-  autoBusy = false; autoShow(id); if (!xrSession && !autoQ.length) listScans(); setTimeout(autoRun, 300);
+  } catch (e) { if (xrSession && /paused/.test(e.message)) { autoPending.add(id); autoMsg.set(id, 'queued'); } else { autoMsg.set(id, 'Processing stopped: ' + e.message); } try { const rec = await DB.get(id); if (rec && !/saved again|paused/.test(e.message)) { rec.auto = { v: 1, error: e.message }; await putIfSame(rec); } } catch (_) {} }
+  autoBusy = false; autoRun.cur = null; autoShow(id); if (!xrSession && !autoQ.length) listScans(); setTimeout(autoRun, 300);
 }
 
 
@@ -2842,9 +2888,10 @@ function drawPanel() {
     const st = [confirmed.toLocaleString() + ' points', kf.n + ' photos', lastSave ? 'saved ' + Math.round((Date.now() - lastSave) / 1000) + 's ago' : 'not saved yet'];
     g.fillText(st.join('  ·  '), 32, 168);
     if (scanErr) { g.fillStyle = '#ff8a7a'; g.fillText(('Problem: ' + scanErr).slice(0, 46), 32, 198); }
-    bs.forEach((b, i) => { const x = 32, y = 220 + i * 98, w = W - 64, h = 84; panel.buttons.push({ ...b, x, y, w, h });
+    const pit = Math.min(98, Math.floor(540 / bs.length)), h = pit - 14;
+    bs.forEach((b, i) => { const x = 32, y = 220 + i * pit, w = W - 64; panel.buttons.push({ ...b, x, y, w, h });
       rr(g, x, y, w, h, 22); g.fillStyle = panel.hover === i ? '#2e7d8b' : b.on ? '#1f525c' : '#262b30'; g.fill();
-      g.font = '600 32px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 32, y + 56); });
+      g.font = '600 ' + Math.min(32, Math.round(h * .4)) + 'px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 32, y + h * .66); });
   } else {
     g.font = '17px monospace'; g.fillStyle = '#8fc4ce';
     const diag = [
@@ -2857,12 +2904,12 @@ function drawPanel() {
             ...(scanErr ? ['ERROR   ' + scanErr] : [])
     ];
     diag.forEach((l, i) => { g.fillStyle = /^ERROR/.test(l) ? '#ff8a7a' : '#8fc4ce'; g.fillText(l.slice(0, 60), 32, 166 + i * 24); });
-    const bw = 280, bh = 64;
-    bs.forEach((b, i) => { const x = 32 + (i % 2) * (bw + 16), y = 340 + Math.floor(i / 2) * (bh + 18); panel.buttons.push({ ...b, x, y, w: bw, h: bh });
+    const bw = 280, rows = Math.ceil(bs.length / 2), pit = Math.min(82, Math.floor(420 / rows)), bh = pit - 12;
+    bs.forEach((b, i) => { const x = 32 + (i % 2) * (bw + 16), y = 340 + Math.floor(i / 2) * pit; panel.buttons.push({ ...b, x, y, w: bw, h: bh });
       rr(g, x, y, bw, bh, 18); g.fillStyle = panel.hover === i ? '#2e7d8b' : b.on ? '#1f525c' : '#262b30'; g.fill();
-      g.font = '24px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 22, y + 41); });
+      g.font = '24px system-ui, sans-serif'; g.fillStyle = '#f4f2ec'; g.fillText(b.label, x + 22, y + bh * .64); });
   }
-  if (toastT > 0) { g.font = '21px system-ui, sans-serif'; g.fillStyle = '#f0d58a'; g.fillText(toastMsg.slice(0, 50), 32, 776); }
+  if (toastT > 0) { g.font = '21px system-ui, sans-serif'; g.fillStyle = '#f0d58a'; g.fillText(toastMsg.slice(0, 50), 32, 786); }
   panel.t.needsUpdate = true;
 }
 function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.gamepad.hapticActuators && src.gamepad.hapticActuators[0]; if (a) a.pulse(k, ms); } catch (e) {} }
@@ -2885,7 +2932,7 @@ async function press(id, frame) {
   if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
-  if (id === 'view') { showMode = (showMode + 1) % 5; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
+  if (id === 'view') setShow((showMode + 1) % 5);
   if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} resetLiveMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
@@ -2948,6 +2995,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
+    pendingLoad = null; anchorPose = null; lastSaveId = null; tune.on = false; sweep.calibrating = false; auto.quickBusy = false; if (auto.bins) auto.bins.clear(); flushAnchorDeletes(s);
     clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; kfMem.length = 0; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT; auto.lastSaveW = 0; auto.quick = 0;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
@@ -2957,13 +3005,14 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); setTimeout(() => { for (const id of autoPending) autoEnqueue(id); autoPending.clear(); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); tune.on = false; pendingLoad = null; relocate = null; setTimeout(() => { const ids = [...autoPending]; autoPending.clear(); ids.forEach(autoEnqueue); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan().catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
-    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
-  } catch (e) { $('st').textContent = colorCam.on && /activation|gesture|user/i.test(e.message) ? 'Camera is ready. Tap Start scanning again.' : 'Could not start: ' + e.message; }
+    if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => { if (xrSession === s) loadIntoSession(r).catch(e => toast('Could not load: ' + e.message)); }, 1500); }
+  } catch (e) { replayMode = false; pendingOpen = null; $('st').textContent = colorCam.on && /activation|gesture|user/i.test(e.message) ? 'Camera is ready. Tap again to start.' : 'Could not start: ' + e.message; }
 });
+function flushAnchorDeletes(s) { if (!s.deletePersistentAnchor) return; let q = []; try { q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); localStorage.removeItem('scanner.delAnchors'); } catch (e) {} for (const u of q) s.deletePersistentAnchor(u).catch(() => {}); }
 let savedConf = -1, pendingOpen = null, askedRoom = true, useMeta = true, scanErr = '';
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
@@ -2972,14 +3021,19 @@ async function recoverLive(L, existing) {                         // turn a save
   $('st').textContent = 'Recovering…'; const m = await tsdfMeshOf(L.tsdf, L.zones || [], L.floorY || 0);
   const n = m.P.length / 3, Nr = new Int8Array(n * 3), Cl = new Uint8Array(n * 4), Cn = new Uint16Array(n).fill(CONF + 2);
   for (let i = 0; i < n; i++) { for (let a = 0; a < 3; a++) { Nr[i * 3 + a] = Math.round(m.N[i * 3 + a] * 127); Cl[i * 4 + a] = Math.round(Math.min(1, m.C[i * 3 + a]) * 255); } Cl[i * 4 + 3] = 255; }
-  const rec = existing ? Object.assign(existing, { tsdf: L.tsdf, D: L.D, date: L.at }) : { id: L.id, name: (L.name || 'House scan') + ' (recovered)', date: L.at, voxelSize: VS, points: m.P, counts: Cn, masks: null, colors: Cl, normals: Nr, understanding: null, planes: [], meshes: [], floorY: L.floorY || 0, tsdf: L.tsdf, D: L.D, zones: L.zones || [] };
+  const ex = existing ? await DB.get(existing.id).catch(() => null) : null;
+  const rec = ex ? Object.assign(ex, { tsdf: L.tsdf, D: L.D, date: L.at, points: m.P, counts: Cn, colors: Cl, normals: Nr, masks: null, fpoints: null, fcolors: null, fnormals: null, fcounts: null }) : { id: L.id, name: (L.name || 'House scan') + ' (recovered)', date: L.at, voxelSize: VS, points: m.P, counts: Cn, masks: null, colors: Cl, normals: Nr, understanding: null, planes: [], meshes: [], floorY: L.floorY || 0, tsdf: L.tsdf, D: L.D, zones: L.zones || [] };
   delete rec.meshCache; delete rec.tex; delete rec.auto; delete rec.refined; delete rec.photoAlign;
   await DB.put(rec); await DB.delLive(L.id); $('st').textContent = 'Recovered "' + rec.name + '"'; listScans();
 }
 async function listScans() {
-  const el = $('scans'); el.innerHTML = '';
+  const gen = listScans.gen = (listScans.gen || 0) + 1, el0 = $('scans');
   let all = []; try { all = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
   let lives = []; try { lives = (await DB.allLive()).filter(L => !xrSession || L.id !== currentId); } catch (e) {}
+  if (gen !== listScans.gen) return; el0.innerHTML = ''; const el = document.createDocumentFragment(); try { listRows(el, all, lives); } finally { el0.appendChild(el); }
+}
+const fresh = async (r) => { if (autoRun.cur === r.id || autoQ.includes(r.id)) throw new Error('still processing this scan: wait for Ready'); const x = await DB.get(r.id); if (!x) throw new Error('scan no longer exists'); return x; };
+function listRows(el, all, lives) {
   for (const L of lives) { const ex = all.find(r => r.id === L.id); if (ex && ex.date >= L.at) { DB.delLive(L.id).catch(() => {}); continue; }
     const row = document.createElement('div'); row.className = 'scan'; const n = document.createElement('div'); n.className = 'n'; n.textContent = (ex ? ex.name + ': newer unsaved scanning' : (L.name || 'Scan') + ': unsaved (the session ended early)');
     const sm = document.createElement('small'); sm.textContent = new Date(L.at).toLocaleString() + ' · ' + L.tsdf.keys.length + ' surface blocks · ' + (L.photos || 0) + ' photos'; n.appendChild(sm); row.appendChild(n);
@@ -2999,17 +3053,17 @@ async function listScans() {
     mk('Continue scanning', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
-    mk('Refine', () => refineScan(r));
+    mk('Refine', async () => { try { const x = await fresh(r); if (x.refined && !confirm('This scan is already refined. Refine again?')) return; await refineScan(x, m => $('st').textContent = m); listScans(); } catch (e) { $('st').textContent = 'Refine: ' + e.message; } });
     mk('Floor plan', () => { try { const fp = floorPlan(r); download((r.name || 'scan').replace(/\W+/g, '-') + '-floorplan.svg', new Blob([fp.svg], { type: 'image/svg+xml' })); $('st').textContent = 'Floor plan: ' + fp.rooms + ' rooms, ' + fp.area.toFixed(1) + ' m²'; } catch (e) { $('st').textContent = 'Floor plan: ' + e.message; } });
     mk('Merge with…', async () => { const others = all.filter(o => o.id !== r.id); if (!others.length) { $('st').textContent = 'Scan another room first, then merge.'; return; }
       const pick = prompt('Merge "' + r.name + '" with which scan? Type its number:\n' + others.map((o, i) => (i + 1) + '. ' + o.name + ' (' + new Date(o.date).toLocaleDateString() + ')').join('\n'), '1'); const o = others[(+pick || 0) - 1]; if (!o) return;
       try { const m = await mergeScans(r, o, t => $('st').textContent = 'Merging: ' + t); $('st').textContent = 'Merged into "' + m.rec.name + '" (' + Math.round(m.overlap * 100) + '% overlap). It is being refined with loop closure now.'; listScans(); } catch (e) { $('st').textContent = 'Merge: ' + e.message; } });
-    mk('Match photos', async () => { const st = $('st'); try { const a = await alignPhotos(r, m => st.textContent = 'Photo matching: ' + m + '…'); st.textContent = 'Photos matched: ' + a.used + ' photos, colour error ' + (a.rms0 * 100).toFixed(1) + '% → ' + (a.rms1 * 100).toFixed(1) + '%, camera offset ' + Math.hypot(a.E[12], a.E[13], a.E[14]).toFixed(3) + ' m. Re-run Photo texture.'; } catch (e) { st.textContent = 'Photo matching: ' + e.message; } });
+    mk('Match photos', async () => { const st = $('st'); try { const a = await alignPhotos(await fresh(r), m => st.textContent = 'Photo matching: ' + m + '…'); st.textContent = 'Photos matched: ' + a.used + ' photos, colour error ' + (a.rms0 * 100).toFixed(1) + '% → ' + (a.rms1 * 100).toFixed(1) + '%, camera offset ' + Math.hypot(a.E[12], a.E[13], a.E[14]).toFixed(3) + ' m. Re-run Photo texture.'; } catch (e) { st.textContent = 'Photo matching: ' + e.message; } });
     mk('Photo texture', async () => { const st = $('st'), t0 = performance.now(); st.textContent = 'Texturing…';
-      try { delete r.tex; const t = await recTexture(r, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
+      try { const x = await fresh(r); delete x.tex; const t = await recTexture(x, m => st.textContent = 'Texturing: ' + m + '…'); st.textContent = 'Photo texture: ' + t.painted.toLocaleString() + ' / ' + t.patches.toLocaleString() + ' patches from ' + t.photosUsed + ' photos in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s. Open View or Walk through.'; }
       catch (e) { st.textContent = 'Texture failed: ' + e.message; } });
-    mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
-    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
+    mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (!nm) return; try { const x = await fresh(r); x.name = nm; x.date = Date.now(); await DB.put(x); listScans(); } catch (e) { $('st').textContent = 'Rename: ' + e.message; } });
+    mk('Delete', async () => { if (autoRun.cur === r.id) { $('st').textContent = 'Still processing this scan: wait for Ready'; return; } const qi = autoQ.indexOf(r.id); if (qi >= 0) autoQ.splice(qi, 1); if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid) { try { const q = JSON.parse(localStorage.getItem('scanner.delAnchors') || '[]'); q.push(r.anchor.uuid); localStorage.setItem('scanner.delAnchors', JSON.stringify(q)); } catch (e) {} } await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
     el.appendChild(row);
   }
 }
@@ -3052,7 +3106,7 @@ $('fOpen').addEventListener('change', async e => {
 });
 
 /* ================= loop ================= */
-const clock = new THREE.Clock();
+const clock = new THREE.Clock(), _cp1 = new V3(), _cp2 = new V3();
 renderer.setAnimationLoop((t, frame) => {
   const dt = Math.min(.1, clock.getDelta()); clockT += dt; pmat.uniforms.time.value = clockT;
   fpsAcc += dt; fpsN++; if (fpsAcc > .5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; if (renderer.xr.isPresenting) { diag.fpsH.push(Math.round(fps)); if (diag.fpsH.length > 1200) diag.fpsH.shift(); } }
@@ -3060,11 +3114,13 @@ renderer.setAnimationLoop((t, frame) => {
     try {
     lastFrame = frame;
     if (!refSpace) { refSpace = renderer.xr.getReferenceSpace(); if (refSpace && refSpace.addEventListener) refSpace.addEventListener('reset', onRefReset); }
-    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { motionTick(vp0, clockT); poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); camPoseHist.push({ t, m: Float32Array.from(vp0.transform.matrix) }); if (camPoseHist.length > 60) camPoseHist.shift(); } }
+    const vp0 = frame.getViewerPose(refSpace); { if (vp0) { motionTick(vp0, clockT); poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); camPoseHist.push({ t, m: Float32Array.from(vp0.transform.matrix) }); if (camPoseHist.length > 60) camPoseHist.shift(); } }
     camPump();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
-    if (useMeta) { syncLayout(frame, refSpace); if (metaSurf.dirty && clockT - metaSurf.t > 2) { metaSurf.t = clockT; buildMetaSurf(); } }
+    if (useMeta) { syncLayout(frame, refSpace); if (metaSurf.D0 && !metaSurf.dirty && clockT - metaSurf.t > 2) { const e = metaSurf.D0.elements, f = Dm.elements; if (Math.hypot(e[12] - f[12], e[13] - f[13], e[14] - f[14]) > .03 || Math.abs(e[0] - f[0]) + Math.abs(e[2] - f[2]) + Math.abs(e[8] - f[8]) > .04) metaSurf.dirty = true; }
+      if (metaSurf.dirty && clockT - metaSurf.t > 2) { metaSurf.t = clockT; buildMetaSurf(); } }
+    if (originAnchor && originAnchor !== 'pending' && (fpsN & 15) === 0) { try { const ap = frame.getPose(originAnchor.anchorSpace, refSpace); if (ap) anchorPose = Array.from(ap.transform.matrix); } catch (e) {} }
     if (pendingLoad) {                                       // the saved anchor has been found: map old coordinates into this session's
       const ap = frame.getPose(pendingLoad.anchor.anchorSpace, refSpace);
       if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m), T = now.multiply(then.invert());
@@ -3083,10 +3139,10 @@ renderer.setAnimationLoop((t, frame) => {
     tmat.uniforms.time.value = clockT; tmat.uniforms.floorY.value = pmat.uniforms.floorY.value; tmat.uniforms.photo.value = pmat.uniforms.photo.value; tmat.uniforms.alpha.value = pmat.uniforms.alpha.value; tmat.uniforms.style.value = pmat.uniforms.style.value; tiles.visible = cloud.visible;
     if (scanning && N) cleanSlice(4000);
     if (clockT - depth.lastT > depth.rate) { depth.lastT = clockT; sampleDepth(frame, refSpace, xrSession, clockT); }
-    { const vp = frame.getViewerPose(refSpace); if (vp) maybeKeyframe(vp, clockT); }
+    if (vp0) maybeKeyframe(vp0, clockT);
     if (underOn && scanning && clockT - underAt > (understanding && understanding.ms > 1500 ? 30 : 12) && confirmed > underN * 1.03 + 2000) { underAt = clockT; runUnderstanding(); }
     if (!askedRoom && clockT > 8 && !planes.size && xrSession && xrSession.initiateRoomCapture) { askedRoom = true; toast("No Meta room scan here yet: press 'Meta room scan'"); }
-    { const cp = renderer.xr.getCamera().getWorldPosition(new V3()), f = renderer.xr.getCamera().getWorldDirection(new V3()); f.y = 0; f.normalize();
+    if (underG.children.length) { const cp = renderer.xr.getCamera().getWorldPosition(_cp1), f = renderer.xr.getCamera().getWorldDirection(_cp2); f.y = 0; f.normalize();
       underG.children.forEach(o => { if (o.userData.follow !== undefined) o.position.set(cp.x + f.x * 1.4, o.userData.follow + .05, cp.z + f.z * 1.4); }); }
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
@@ -3101,7 +3157,7 @@ renderer.setAnimationLoop((t, frame) => {
     camera.position.set(viewer.target.x + Math.sin(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist, viewer.target.y + Math.sin(viewer.pitch) * viewer.dist, viewer.target.z + Math.cos(viewer.yaw) * Math.cos(viewer.pitch) * viewer.dist);
     camera.lookAt(viewer.target);
   }
-  renderer.render(scene, camera);
+  if (frame || viewer.on) renderer.render(scene, camera);
 });
 checkXR(); listScans();
 </script>
