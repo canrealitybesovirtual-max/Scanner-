@@ -520,29 +520,53 @@ function handsNow() { const out = []; for (const g of grips) if (g.visible !== f
    (80° by default; ?hfov=NN in the URL to tune it, ?cy=0.0x to nudge it vertically). */
 const colorCam = { on: false, video: null, cv: document.createElement('canvas'), ctx: null, data: null, t: 0, status: 'off', w: 512, h: 288,
   f: 1 / Math.tan((Number(new URLSearchParams(location.search).get('hfov')) || 80) * Math.PI / 360), cx: 0, cy: Number(new URLSearchParams(location.search).get('cy')) || 0, aligned: false };
-try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.E) colorCam.E = new M4().fromArray(c.E); } catch (e) {}
+try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.E) { colorCam.E = new M4().fromArray(c.E); colorCam.k1 = c.k1 || 0; } } catch (e) {}
 try { const a = JSON.parse(localStorage.getItem('scanner.camAlign') || 'null'); if (a && !new URLSearchParams(location.search).get('hfov')) { colorCam.f = a.f; colorCam.cx = a.cx; colorCam.cy = a.cy; colorCam.aligned = true; } } catch (e) {}
 colorCam.cv.width = 512; colorCam.cv.height = 288; colorCam.ctx = colorCam.cv.getContext('2d', { willReadFrequently: true });
 async function toggleColor() {
-  if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); colorCam.status = 'off'; return; }
+  if (colorCam.on) { colorCam.on = false; if (colorCam.video && colorCam.video.srcObject) colorCam.video.srcObject.getTracks().forEach(t => t.stop()); if (colorCam.video) colorCam.video.remove(); colorCam.status = 'off'; return; }
   try {
     const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 1280, height: 720 }, audio: false });
-    const v = colorCam.video = document.createElement('video'); v.muted = true; v.playsInline = true; v.srcObject = st; await v.play();
+    const v = colorCam.video = document.createElement('video'); v.muted = true; v.playsInline = true; v.srcObject = st; v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none'; document.body.appendChild(v); await v.play();
     colorCam.w = 512; colorCam.h = Math.max(64, Math.round(512 * (v.videoHeight || 288) / (v.videoWidth || 512))); colorCam.cv.width = colorCam.w; colorCam.cv.height = colorCam.h;   // keep the real aspect (Quest gives 4:3 or 16:9)
-    colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight;
+    colorCam.on = true; colorCam.status = 'on · ' + v.videoWidth + '×' + v.videoHeight; startFrameClock(v);
   } catch (e) { colorCam.status = 'unavailable (' + (e.name || e.message) + ')'; toast('Camera colour needs Horizon OS v74+ and camera permission'); }
 }
 const kf = { cv: document.createElement('canvas'), busy: false, t: 0, pos: new V3(), q: new THREE.Quaternion(), prevQ: new THREE.Quaternion(), prevT: 0, has: false, n: 0 };
+/* the camera image is older than the head pose of the frame we're in: pair every image with the head pose at its own capture time */
+const camPoseHist = [];
+function poseAt(tq) {                                              // head pose (headset world) at time tq (performance.now ms), interpolated
+  const H = camPoseHist; if (!H.length || tq == null) return null; if (tq >= H[H.length - 1].t) return new M4().fromArray(H[H.length - 1].m); if (tq < H[0].t) return null;
+  let i = H.length - 2; while (i > 0 && H[i].t > tq) i--; const A = H[i], B = H[i + 1], a = (tq - A.t) / Math.max(1e-6, B.t - A.t);
+  const ma = new M4().fromArray(A.m), mb = new M4().fromArray(B.m), qa = new THREE.Quaternion().setFromRotationMatrix(ma), qb = new THREE.Quaternion().setFromRotationMatrix(mb);
+  return new M4().compose(new V3().setFromMatrixPosition(ma).lerp(new V3().setFromMatrixPosition(mb), a), qa.slerp(qb, a), new V3(1, 1, 1));
+}
+function startFrameClock(v) {                                      // requestVideoFrameCallback tells us when each camera frame was captured
+  const c = colorCam; if (!v.requestVideoFrameCallback) { c.clock = 'none'; return; }
+  const onVF = (now, meta) => { if (colorCam.video !== v) return;
+    c.vfT = meta.captureTime || (meta.presentationTime ? meta.presentationTime - 45 : now - 60); c.clock = meta.captureTime ? 'capture time' : 'estimated'; c.lat = performance.now() - c.vfT;
+    if (kf.want) { const w = kf.want; kf.want = null; captureKeyframe(c.vfT, w); }
+    v.requestVideoFrameCallback(onVF); };
+  v.requestVideoFrameCallback(onVF);
+}
 function maybeKeyframe(vp, tNow) {
+  if (kf.want && performance.now() - kf.wantT > 250) { const w = kf.want; kf.want = null; colorCam.clock = 'none'; captureKeyframe(performance.now() - 70, w); }   // the frame clock went quiet: don't lose the photo
   const c = colorCam; if (!c.on || !scanning || replayMode || kf.busy || !c.video || c.video.readyState < 2) return;
   const m = new M4().fromArray(vp.transform.matrix), p = new V3().setFromMatrixPosition(m), q = new THREE.Quaternion().setFromRotationMatrix(m);
   const raw = kf.prevT ? kf.prevQ.angleTo(q) / Math.max(1e-3, tNow - kf.prevT) : 0; kf.prevQ.copy(q); kf.prevT = tNow;
   kf.spin = (kf.spin || 0) * .8 + raw * .2;
-  if (kf.spin > 1.2) return;                                                       // turning faster than ~70°/s: the frame would be blurred                                                           // turning faster than ~30°/s: the frame would be blurred
+  if (kf.spin > .5 || (depth.motion && depth.motion.lin > .45)) return;           // photos only while turning < ~30°/s and walking slowly: sharp, and timing errors stay small
   if (kf.has && tNow - kf.t < .25) return; if (kf.n >= 1500) return;                     // up to 1500 photos a scan
   if (kf.has && p.distanceTo(kf.pos) < (det.on ? .05 : .12) && q.angleTo(kf.q) < (det.on ? .1 : .12)) return;       // a new viewpoint every ~12 cm or ~7°: lots of angles for the walk-through
   if (tNow - (kf.tryT || 0) < .25) return; kf.tryT = tNow;
   if (!currentId) currentId = 'scan-' + Date.now();
+  const want = { p, q, tNow, m: new M4().fromArray(vp.transform.matrix) };
+  if (c.video.requestVideoFrameCallback && c.clock !== 'none' && c.vfT && performance.now() - c.vfT < 400) { kf.want = want; kf.wantT = performance.now(); return; }   // capture on the next camera frame, with that frame's own pose
+  captureKeyframe(performance.now() - (c.lat > 0 && c.lat < 300 ? c.lat : 70), want);       // no frame clock here: assume the usual camera delay
+}
+function captureKeyframe(tCap, want) {
+  const c = colorCam; if (kf.busy || !c.video) return;
+  const head = (tCap != null && poseAt(tCap)) || want.m, p = want.p, q = want.q, tNow = want.tNow;
   const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
   /* motion blur kills Gaussian splats: score sharpness (variance of the Laplacian on a small copy), keep only frames near the best seen */
   const sg = kf.sg || (kf.sg = Object.assign(document.createElement('canvas'), { width: 160, height: 120 }).getContext('2d', { willReadFrequently: true }));
@@ -553,17 +577,17 @@ function maybeKeyframe(vp, tNow) {
   if (sharp < kf.best * .45) { kf.blurred = (kf.blurred || 0) + 1; return; }
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
-  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(new M4().fromArray(vp.transform.matrix)).elements), m: Array.from(Dm.clone().multiply(new M4().fromArray(vp.transform.matrix)).multiply(colorCam.E || new M4()).elements), w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(vp.transform.matrix) };
+  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(head).elements), m: Array.from(Dm.clone().multiply(head).multiply(colorCam.E || new M4()).elements), k1: colorCam.k1 || 0, camLatMs: tCap != null ? Math.round(performance.now() - tCap) : null, w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(head.elements) };
   kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
 }
 function camPump() {                                            // keep one fresh, downscaled camera bitmap ready (decoded asynchronously)
   const c = colorCam; if (!c.on || c.noBmp || c.pending || !c.video || c.video.readyState < 2 || performance.now() - (c.bt || 0) < 90 || typeof createImageBitmap === 'undefined') return;
   c.pending = true; c.bt = performance.now();
-  createImageBitmap(c.video, { resizeWidth: c.w, resizeHeight: c.h }).then(b => { if (c.bmp) c.bmp.close(); c.bmp = b; c.pending = false; }).catch(() => { c.pending = false; c.noBmp = true; });
+  const tb = c.vfT && performance.now() - c.vfT < 400 ? c.vfT : performance.now() - (c.lat > 0 && c.lat < 300 ? c.lat : 70); createImageBitmap(c.video, { resizeWidth: c.w, resizeHeight: c.h }).then(b => { if (c.bmp) c.bmp.close(); c.bmp = b; c.bmpT = tb; c.pending = false; }).catch(() => { c.pending = false; c.noBmp = true; });
 }
 function camFrame(vp, forWorker) {
   const c = colorCam; if (!c.on || !c.video || c.video.readyState < 2) return null;
-  if (forWorker && !c.noBmp && typeof createImageBitmap !== 'undefined') { const b = c.bmp; c.bmp = null; return b ? { bmp: b, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy } : null; }
+  if (forWorker && !c.noBmp && typeof createImageBitmap !== 'undefined') { const b = c.bmp; c.bmp = null; return b ? { bmp: b, t: c.bmpT, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy, k1: c.k1 || 0 } : null; }
   if (performance.now() - c.t > 90 || !c.data) { c.ctx.drawImage(c.video, 0, 0, c.w, c.h); c.data = c.ctx.getImageData(0, 0, c.w, c.h).data; c.t = performance.now(); }
   return { data: c.data, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy };
 }
@@ -883,7 +907,7 @@ function tsdfIntegrate(c) {
       b.d[v] = Math.round((d0 * w0 + t * wn) / (w0 + wn) * 32767); b.w[v] = Math.max(1, Math.min(WMAX * 8, Math.round((w0 + wn) * 8))); changed = true;
       if (cam && sdf < MU * .5) {                                   // colour from the camera, for voxels right at the surface
         const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
-        if (ez < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * ex / -ez, cv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
+        const xn0 = ex / -ez, yn0 = ey / -ez, rr0 = xn0 * xn0 + yn0 * yn0, kk0 = cam.k1 || 0; if (ez < -.1 && rr0 < 2 && !(kk0 < 0 && rr0 > -1 / (3 * kk0))) { const xn = xn0, yn = yn0, kd = 1 + kk0 * rr0, cu = .5 + (cam.cx || 0) + .5 * cam.f * xn * kd, cv = .5 - .5 * cam.f * cam.asp * yn * kd + cam.cy;
           if (cu > .01 && cu < .99 && cv > .01 && cv < .99) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, a = cu * 2 - 1, bb = cv * 2 - 1, q = wn * (1 - .75 * Math.min(1, (a * a + bb * bb) * .5)) * (1 - Math.abs(sdf) / MU);
             const cw0 = b.cw[v] / 8, k2 = cw0 + q; if (k2 > 0) { const g = c.gain || 1, a2 = q / k2;
               for (let ch = 0; ch < 3; ch++) { const cur = b.c[v * 3 + ch] / 65535; b.c[v * 3 + ch] = Math.round((cur + (Math.min(1, cam.data[pi + ch] / 255 * g) - cur) * a2) * 65535); }
@@ -1132,7 +1156,7 @@ onmessage = e => {
     let R = -1, G = 0, Bl = 0, cq = 0;
     if (cam && w > .3) {
       const ex = V[0] * wx + V[4] * wy + V[8] * wz + V[12], ey = V[1] * wx + V[5] * wy + V[9] * wz + V[13], ez = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
-      if (ez < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * ex / -ez, cvv = .5 - .5 * cam.f * cam.asp * ey / -ez + cam.cy;
+      const xn0 = ex / -ez, yn0 = ey / -ez, rr0 = xn0 * xn0 + yn0 * yn0, kk0 = cam.k1 || 0; if (ez < -.1 && rr0 < 2 && !(kk0 < 0 && rr0 > -1 / (3 * kk0))) { const xn = xn0, yn = yn0, kd = 1 + kk0 * rr0, cu = .5 + (cam.cx || 0) + .5 * cam.f * xn * kd, cvv = .5 - .5 * cam.f * cam.asp * yn * kd + cam.cy;
         if (cu > .01 && cu < .99 && cvv > .01 && cvv < .99) { const pi = ((cvv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4; R = cam.data[pi] / 255; G = cam.data[pi + 1] / 255; Bl = cam.data[pi + 2] / 255;
           const a = cu * 2 - 1, b = cvv * 2 - 1; cq = q * (1 - .75 * Math.min(1, (a * a + b * b) * .5)); } }      // lens centre is sharpest and truest
     }
@@ -1237,11 +1261,12 @@ function postIntegration(M) {                                       // hand a de
   const cfg = depth.cfg, src = cfg.src === 'info' && M.projI ? 'info' : 'view', inv = src === 'info' ? M.projI : M.projV, L = depth.lag || 0;
   let xf = src === 'info' ? M.xfI : M.xfV; if (L) { const R = lagRel(M, L, 0); if (R) xf = R.clone().multiply(xf); }   // where the head really was when the depth was taken
   xf = Dm.clone().multiply(xf);                                    // into the map frame
-  const hd = M.head.clone().applyMatrix4(Dm), vinvD = (colorCam.E ? colorCam.E.clone().invert().multiply(M.vinv) : M.vinv.clone()).multiply(Dinv), nowMs = Date.now(), saveRaw = !M.fine && !M.moving && nowMs - (depth.rawT || 0) > 500;
+  const hpc = M.cam && M.cam.t ? poseAt(M.cam.t) : null, vinvBase = hpc ? hpc.invert() : M.vinv.clone();     // camera image -> head pose when that image was taken
+  const hd = M.head.clone().applyMatrix4(Dm), vinvD = (colorCam.E ? colorCam.E.clone().invert().multiply(vinvBase) : vinvBase).multiply(Dinv), nowMs = Date.now(), saveRaw = !M.fine && !M.moving && nowMs - (depth.rawT || 0) > 500;
   if (saveRaw) depth.rawT = nowMs;
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
-  if (M.cam && (M.cam.bmp || M.cam.data)) { cam = { bmp: M.cam.bmp || null, data: M.cam.bmp ? null : M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; if (!M.cam.bmp) { colorCam.data = null; colorCam.t = 0; } }   // hand the frame over; grab a fresh one next time
+  if (M.cam && (M.cam.bmp || M.cam.data)) { cam = { bmp: M.cam.bmp || null, data: M.cam.bmp ? null : M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, k1: colorCam.k1 || 0, align: !colorCam.aligned }; if (!M.cam.bmp) { colorCam.data = null; colorCam.t = 0; } }   // hand the frame over; grab a fresh one next time
   const msg = { tCap: Date.now(), DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
     head: [hd.x, hd.y, hd.z], hands: M.hands.map(h => { const v = h.clone().applyMatrix4(Dm); return [v.x, v.y, v.z]; }), cam, vinv: Array.from(vinvD.elements), t: M.tNow, icp: icpOn, saveRaw,
@@ -1446,20 +1471,20 @@ async function png16(w, h, mm) {
   return new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ih), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))], { type: 'image/png' });
 }
 /* render the fused surface from each photo's camera: per-photo depth for depth-supervised splat training */
-async function photoDepths(rec, frames, say) {
+async function photoDepths(rec, frames, say, raw, scale) {
   const parts = await recMesh(rec).catch(() => []); if (!parts.length) return null;
   const sc2 = new THREE.Scene(), out = []; for (const m of parts) { if (!m.I.length) continue; const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1)); const o = new THREE.Mesh(g, ibrDist); o.frustumCulled = false; sc2.add(o); }
   const cam = new THREE.PerspectiveCamera(); cam.matrixAutoUpdate = false; cam.matrixWorldAutoUpdate = false;
   let rt = null; const prevT = renderer.getRenderTarget(), cc = new THREE.Color(), ca = renderer.getClearAlpha(); renderer.getClearColor(cc);
   for (let i = 0; i < frames.length; i++) { const f = frames[i]; if (i % 20 === 0) say('depth ' + (i + 1) + ' / ' + frames.length);
-    const w = Math.round(f.w / 2), h = Math.round(f.h / 2), fx = 1 / Math.tan(f.hfov / 2), asp = f.w / f.h, n = .05, fa = 30;
+    const w = Math.max(16, Math.round(f.w * (scale || .5))), h = Math.max(16, Math.round(f.h * (scale || .5))), fx = 1 / Math.tan(f.hfov / 2), asp = f.w / f.h, n = .05, fa = 30;
     if (!rt || rt.width !== w || rt.height !== h) { if (rt) rt.dispose(); rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.FloatType }); }
     cam.projectionMatrix.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
     cam.matrixWorld.fromArray(f.m); cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
     renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(sc2, cam);
     const px = new Float32Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
     const mm = new Uint16Array(w * h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = px[((h - 1 - y) * w + x) * 4]; mm[y * w + x] = v > .05 && v < 60 ? Math.round(v * 1000) : 0; }   // top row first, like the photo
-    out.push(await png16(w, h, mm)); await new Promise(r => setTimeout(r, 0)); }
+    out.push(raw ? { w, h, mm } : await png16(w, h, mm)); if (i % 8 === 7) await new Promise(r => setTimeout(r, 0)); }
   renderer.setRenderTarget(prevT); renderer.setClearColor(cc, ca); if (rt) rt.dispose(); sc2.traverse(o => o.geometry && o.geometry.dispose());
   return out;
 }
@@ -1468,7 +1493,7 @@ async function exportPhotos(rec) {
   const fr = (await DB.frames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
   if (!fr.length) { $('st').textContent = 'No photos recorded for this scan. Turn on camera colour while scanning.'; return; }
   let deps = null; if (!xrSession) { try { deps = await photoDepths(rec, fr, m => $('st').textContent = 'Packing photos: ' + m + '…'); } catch (e) { deps = null; } }
-  const f0 = fr[0], intr = f => { const fl = f.w / 2 / Math.tan(f.hfov / 2); return { fl_x: fl, fl_y: fl, cx: f.w * (.5 + (f.cx || 0)), cy: f.h * (.5 + (f.cy || 0)), w: f.w, h: f.h }; };
+  const f0 = fr[0], intr = f => { const fl = f.w / 2 / Math.tan(f.hfov / 2); return { fl_x: fl, fl_y: fl, cx: f.w * (.5 + (f.cx || 0)), cy: f.h * (.5 + (f.cy || 0)), w: f.w, h: f.h, k1: f.k1 || 0 }; };
   /* Nerfstudio / Brush format; intrinsics per frame because auto-alignment can refine them mid-scan */
   const tj = Object.assign({ camera_model: 'OPENCV', k1: 0, k2: 0, p1: 0, p2: 0, ply_file_path: 'points3D.ply' }, intr(f0), {
     frames: fr.map((f, i) => { const m = f.m; return Object.assign({ file_path: 'images/frame_' + String(i + 1).padStart(5, '0') + '.jpg', ...(deps ? { depth_file_path: 'depth/frame_' + String(i + 1).padStart(5, '0') + '.png' } : {}), transform_matrix: [[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [0, 0, 0, 1]] }, intr(f)); }) });
@@ -1727,15 +1752,19 @@ onmessage = async e => {
   let used = 0; const gains = [];
   for (let pi = 0; pi < photos.length; pi++) {
     const ph = photos[pi]; if (pi % 5 === 0) say('photo ' + (pi + 1) + ' / ' + photos.length);
-    let dep = null, dbest = 700; for (const d of depths) { const dt = Math.abs(d.t - ph.t); if (dt < dbest) { dbest = dt; dep = d; } }
-    if (!dep) continue;                                              // no depth frame near this photo: can't check what's hidden, skip it
+    let dep = null, dbest = 700; if (!ph.dm) for (const d of depths) { const dt = Math.abs(d.t - ph.t); if (dt < dbest) { dbest = dt; dep = d; } }
+    if (!dep && !ph.dm) continue;                                    // nothing to check occlusion against: skip this photo
     let bmp; try { bmp = await createImageBitmap(ph.blob); } catch (err) { continue; }
     const W = Math.min(960, bmp.width), H = Math.round(W * bmp.height / bmp.width), oc = new OffscreenCanvas(W, H), cx2 = oc.getContext('2d'); cx2.drawImage(bmp, 0, 0, W, H); bmp.close();
-    const px = cx2.getImageData(0, 0, W, H).data, V = inv4r(ph.m), f = 1 / Math.tan(ph.hfov / 2), asp = W / H, pcx = ph.cx || 0, pcy = ph.cy || 0, ox = ph.m[12], oy = ph.m[13], oz = ph.m[14];
-    const DV = inv4r(dep.X), DP = dep.PRJ, DN = dep.NDI, DR0 = dep.R0;
+    const px = cx2.getImageData(0, 0, W, H).data, V = inv4r(ph.m), f = 1 / Math.tan(ph.hfov / 2), asp = W / H, pcx = ph.cx || 0, pcy = ph.cy || 0, pk1 = ph.k1 || 0, ox = ph.m[12], oy = ph.m[13], oz = ph.m[14];
+    const DV = dep ? inv4r(dep.X) : null, DP = dep && dep.PRJ, DN = dep && dep.NDI, DR0 = dep && dep.R0, DM = ph.dm;
     const proj = (x, y, z, out) => { const ex = V[0] * x + V[4] * y + V[8] * z + V[12], ey = V[1] * x + V[5] * y + V[9] * z + V[13], ez = V[2] * x + V[6] * y + V[10] * z + V[14]; if (ez > -.15) return false;
-      out[0] = .5 + pcx + .5 * f * ex / -ez; out[1] = .5 - .5 * f * asp * ey / -ez + pcy; out[2] = -ez; return out[0] > .01 && out[0] < .99 && out[1] > .01 && out[1] < .99; };
-    const hidden = (x, y, z) => {                                    // the depth frame taken with this photo saw something nearer: occluded
+      const xn = ex / -ez, yn = ey / -ez, rr = xn * xn + yn * yn; if (rr > 2 || (pk1 < 0 && rr > -1 / (3 * pk1))) return false; const kd = 1 + pk1 * rr; out[0] = .5 + pcx + .5 * f * xn * kd; out[1] = .5 - .5 * f * asp * yn * kd + pcy; out[2] = -ez; return out[0] > .01 && out[0] < .99 && out[1] > .01 && out[1] < .99; };
+    const hidden = (x, y, z) => {                                    // something nearer lies on the line of sight: occluded
+      if (DM) { const ex = V[0] * x + V[4] * y + V[8] * z + V[12], ey = V[1] * x + V[5] * y + V[9] * z + V[13], ez = V[2] * x + V[6] * y + V[10] * z + V[14]; if (ez > -.1) return true;
+        const u = .5 + pcx + .5 * f * ex / -ez, v = .5 - .5 * f * asp * ey / -ez + pcy, xi = Math.floor(u * DM.w), yi = Math.floor(v * DM.h); if (xi < 0 || yi < 0 || xi >= DM.w || yi >= DM.h) return true;
+        let zm = 1e9; for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) { const xx = Math.min(DM.w - 1, Math.max(0, xi + a)), yy = Math.min(DM.h - 1, Math.max(0, yi + b)), m = DM.mm[yy * DM.w + xx]; if (m) zm = Math.min(zm, m / 1000); }
+        return zm < 1e8 && -ez > zm + .03; }
       const ax = x - dep.X[12], ay = y - dep.X[13], az = z - dep.X[14], cx = dep.X[0] * ax + dep.X[1] * ay + dep.X[2] * az, cy = dep.X[4] * ax + dep.X[5] * ay + dep.X[6] * az, cz = dep.X[8] * ax + dep.X[9] * ay + dep.X[10] * az, zv = -cz;
       if (zv < .15) return true; const qw = DP[3] * cx + DP[7] * cy + DP[11] * cz + DP[15]; let vu = (DP[0] * cx + DP[4] * cy + DP[8] * cz + DP[12]) / qw * .5 + .5, vv = (DP[1] * cx + DP[5] * cy + DP[9] * cz + DP[13]) / qw * .5 + .5;
       if (dep.flip) vv = 1 - vv; let u = vu, w = vv; if (DN) { u = DN[0] * vu + DN[4] * vv + DN[12]; w = DN[1] * vu + DN[5] * vv + DN[13]; }
@@ -1776,11 +1805,12 @@ async function recTexture(rec, say = () => {}) {
   const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface to texture');
   const photos = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob), depths = await DB.depthFrames(rec.id).catch(() => []);
   if (!photos.length) throw new Error('no photos saved with this scan (turn on Real colours while scanning)');
-  if (!depths.length) throw new Error('no depth frames saved with this scan (scans from this version on have them)');
+  say('rendering what each photo saw'); const dms = await photoDepths(rec, photos, m => say('occlusion ' + m), true, .25).catch(() => null);
+  if (!dms && !depths.length) throw new Error('no way to check occlusion for this scan');
   const Q = m.I.length / 6, A = Q < 110000 ? 2048 : Q < 450000 ? 4096 : 8192, Ts = Q < 110000 ? 4 : 4;
   const w = new Worker(URL.createObjectURL(new Blob([BAKE_SRC], { type: 'text/javascript' })));
   const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onerror = e => no(new Error(e.message || 'texture bake failed'));
-    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map(f => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, sharp: f.sharp, t: f.t })), depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }); });
+    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map((f, i) => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, k1: f.k1 || 0, sharp: f.sharp, t: f.t, dm: dms ? dms[i] : null })), depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }); });
   w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await putIfSame(rec).catch(() => {});
   return tex;
 }
@@ -1805,7 +1835,7 @@ function solve(A, b, n) { const M = []; for (let i = 0; i < n; i++) M.push(Array
   for (let c = 0; c < n; c++) { let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r; [M[c], M[p]] = [M[p], M[c]]; if (Math.abs(M[c][c]) < 1e-15) return null; for (let r = c + 1; r < n; r++) { const f = M[r][c] / M[c][c]; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; } }
   const x = new Array(n).fill(0); for (let r = n - 1; r >= 0; r--) { let s = M[r][n]; for (let k = r + 1; k < n; k++) s -= M[r][k] * x[k]; x[r] = s / M[r][r]; } return x; }
 onmessage = async e => {
-  const { P, N, photos, depths, E0, W } = e.data, say = m => postMessage({ msg: m });
+  const { P, N, photos, depths, E0, W, K10 } = e.data, say = m => postMessage({ msg: m });
   /* surface samples */
   const nv = P.length / 3, st = Math.max(1, Math.floor(nv / 20000)), S = [], SN = []; for (let i = 0; i < nv; i += st) { S.push(P[i * 3], P[i * 3 + 1], P[i * 3 + 2]); SN.push(N[i * 3], N[i * 3 + 1], N[i * 3 + 2]); }
   const ns = S.length / 3;
@@ -1831,22 +1861,24 @@ onmessage = async e => {
       for (let y = A.h - 1; y >= 0; y--) for (let x = A.w - 1; x >= 0; x--) { const o = y * A.w + x; let v = DT[o]; if (x < A.w - 1) v = Math.min(v, DT[o + 1] + 1); if (y < A.h - 1) v = Math.min(v, DT[o + A.w] + 1); if (x < A.w - 1 && y < A.h - 1) v = Math.min(v, DT[o + A.w + 1] + 1.41); if (y < A.h - 1 && x) v = Math.min(v, DT[o + A.w - 1] + 1.41); DT[o] = v; }
       A.dt = DT; }
     const f0 = 1 / Math.tan(photos[k].hfov / 2);
-    ph.push({ k, H: new Float64Array(photos[k].m0), D: new Float64Array(16).fill(0).map((_, i) => i % 5 === 0 ? 1 : 0), f0, cx0: photos[k].cx || 0, cy0: photos[k].cy || 0, asp: w / h, L, vis: null, gain: 1, t: photos[k].t }); }
+    ph.push({ k, dm: photos[k].dm || null, H: new Float64Array(photos[k].m0), D: new Float64Array(16).fill(0).map((_, i) => i % 5 === 0 ? 1 : 0), f0, cx0: photos[k].cx || 0, cy0: photos[k].cy || 0, asp: w / h, L, vis: null, gain: 1, t: photos[k].t }); }
   if (ph.length < 5) { postMessage({ error: 'need at least 5 photos' }); return; }
-  let E = new Float64Array(E0), gs = 0, gcx = 0, gcy = 0;
+  let E = new Float64Array(E0), gs = 0, gcx = 0, gcy = 0, gk = K10 || 0;
   const camW2C = (q, E2, Dx) => rinv(mul(Dx || q.D, mul(q.H, E2 || E)));
   const sample = (L, u, v) => { const x = u * L.w - .5, y = v * L.h - .5, x0 = Math.floor(x), y0 = Math.floor(y); if (x0 < 0 || y0 < 0 || x0 >= L.w - 1 || y0 >= L.h - 1) return -1; const ax = x - x0, ay = y - y0, o = y0 * L.w + x0;
     return (L.g[o] * (1 - ax) + L.g[o + 1] * ax) * (1 - ay) + (L.g[o + L.w] * (1 - ax) + L.g[o + L.w + 1] * ax) * ay; };
+  let KD = gk;                                                       // lens distortion used by proj (set per evaluation)
   const proj = (V, q, i, out, s2, cx2, cy2) => { const x = S[i * 3], y = S[i * 3 + 1], z = S[i * 3 + 2], ex = V[0] * x + V[4] * y + V[8] * z + V[12], ey = V[1] * x + V[5] * y + V[9] * z + V[13], ez = V[2] * x + V[6] * y + V[10] * z + V[14];
-    if (ez > -.1) return false; const f = q.f0 * (1 + s2); out[0] = .5 + q.cx0 + cx2 + .5 * f * ex / -ez; out[1] = .5 - .5 * f * q.asp * ey / -ez + q.cy0 + cy2; out[2] = -ez; return out[0] > .02 && out[0] < .98 && out[1] > .02 && out[1] < .98; };
+    if (ez > -.1) return false; const f = q.f0 * (1 + s2), xn = ex / -ez, yn = ey / -ez, rr = xn * xn + yn * yn; if (rr > 2 || (KD < 0 && rr > -1 / (3 * KD))) return false; const kd = 1 + KD * rr; out[0] = .5 + q.cx0 + cx2 + .5 * f * xn * kd; out[1] = .5 - .5 * f * q.asp * yn * kd + q.cy0 + cy2; out[2] = -ez; return out[0] > .02 && out[0] < .98 && out[1] > .02 && out[1] < .98; };
   /* which samples each photo really sees: facing it, inside the frame, not hidden (checked with the depth frame taken alongside) */
   say('finding what each photo sees'); const o3 = [0, 0, 0];
   for (const q of ph) {
-    let dep = null, db = 700; for (const d of depths) { const dt = Math.abs(d.t - q.t); if (dt < db) { db = dt; dep = d; } }
+    let dep = null, db = 700; if (!q.dm) for (const d of depths) { const dt = Math.abs(d.t - q.t); if (dt < db) { db = dt; dep = d; } }
     const V = camW2C(q), C = mul(q.H, E), list = [];
     for (let i = 0; i < ns; i++) { if (!proj(V, q, i, o3, 0, 0, 0)) continue; const vx = C[12] - S[i * 3], vy = C[13] - S[i * 3 + 1], vz = C[14] - S[i * 3 + 2], dl = Math.hypot(vx, vy, vz);
       if ((SN[i * 3] * vx + SN[i * 3 + 1] * vy + SN[i * 3 + 2] * vz) / dl < .3 || dl > 4) continue;
-      if (dep) { const X = dep.X, ax = S[i * 3] - X[12], ay = S[i * 3 + 1] - X[13], az = S[i * 3 + 2] - X[14], cx = X[0] * ax + X[1] * ay + X[2] * az, cy = X[4] * ax + X[5] * ay + X[6] * az, cz = X[8] * ax + X[9] * ay + X[10] * az, zv = -cz, PR = dep.PRJ;
+      if (q.dm) { const DM = q.dm, f = q.f0, xn = o3[0], yn = o3[1], xi = Math.floor(xn * DM.w), yi = Math.floor(yn * DM.h); if (xi >= 0 && yi >= 0 && xi < DM.w && yi < DM.h) { let zm = 1e9; for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) { const m = DM.mm[Math.min(DM.h - 1, Math.max(0, yi + b)) * DM.w + Math.min(DM.w - 1, Math.max(0, xi + a))]; if (m) zm = Math.min(zm, m / 1000); } if (zm < 1e8 && o3[2] > zm + .04) continue; } }
+      else if (dep) { const X = dep.X, ax = S[i * 3] - X[12], ay = S[i * 3 + 1] - X[13], az = S[i * 3 + 2] - X[14], cx = X[0] * ax + X[1] * ay + X[2] * az, cy = X[4] * ax + X[5] * ay + X[6] * az, cz = X[8] * ax + X[9] * ay + X[10] * az, zv = -cz, PR = dep.PRJ;
         if (zv > .15) { const qw = PR[3] * cx + PR[7] * cy + PR[11] * cz + PR[15]; let vu = (PR[0] * cx + PR[4] * cy + PR[8] * cz + PR[12]) / qw * .5 + .5, vv = (PR[1] * cx + PR[5] * cy + PR[9] * cz + PR[13]) / qw * .5 + .5; if (dep.flip) vv = 1 - vv;
           let u = vu, w2 = vv; if (dep.NDI) { u = dep.NDI[0] * vu + dep.NDI[4] * vv + dep.NDI[12]; w2 = dep.NDI[1] * vu + dep.NDI[5] * vv + dep.NDI[13]; }
           const xi = Math.round(((u - dep.R0[0]) / dep.R0[2] - dep.jx) * dep.DW - .5), yi = Math.round(((w2 - dep.R0[1]) / dep.R0[3] - dep.jy) * dep.DH - .5);
@@ -1866,26 +1898,28 @@ onmessage = async e => {
   target(1); const rms0 = rmsAll(1);
   /* stage 1 - geometry edges onto photo edges (chamfer): pins the camera offset on the headset and the lens in absolute terms */
   for (const q of use) { const V = camW2C(q), list = []; for (const i of CR) if (proj(V, q, i, o3, 0, 0, 0)) list.push(i); q.cr = new Int32Array(list.slice(0, 700)); }
-  const edgeCost = (lv, E2, s2, cx2, cy2, out) => { let c = 0, n = 0, j = 0; for (const q of use) { const V = camW2C(q, E2), A = q.L[lv], K = 6;
+  const edgeCost = (lv, E2, s2, cx2, cy2, out, k1) => { KD = k1 == null ? gk : k1; let c = 0, n = 0, j = 0; for (const q of use) { const V = camW2C(q, E2), A = q.L[lv], K = 6;
     for (const i of q.cr) { let d = K; if (proj(V, q, i, o3, s2, cx2, cy2)) { const fx = Math.min(A.w - 1.001, Math.max(0, o3[0] * A.w - .5)), fy = Math.min(A.h - 1.001, Math.max(0, o3[1] * A.h - .5)), x0 = Math.floor(fx), y0 = Math.floor(fy), ax = fx - x0, ay = fy - y0, o = y0 * A.w + x0;
         d = Math.min(K, (A.dt[o] * (1 - ax) + A.dt[o + 1] * ax) * (1 - ay) + (A.dt[o + A.w] * (1 - ax) + A.dt[o + A.w + 1] * ax) * ay); } if (out) out[j] = d; j++; c += d; n++; } } return n ? c / n : 0; };
   const nEdge = use.reduce((a, q) => a + q.cr.length, 0); let edge0 = 0, edge1 = 0;
   if (nEdge > 300) {
     edge0 = edgeCost(1, E, gs, gcx, gcy);
     for (const lv of [3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 0, 0, 0]) {    // coarse-to-fine; derivatives from smoothed differences
-      const NP = 9, base = new Float64Array(nEdge); edgeCost(lv, E, gs, gcx, gcy, base); const cols = [];
-      for (let pI = 0; pI < NP; pI++) { const h = (pI < 3 ? .006 : pI < 6 ? .006 : pI === 6 ? .012 : .006) * (1 << lv) / 2; let E2 = E, s2 = gs, cx2 = gcx, cy2 = gcy;
-        if (pI < 6) E2 = mul(E, rig(pI < 3 ? [pI === 0 ? h : 0, pI === 1 ? h : 0, pI === 2 ? h : 0] : [0, 0, 0], pI >= 3 ? [pI === 3 ? h : 0, pI === 4 ? h : 0, pI === 5 ? h : 0] : [0, 0, 0])); else if (pI === 6) s2 += h; else if (pI === 7) cx2 += h; else cy2 += h;
-        const o = new Float64Array(nEdge); edgeCost(lv, E2, s2, cx2, cy2, o); for (let j = 0; j < nEdge; j++) o[j] = (o[j] - base[j]) / h; cols.push(o); }
+      const NP = 9, base = new Float64Array(nEdge); edgeCost(lv, E, gs, gcx, gcy, base); const cols = [];   // lens distortion (index 9) is weakly observable from edges: kept at its calibrated value
+      for (let pI = 0; pI < NP; pI++) { const h = (pI < 3 ? .006 : pI < 6 ? .006 : pI === 6 ? .012 : pI === 9 ? .02 : .006) * (1 << lv) / 2; let E2 = E, s2 = gs, cx2 = gcx, cy2 = gcy, k2 = gk;
+        if (pI < 6) E2 = mul(E, rig(pI < 3 ? [pI === 0 ? h : 0, pI === 1 ? h : 0, pI === 2 ? h : 0] : [0, 0, 0], pI >= 3 ? [pI === 3 ? h : 0, pI === 4 ? h : 0, pI === 5 ? h : 0] : [0, 0, 0])); else if (pI === 6) s2 += h; else if (pI === 7) cx2 += h; else if (pI === 8) cy2 += h; else k2 += h;
+        const o = new Float64Array(nEdge); edgeCost(lv, E2, s2, cx2, cy2, o, k2); for (let j = 0; j < nEdge; j++) o[j] = (o[j] - base[j]) / h; cols.push(o); }
       const A = new Float64Array(NP * NP), g = new Array(NP).fill(0);
       for (let j = 0; j < nEdge; j++) { if (base[j] >= 6) continue; for (let a = 0; a < NP; a++) { g[a] -= cols[a][j] * base[j]; for (let c = 0; c < NP; c++) A[a * NP + c] += cols[a][j] * cols[c][j]; } }
       let tr = 0; for (let a = 0; a < NP; a++) tr += A[a * NP + a]; for (let a = 0; a < NP; a++) A[a * NP + a] += tr / NP * .2 + 1e-9;
       const x = solve(A, g, NP); if (!x) continue;
       const cand = [mul(E, rig([x[0], x[1], x[2]].map(v => Math.max(-.02, Math.min(.02, v))), [x[3], x[4], x[5]].map(v => Math.max(-.03, Math.min(.03, v))))), Math.max(-.2, Math.min(.2, gs + Math.max(-.03, Math.min(.03, x[6])))), Math.max(-.08, Math.min(.08, gcx + Math.max(-.015, Math.min(.015, x[7])))), Math.max(-.08, Math.min(.08, gcy + Math.max(-.015, Math.min(.015, x[8]))))];
-      if (edgeCost(lv, ...cand) < edgeCost(lv, E, gs, gcx, gcy)) { [E, gs, gcx, gcy] = cand; }   // only accept steps that help
+      cand.push(NP > 9 ? Math.max(-.35, Math.min(.35, gk + Math.max(-.05, Math.min(.05, x[9])))) : gk);
+      if (edgeCost(lv, cand[0], cand[1], cand[2], cand[3], null, cand[4]) < edgeCost(lv, E, gs, gcx, gcy, null, gk)) { [E, gs, gcx, gcy, gk] = cand; }   // only accept steps that help
     }
-    edge1 = edgeCost(1, E, gs, gcx, gcy);
+    edge1 = edgeCost(1, E, gs, gcx, gcy, null, gk);
   }
+  KD = gk;
   say('edges matched: ' + edge0.toFixed(2) + ' → ' + edge1.toFixed(2) + ' px');
   /* stage 2 - colour consistency polish (per-photo moves stay tiny) */
   for (const lv of [1, 0, 0]) {
@@ -1916,28 +1950,30 @@ onmessage = async e => {
     }
   }
   target(0); const rms1 = rmsAll(0); target(1); const rms1c = rmsAll(1);
-  postMessage({ done: true, E: Array.from(E), s: gs, cx: gcx, cy: gcy, rms0, rms1: rms1c, rmsFine: rms1, edge0, edge1, creases: CR.length, used: use.length,
-    photos: use.map(q => ({ k: q.k, m: Array.from(mul(q.D, mul(q.H, E))), hfov: 2 * Math.atan(1 / (q.f0 * (1 + gs))), cx: q.cx0 + gcx, cy: q.cy0 + gcy, gain: q.gain })) });
+  postMessage({ done: true, E: Array.from(E), s: gs, cx: gcx, cy: gcy, k1: gk, rms0, rms1: rms1c, rmsFine: rms1, edge0, edge1, creases: CR.length, used: use.length,
+    photos: use.map(q => ({ k: q.k, m: Array.from(mul(q.D, mul(q.H, E))), hfov: 2 * Math.atan(1 / (q.f0 * (1 + gs))), cx: q.cx0 + gcx, cy: q.cy0 + gcy, k1: gk, gain: q.gain })) });
 };`;
 async function alignPhotos(rec, say = () => {}) {
   const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface');
   const frames = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m), depths = await DB.depthFrames(rec.id).catch(() => []);
   if (frames.length < 5) throw new Error('need at least 5 photos');
+  say('rendering what each photo saw'); const dms = await photoDepths(rec, frames, m => say('occlusion ' + m), true, .25).catch(() => null);
   let E0 = null; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.E) E0 = c.E; } catch (e) {}
   if (!E0) E0 = new M4().elements.slice();
   const w = new Worker(URL.createObjectURL(new Blob([PALIGN_SRC], { type: 'text/javascript' })));
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'photo matching failed'));
-    w.postMessage({ P: m.P, N: m.N, E0, W: 400,
-      photos: frames.map(f => ({ blob: f.blob, m0: f.m0 || (f.E ? new M4().fromArray(f.m).multiply(new M4().fromArray(f.E).invert()).elements.slice() : f.m), hfov: f.hfov0 || f.hfov, cx: f.cx0 != null ? f.cx0 : f.cx, cy: f.cy0 != null ? f.cy0 : f.cy, t: f.t })),
+    let K10 = 0; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.k1) K10 = c.k1; } catch (e) {}
+    w.postMessage({ P: m.P, N: m.N, E0, K10, W: 400,
+      photos: frames.map((f, i) => ({ dm: dms ? dms[i] : null, blob: f.blob, m0: f.m0 || (f.E ? new M4().fromArray(f.m).multiply(new M4().fromArray(f.E).invert()).elements.slice() : f.m), hfov: f.hfov0 || f.hfov, cx: f.cx0 != null ? f.cx0 : f.cx, cy: f.cy0 != null ? f.cy0 : f.cy, t: f.t })),
       depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }); });
   w.terminate();
   if (!(res.edge1 < res.edge0 - .05 || res.rms1 < res.rms0)) throw new Error('photo matching did not improve (edges ' + (res.edge0 || 0).toFixed(2) + ' px, colour ' + res.rms0.toFixed(3) + ')');
   for (const p of res.photos) { const f = frames[p.k];
     if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
-    f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.gain = p.gain; f.aligned = true; await DB.putFrame(f); }
+    f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.k1 = p.k1; f.gain = p.gain; f.aligned = true; await DB.putFrame(f); }
   /* the camera calibration carries over: future scans colour and photograph with it */
-  try { localStorage.setItem('scanner.camCal', JSON.stringify({ E: res.E, s: res.s, cx: res.cx, cy: res.cy, at: Date.now() })); } catch (e) {}
-  colorCam.E = new M4().fromArray(res.E); const fp = res.photos[res.photos.length - 1]; colorCam.f = 1 / Math.tan(fp.hfov / 2); colorCam.cx = fp.cx; colorCam.cy = fp.cy; colorCam.aligned = true;
+  try { localStorage.setItem('scanner.camCal', JSON.stringify({ E: res.E, s: res.s, cx: res.cx, cy: res.cy, k1: res.k1, at: Date.now() })); } catch (e) {}
+  colorCam.E = new M4().fromArray(res.E); const fp = res.photos[res.photos.length - 1]; colorCam.f = 1 / Math.tan(fp.hfov / 2); colorCam.cx = fp.cx; colorCam.cy = fp.cy; colorCam.k1 = res.k1 || 0; colorCam.aligned = true;
   rec.photoAlign = { at: Date.now(), rms0: res.rms0, rms1: res.rms1, edge0_px: res.edge0, edge1_px: res.edge1, used: res.used, offset_cm: Math.hypot(res.E[12], res.E[13], res.E[14]) * 100 };
   delete rec.tex; await putIfSame(rec);
   return res;
@@ -1953,8 +1989,9 @@ const ibrCam = new THREE.PerspectiveCamera(); ibrCam.matrixAutoUpdate = false; i
 for (let k = 0; k < IBR_K; k++) { const tex = new THREE.Texture(); tex.flipY = false; tex.colorSpace = THREE.SRGBColorSpace; tex.minFilter = THREE.LinearFilter; tex.generateMipmaps = false;
   ibr.slots.push({ idx: -1, tex, rt: new THREE.WebGLRenderTarget(256, 256, { type: THREE.HalfFloatType, depthBuffer: true }), view: new M4(), intr: new THREE.Vector4(), pos: new V3(), on: 0, gain: 1, bmp: null }); }
 const SLOT = i => `if (phOn[${i}] > .5) { vec4 e = phV[${i}] * vec4(vW, 1.0); float z = -e.z;
-    if (z > .1) { vec4 q = phI[${i}]; float u = .5 + q.z + .5 * q.x * e.x / z, v = .5 - .5 * q.x * q.y * e.y / z + q.w;
-      if (u > .004 && u < .996 && v > .004 && v < .996 && z < texture2D(sh[${i}], vec2(u, 1.0 - v)).r + .045) {
+    if (z > .1) { vec4 q = phI[${i}]; vec2 nrm2 = e.xy / z; float rr = dot(nrm2, nrm2); bool okr = rr < 2.0 && !(phK[${i}] < 0.0 && rr > -1.0 / (3.0 * phK[${i}])); float kd = 1.0 + phK[${i}] * rr, u = !okr ? -1.0 : .5 + q.z + .5 * q.x * nrm2.x * kd, v = .5 - .5 * q.x * q.y * nrm2.y * kd + q.w;
+      float su = .5 + q.z + .5 * q.x * nrm2.x, sv = .5 - .5 * q.x * q.y * nrm2.y + q.w;            // the depth view is a plain pinhole
+      if (u > .004 && u < .996 && v > .004 && v < .996 && z < texture2D(sh[${i}], vec2(su, 1.0 - sv)).r + .045) {
         vec3 r1 = normalize(vW - cameraPosition), r2 = normalize(vW - phP[${i}]); float de = length(vW - cameraPosition);
         float edge = smoothstep(0.0, .08, min(min(u, 1.0 - u), min(v, 1.0 - v)));        // feather the photo's own borders (vignette, blur)
         float w = (exp(-(1.0 - dot(r1, r2)) * 45.0) * clamp((de + .3) / (z + .3), .25, 1.0) * edge * phF[${i}]) / (1.0 + z * .3) + 1e-5;
@@ -1962,7 +1999,7 @@ const SLOT = i => `if (phOn[${i}] > .5) { vec4 e = phV[${i}] * vec4(vW, 1.0); fl
 function ibrMaterial(useMap, map) {
   return new THREE.ShaderMaterial({ side: THREE.DoubleSide, transparent: true, vertexColors: !useMap, defines: useMap ? { IBR_MAP: 1 } : {},
     uniforms: { baseMap: { value: map || null }, ph: { value: ibr.slots.map(s => s.tex) }, sh: { value: ibr.slots.map(s => s.rt.texture) }, phV: { value: ibr.slots.map(s => s.view) }, phI: { value: ibr.slots.map(s => s.intr) },
-      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, phF: { value: [0, 0, 0, 0, 0, 0] }, opacity: { value: 1 } },
+      phP: { value: ibr.slots.map(s => s.pos) }, phOn: { value: [0, 0, 0, 0, 0, 0] }, phG: { value: [1, 1, 1, 1, 1, 1] }, phF: { value: [0, 0, 0, 0, 0, 0] }, phK: { value: [0, 0, 0, 0, 0, 0] }, opacity: { value: 1 } },
     vertexShader: `varying vec3 vW; varying vec2 vUv2; varying vec3 vC2; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
       #ifdef IBR_MAP
       vUv2 = uv;
@@ -1970,7 +2007,7 @@ function ibrMaterial(useMap, map) {
       vC2 = color;
       #endif
       gl_Position = projectionMatrix * viewMatrix * w; }`,
-    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float phF[6]; uniform float opacity;
+    fragmentShader: `uniform sampler2D baseMap; uniform sampler2D ph[6]; uniform sampler2D sh[6]; uniform mat4 phV[6]; uniform vec4 phI[6]; uniform vec3 phP[6]; uniform float phOn[6]; uniform float phG[6]; uniform float phF[6]; uniform float phK[6]; uniform float opacity;
       varying vec3 vW; varying vec2 vUv2; varying vec3 vC2;
       void main(){ vec3 acc = vec3(0.0); float ws = 0.0;
         ${[0, 1, 2, 3, 4, 5].map(SLOT).join('\n')}
@@ -2000,7 +2037,7 @@ async function ibrLoad(slot, k) {                                    // decode o
     if (!ibr.on) { bmp.close(); return; }
     if (slot.bmp) slot.bmp.close(); slot.bmp = bmp; slot.tex.image = bmp; slot.tex.needsUpdate = true;
     const Mw = ibr.T.clone().multiply(F.m), fx = 1 / Math.tan(f.hfov / 2), asp = w / h;
-    slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = f.gain || ibr.gains.get(f.t) || 1; slot.idx = k;
+    slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = f.gain || ibr.gains.get(f.t) || 1; slot.k1 = f.k1 || 0; slot.idx = k;
     /* the photo's own depth view (for occlusion), same projection as the photo */
     const P = ibrCam.projectionMatrix, n = .05, fa = 30; P.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); ibrCam.projectionMatrixInverse.copy(P).invert();
     ibrCam.matrixWorld.copy(Mw); ibrCam.matrixWorldInverse.copy(slot.view);
@@ -2019,7 +2056,7 @@ function ibrUpdate(eyeCam) {                                         // pick the
     if (ibr.slow > 90 && (ibr.k || IBR_K) > 3) { ibr.k = (ibr.k || IBR_K) - 1; ibr.slow = 0; } if (ibr.fast > 300 && (ibr.k || IBR_K) < IBR_K) { ibr.k = (ibr.k || IBR_K) + 1; ibr.fast = 0; } }
   const kAct = ibr.k || IBR_K;
   for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k]; sl.fade = Math.min(1, (sl.fade || 0) + 1 / 20); }       // ~1/3 s fade-in for a newly loaded photo
-  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
+  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
   if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
   const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
   const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
@@ -2392,7 +2429,7 @@ function diagSnapshot() {
     session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
-    camera: { status: colorCam.status, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
+    camera: { status: colorCam.status, clock: colorCam.clock || null, latencyMs: colorCam.lat != null ? Math.round(colorCam.lat) : null, k1: colorCam.k1 || 0, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
     map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
 }
@@ -2730,7 +2767,7 @@ renderer.setAnimationLoop((t, frame) => {
     try {
     lastFrame = frame;
     if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
-    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); } }
+    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); camPoseHist.push({ t, m: Float32Array.from(vp0.transform.matrix) }); if (camPoseHist.length > 60) camPoseHist.shift(); } }
     camPump();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
