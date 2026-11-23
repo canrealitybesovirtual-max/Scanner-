@@ -697,7 +697,7 @@ function calibrateStep(M, raws, modes) {
     if (cal.pairs >= 24) {
       let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (o.n >= 4 && m > bs) { bs = m; best = k; } }
       if (bs < .3) { depth.metaStale = true; cal.pairs = 0; cal.score = new Map(); toast('The Meta room scan does not match this room: calibrating from your own views'); return; }   // old or other-room Meta data
-      if (best) { depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.locked = true; depth.agree = bs; try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {} clearMap();
+      if (best) { depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.locked = true; depth.agree = bs; try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {} resetLiveMap();
         toast(bs > .45 ? 'Depth matched to the Meta scan (' + Math.round(bs * 100) + '%): scanning' : 'Depth only ' + Math.round(bs * 100) + '% matches the Meta scan. Redo the Meta room scan?'); }
     }
     return;
@@ -722,7 +722,7 @@ function calibrateStep(M, raws, modes) {
     let best = null, bs = -1; for (const [k, o] of cal.score) { const m = o.s / Math.max(1, o.n); if (m > bs) { bs = m; best = k; } }
     depth.cfg = JSON.parse(best); depth.cfgScore = bs; cal.method = 'two views'; cal.locked = true; cal.prev = null;
     try { localStorage.setItem('scanner.depthCfg', best); } catch (e) {}
-    clearMap(); toast('Depth calibrated (' + Math.round(depth.cfgScore * 100) + '% agreement): scanning');
+    resetLiveMap(); toast('Depth calibrated (' + Math.round(depth.cfgScore * 100) + '% agreement): scanning');
   }
 }
 function integrateDepth() {
@@ -755,7 +755,7 @@ function integrateDepth() {
     if (depth.cfg && metaSurf.n > 3000 && !depth.metaStale && depth.frames % 3 === 0) {
       const a = metaAgreement(M, raws, depth.cfg, MODES[depth.cfg.mode] || MODES[depth.mode], 6);
       if (a >= 0) { depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
-        if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; } }
+        if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; resetLiveMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; } }
     }
     const f = MODES[depth.mode]; depth.modeName = depth.mode + (depth.cfg ? ' · nd' + depth.cfg.nd + (depth.cfg.flip ? ' flip' : '') + (depth.cfg.swap ? ' swap' : '') + ' ' + depth.cfg.src : '');
     for (let k = 0; k < DW * DH; k++) { const z = f(raws[k]); zs[k] = z; if (z > .2 && z < 4.5) valid++; }
@@ -1269,7 +1269,7 @@ function applyIntegration(budget) {                                // spread eac
     applyQ.shift();
     if (chk && d.tot > 40 && gen === (depth.gen || 0)) {              // keep checking against the Meta scan; recalibrate if it drifts
       const a = d.hit / d.tot; depth.agree = depth.agree == null ? a : depth.agree * .9 + a * .1; depth.lowAgree = depth.agree < .25 ? (depth.lowAgree || 0) + 1 : 0;
-      if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; clearMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; }
+      if (depth.lowAgree > 40) { depth.lowAgree = 0; depth.agree = null; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; resetLiveMap(); toast('Live depth stopped matching the Meta scan: recalibrating'); return; }
     }
     depth.ms = depth.ms ? depth.ms * .8 + d.ms * .2 : d.ms;
     if (F) { depth.fineStatus = d.np + ' fine vox'; if (performance.now() > end) return; continue; }
@@ -1353,6 +1353,7 @@ function snapshot() {
   };
 }
 async function saveScan(frame) {
+  if (cont && !cont.moved && cont.M && currentId === cont.rec.id) { cont.moved = true; const I4 = cont.M.elements.every((v, i) => Math.abs(v - (i % 5 === 0 ? 1 : 0)) < 1e-6); if (!I4) await moveOldFrames(currentId, cont.M, sessionT0); }
   const tsdf = await Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 4000))]);
   const s = snapshot(); if (tsdf && tsdf.keys.length) s.tsdf = tsdf; s.D = Array.from(Dm.elements); if (!s.points.length) { toast('Nothing captured yet'); return; }
   const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
@@ -1377,14 +1378,28 @@ async function loadIntoSession(rec) {
   } else toast('Loaded (no anchor: alignment is from the session origin)');
   mergeRecord(rec, T);
 }
-function mergeRecord(rec, T) {
+/* continuing a saved scan: remember how it was placed, so recalibration can reload it and its old photos/depth frames can be moved into this session's frame on save */
+let cont = null, sessionT0 = 0;
+function resetLiveMap() { clearMap(); if (cont) mergeRecord(cont.rec, cont.T0, true); }
+async function putIfSame(rec) {                                     // background jobs never overwrite a newer save of the same scan
+  const cur = await DB.get(rec.id).catch(() => null); if (cur && cur.date !== rec.date) return false; await DB.put(rec); return true;
+}
+async function moveOldFrames(id, M, before) {                       // old photos and depth frames -> this session's map frame
+  const m4 = new M4(); let n = 0;
+  for (const f of await DB.frames(id).catch(() => [])) if (f.t < before) { f.m = Array.from(m4.copy(M).multiply(new M4().fromArray(f.m)).elements); await DB.putFrame(f); n++; }
+  for (const f of await DB.depthFrames(id).catch(() => [])) if (f.t < before) { f.X = Array.from(m4.copy(M).multiply(new M4().fromArray(f.X)).elements); await DB.putDepth(f); n++; }
+  return n;
+}
+function mergeRecord(rec, T, reload) {
+  if (!viewer.on && !replayMode && !reload) cont = { rec, T0: T.clone(), M: null, moved: false };
   if (rec.D && !viewer.on) T = T.clone().multiply(new M4().fromArray(rec.D).invert());   // saved in that session's map frame
+  if (cont && cont.rec === rec) cont.M = T.clone();
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
   fineIn(rec, T);
   if (rec.tsdf && !viewer.on) integWorker().postMessage({ tsdfLoad: rec.tsdf, T: Array.from(T.elements) });
   flushGeo(); if (!viewer.on) { integWorker().postMessage({ known: Float64Array.from(vmap.keys()) }); integWorker().postMessage({ knownFine: Float64Array.from(fmap.keys()) }); layoutEditsIn(rec.layoutEdits, T); }     // so the live scan can erase what has changed since
-  toast('Loaded ' + (P.length / 3).toLocaleString() + ' points · keep scanning to add more');
+  if (!reload) toast(replayMode ? 'Loaded ' + (P.length / 3).toLocaleString() + ' points' : 'Continuing "' + (rec.name || 'scan') + '": scan anywhere to add detail');
   if (replayMode && !viewer.on) { const Tm = T.clone(); toast('Building surfaces…'); recMesh(rec).then(async parts => { if (!replayMode || !parts.length) return; if (rec.tex) await showTexMesh(rec.tex, Tm, parts.filter(p => p.fine)); else showMesh(parts, Tm); toast(rec.tex ? 'Photo surfaces ready' : 'Surfaces ready'); }).catch(e => toast('Surface build failed: ' + e.message)); }
 }
 
@@ -1485,7 +1500,7 @@ async function refineScan(rec, say) {
   const kfs = await DB.frames(rec.id).catch(() => []); let moved = 0;
   for (const k of kfs) { let best = -1, bd = 2500; fr.forEach((f, i) => { const dt = Math.abs(f.t - k.t); if (dt < bd) { bd = dt; best = i; } });
     if (best >= 0) { k.m = Array.from(new M4().fromArray(res.corr[best]).multiply(new M4().fromArray(k.m)).elements); await DB.putFrame(k); moved++; } }
-  await DB.put(rec);
+  if (!(await putIfSame(rec))) { st.textContent = 'Scan was saved again while refining: refine skipped'; return; }
   st.textContent = 'Refined in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s: ' + res.aligned + '/' + fr.length + ' frames re-aligned (median shift ' + (res.median * 1000).toFixed(0) + ' mm), ' + moved + ' photos updated';
 }
 async function exportGLB(rec) {
@@ -1616,7 +1631,7 @@ async function recMesh(rec) {
   if (rec.tsdf && rec.tsdf.keys.length) parts.push(await tsdfMeshOf(rec.tsdf, rec.zones || [], rec.floorY || 0));   // the fused distance field gives the cleanest surface
   else { const g = gatherRec(rec.points, rec.normals, rec.colors, rec.floorY, rec.zones || []); if (g) parts.push(await meshPoints(...g, rec.voxelSize || VS)); }
   if (rec.fpoints && rec.fpoints.length) { const f = gatherRec(rec.fpoints, rec.fnormals, rec.fcolors, rec.floorY, []); if (f) parts.push(Object.assign(await meshPoints(...f, rec.fineVoxel || VSF), { fine: true })); }
-  rec.meshCache = { v: 2, parts }; if (parts.length && !String(rec.id).startsWith('file-')) DB.put(rec).catch(() => {});
+  rec.meshCache = { v: 2, parts }; if (parts.length && !String(rec.id).startsWith('file-')) putIfSame(rec).catch(() => {});
   return parts;
 }
 const meshG = new THREE.Group(); scene.add(meshG); let surfOn = true;
@@ -1730,7 +1745,7 @@ async function recTexture(rec, say = () => {}) {
   const w = new Worker(URL.createObjectURL(new Blob([BAKE_SRC], { type: 'text/javascript' })));
   const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onerror = e => no(new Error(e.message || 'texture bake failed'));
     w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map(f => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, sharp: f.sharp, t: f.t })), depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }); });
-  w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await DB.put(rec).catch(() => {});
+  w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await putIfSame(rec).catch(() => {});
   return tex;
 }
 async function showTexMesh(tex, T, extraParts) {
@@ -2096,10 +2111,10 @@ async function autoRun() {
       if (nd >= 20 && !rec.refined) { await refineScan(rec, m => say('Refining: ' + m.replace(/^Refining:? ?/, ''))); rec = await DB.get(id); }
       say('Building surface…'); await recMesh(rec);
       if (np && nd) { try { await recTexture(rec, m => say('Photo texture: ' + m + '…')); } catch (e) { say('No photo texture: ' + e.message); } }
-      rec.auto = { v: 1, at: Date.now() }; await DB.put(rec);
+      rec.auto = { v: 1, at: Date.now() }; if (!(await putIfSame(rec))) throw new Error('scan was saved again: will reprocess');
     }
     autoMsg.set(id, 'Ready ✓');
-  } catch (e) { autoMsg.set(id, 'Processing stopped: ' + e.message); try { const rec = await DB.get(id); if (rec) { rec.auto = { v: 1, error: e.message }; await DB.put(rec); } } catch (_) {} }
+  } catch (e) { autoMsg.set(id, 'Processing stopped: ' + e.message); try { const rec = await DB.get(id); if (rec && !/saved again/.test(e.message)) { rec.auto = { v: 1, error: e.message }; await putIfSame(rec); } } catch (_) {} }
   autoBusy = false; autoShow(id); if (!xrSession && !autoQ.length) listScans(); setTimeout(autoRun, 300);
 }
 
@@ -2187,7 +2202,7 @@ async function press(id, frame) {
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
   if (id === 'view') { showMode = (showMode + 1) % 4; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
-  if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} clearMap(); toast('Recalibrating: look around slowly'); }
+  if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} resetLiveMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
     if (!confirmed) { toast('Nothing captured yet'); return; }
@@ -2195,7 +2210,7 @@ async function press(id, frame) {
     try { await saveScan(frame); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
     setTimeout(() => { finishing = false; xrSession && xrSession.end(); }, 2500);
   }
-  if (id === 'clear') { clearMap(); currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); cont = null; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -2249,6 +2264,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
+    clearMap(); cont = null; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
@@ -2282,7 +2298,7 @@ async function listScans() {
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
     mk('Walk through', () => { pendingOpen = r; replayMode = true; if (!$('bAR').disabled) $('bAR').click(); else { replayMode = false; $('st').textContent = 'Walking through needs the Quest browser. Use View here.'; } });
     mk('Photos .zip', () => exportPhotos(r));
-    mk('Continue', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
+    mk('Continue scanning', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
     mk('Refine', () => refineScan(r));
