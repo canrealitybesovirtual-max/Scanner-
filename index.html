@@ -83,7 +83,7 @@ addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); ca
 const VS = .02, CONF = 3, MAX = 2000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
 const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX), nrm = new Float32Array(MAX * 3), tl = new Uint8Array(MAX);   // tl: covered by a flat tile. dirs: which of 26 directions each voxel was seen from
-let N = 0, confirmed = 0, newLo = 0;
+let N = 0, confirmed = 0, newLo = 0, mapFull = false;
 const dmark = new Uint8Array(MAX); let dlist = [];
 const markDirty = id => { if (!dmark[id]) { dmark[id] = 1; dlist.push(id); } };
 const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
@@ -91,7 +91,7 @@ function addSighting(x, y, z, t, w = 1, cam = null, mask = 0, nx = 0, ny = 0, nz
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
   if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return -1;
   const k = keyOf(ix, iy, iz); let id = vmap.get(k);
-  if (id === undefined) { if (N >= MAX) return -1; id = N++; vmap.set(k, id); tl[id] = 0; cellAdd(ix, iy, iz, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
+  if (id === undefined) { if (N >= MAX) { mapFull = true; return -1; } id = N++; vmap.set(k, id); tl[id] = 0; cellAdd(ix, iy, iz, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
   else { const a = w / (Math.min(cnt[id], 30) + w); pos[id * 3] += (x - pos[id * 3]) * a; pos[id * 3 + 1] += (y - pos[id * 3 + 1]) * a; pos[id * 3 + 2] += (z - pos[id * 3 + 2]) * a; }   // the true surface point, not the grid corner
   if (nx || ny || nz) { nrm[id * 3] += nx * w; nrm[id * 3 + 1] += ny * w; nrm[id * 3 + 2] += nz * w; }
   if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
@@ -123,7 +123,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { mapFull = false; if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -451,6 +451,7 @@ function maybeKeyframe(vp, tNow) {
   if (kf.spin > 1.2) return;                                                       // turning faster than ~70°/s: the frame would be blurred                                                           // turning faster than ~30°/s: the frame would be blurred
   if (kf.has && tNow - kf.t < .35) return;
   if (kf.has && p.distanceTo(kf.pos) < .22 && q.angleTo(kf.q) < .21) return;      // nothing new in view since the last keyframe
+  if (tNow - (kf.tryT || 0) < .25) return; kf.tryT = tNow;
   if (!currentId) currentId = 'scan-' + Date.now();
   const v = c.video, w = Math.min(1280, v.videoWidth), h = Math.round(w * v.videoHeight / v.videoWidth);
   /* motion blur kills Gaussian splats: score sharpness (variance of the Laplacian on a small copy), keep only frames near the best seen */
@@ -465,8 +466,14 @@ function maybeKeyframe(vp, tNow) {
   const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(vp.transform.matrix), w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(vp.transform.matrix) };
   kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
 }
-function camFrame(vp) {
+function camPump() {                                            // keep one fresh, downscaled camera bitmap ready (decoded asynchronously)
+  const c = colorCam; if (!c.on || c.noBmp || c.pending || !c.video || c.video.readyState < 2 || performance.now() - (c.bt || 0) < 90 || typeof createImageBitmap === 'undefined') return;
+  c.pending = true; c.bt = performance.now();
+  createImageBitmap(c.video, { resizeWidth: c.w, resizeHeight: c.h }).then(b => { if (c.bmp) c.bmp.close(); c.bmp = b; c.pending = false; }).catch(() => { c.pending = false; c.noBmp = true; });
+}
+function camFrame(vp, forWorker) {
   const c = colorCam; if (!c.on || !c.video || c.video.readyState < 2) return null;
+  if (forWorker && !c.noBmp && typeof createImageBitmap !== 'undefined') { const b = c.bmp; c.bmp = null; return b ? { bmp: b, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy } : null; }
   if (performance.now() - c.t > 90 || !c.data) { c.ctx.drawImage(c.video, 0, 0, c.w, c.h); c.data = c.ctx.getImageData(0, 0, c.w, c.h).data; c.t = performance.now(); }
   return { data: c.data, w: c.w, h: c.h, f: c.f, asp: c.w / c.h, cx: c.cx, cy: c.cy };
 }
@@ -476,7 +483,10 @@ function sampleDepth(frame, ref, session, tNow) {
   /* the depth image trails the head slightly: integrating while you turn smears surfaces into streaks, so only take it when you're steady */
   { const m = vp.transform.matrix, q = new THREE.Quaternion().setFromRotationMatrix(new M4().fromArray(m)), pos = new V3(m[12], m[13], m[14]), mo = depth.motion || (depth.motion = { q: q.clone(), p: pos.clone(), t: tNow, spin: 0, lin: 0 });
     const dt = Math.max(1e-3, tNow - mo.t); mo.spin = mo.spin * .6 + (mo.q.angleTo(q) / dt) * .4; mo.lin = mo.lin * .6 + (mo.p.distanceTo(pos) / dt) * .4; mo.q.copy(q); mo.p.copy(pos); mo.t = tNow;
-    if (mo.spin > .45 || mo.lin > .6) { depth.steady = false; return; } depth.steady = true; }
+    const moving = mo.spin > .45 || mo.lin > .6, canMove = depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15 && !depth.noWorker && !depth.cpu;
+    depth.tooFast = mo.spin > 1.2 || mo.lin > 1.5 || (moving && !depth.lagOK);
+    if (moving && (!canMove || mo.spin > 1.2 || mo.lin > 1.5)) { depth.steady = false; return; }   // moving frames only once the lag is measured (or to measure it)
+    depth.steady = !moving; depth.movingNow = moving; }
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   const freeze = (extra) => Object.assign({
     tNow, xf: new M4().fromArray(((info && info.transform) || view.transform).matrix), inv: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).invert(),
@@ -510,8 +520,29 @@ function sampleDepth(frame, ref, session, tNow) {
     projV: new M4().fromArray(view.projectionMatrix).invert(), xfV: new M4().fromArray(view.transform.matrix),
     ndRaw: info.normDepthBufferFromNormView ? new M4().fromArray(info.normDepthBufferFromNormView.matrix) : null,
     near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
-    head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
+    head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), hands: handsNow(), cam: camFrame(vp, workerPathReady()), vinv: new M4().fromArray(vp.transform.inverse.matrix),
+    moving: !!depth.movingNow, H: poseHist.slice(-LAGS).reverse()               // head poses now, 1, 2 … frames ago
   };
+}
+const LAGS = 6, poseHist = [];
+const workerPathReady = () => !!(depth.cal && depth.cal.locked && depth.cfg && depth.frames > 15 && !depth.noWorker && !depth.cpu);
+try { const l = +localStorage.getItem('scanner.depthLag'); if (l >= 0 && l < LAGS) depth.lag = l; } catch (e) {}
+const _hA = new M4(), _hB = new M4();
+function lagRel(M, k, L) { const H = M.H; if (!H || !H.length) return null; const a = H[Math.min(k, H.length - 1)], b = H[Math.min(L, H.length - 1)]; return _hA.fromArray(a).multiply(_hB.fromArray(b).invert()); }   // pose(t-k) · pose(t-L)⁻¹
+/* which lag makes moving frames land on the surfaces already in the map? tested on ~200 points per moving frame, before they're added */
+function lagTest(d) {
+  const B = d.lagB, P = d.P, n = d.np; if (!B || n < 200 || confirmed < 20000) return;
+  const step = Math.max(1, Math.floor(n / 200)), hits = new Float32Array(LAGS); let tot = 0;
+  for (let i = 0; i < n; i += step) { const o = i * 11, x = P[o], y = P[o + 1], z = P[o + 2]; tot++;
+    for (let k = 0; k < LAGS; k++) { const e = B[k], qx = e[0] * x + e[4] * y + e[8] * z + e[12], qy = e[1] * x + e[5] * y + e[9] * z + e[13], qz = e[2] * x + e[6] * y + e[10] * z + e[14];
+      const ix = Math.floor(qx / VS), iy = Math.floor(qy / VS), iz = Math.floor(qz / VS);
+      for (const [a, b, c] of NB7) { const j = vmap.get(keyOf(ix + a, iy + b, iz + c)); if (j !== undefined && cnt[j] >= CONF) { hits[k]++; break; } } } }
+  const S = depth.lagS || (depth.lagS = new Float32Array(LAGS)); depth.lagN = (depth.lagN || 0) + 1;
+  for (let k = 0; k < LAGS; k++) S[k] = S[k] * .96 + hits[k] / tot;
+  if (depth.lagN < 25) return;
+  const L = d.lagUsed || 0; let best = L; for (let k = 0; k < LAGS; k++) if (S[k] > S[best]) best = k;
+  if (best !== L && S[best] > S[L] * 1.04) { depth.lag = best; depth.lagS = null; depth.lagN = 0; depth.lagOK = false; try { localStorage.setItem('scanner.depthLag', best); } catch (e) {} toast('Depth timing tuned: ' + best + ' frame' + (best === 1 ? '' : 's') + ' behind your head'); return; }
+  depth.lagOK = S[L] / (1 / (1 - .96)) > .3;            // the current lag is the best one and the map agrees: moving frames are safe to fuse
 }
 function depthModes(M) {
   const { near, far, r2m } = M;
@@ -651,7 +682,7 @@ function integrateDepth() {
     if (inBody(_p.x, _p.y, _p.z)) continue;
     if (M.fwdY < -.6) { if (_p.y > M.head.y + .1) up++; else if (_p.y < M.head.y - .3) down++; }
     const id = addSighting(_p.x, _p.y, _p.z, tNow, w, depth.cam);
-    if (id >= 0 && cam && w > .3) {                            // colour it from the passthrough camera frame
+    if (id >= 0 && cam && cam.data && w > .3) {                // colour it from the passthrough camera frame
       _c.copy(_p).applyMatrix4(vinv);
       if (_c.z < -.1) { const cu = .5 + (cam.cx || 0) + .5 * cam.f * _c.x / -_c.z, cv = .5 - .5 * cam.f * cam.asp * _c.y / -_c.z + cam.cy;
         if (cu > 0 && cu < 1 && cv > 0 && cv < 1) { const pi = ((cv * cam.h | 0) * cam.w + (cu * cam.w | 0)) * 4, d = cam.data; tint(id, d[pi] / 255, d[pi + 1] / 255, d[pi + 2] / 255, q); } }
@@ -703,6 +734,7 @@ function alignFrame(cam, V, list, n) {
   AL.done = true; if (bv > base * .95) best = C.findIndex(q => q.hfov === 78 && q.cx === 0 && q.cy === 0);     // no clear winner: keep the plain guess
   return Object.assign({ gain: base / bv }, C[best]);
 }
+let OC = null, OCX = null;
 onmessage = e => {
   const d = e.data;
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
@@ -710,6 +742,12 @@ onmessage = e => {
   if (d.metaSet) { MS = new Set(d.metaSet); ME.clear(); MA.clear(); return; }
   if (d.known) { for (const k of d.known) hAdd(k); return; } DW = d.DW, DH = d.DH, B = d.buf, n = DW * DH;
   if (!zs || zs.length !== n) zs = new Float32Array(n);
+  let noOC = false;
+  if (d.cam && d.cam.bmp) {                                              // camera pixels decoded here, off the main thread
+    if (typeof OffscreenCanvas === 'undefined') { noOC = true; d.cam.bmp.close(); d.cam = null; }
+    else { if (!OC || OC.width !== d.cam.w || OC.height !== d.cam.h) { OC = new OffscreenCanvas(d.cam.w, d.cam.h); OCX = OC.getContext('2d', { willReadFrequently: true }); }
+      OCX.drawImage(d.cam.bmp, 0, 0, d.cam.w, d.cam.h); d.cam.bmp.close(); d.cam.data = OCX.getImageData(0, 0, d.cam.w, d.cam.h).data; }
+  }
   const near = d.near, far = d.far, r2m = d.r2m, rvm = d.rvm, lumA = d.lumA, mode = d.mode, fin = isFinite(far);
   let valid = 0;
   for (let k = 0; k < n; k++) {
@@ -783,7 +821,7 @@ onmessage = e => {
   let align = null;
   if (cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add }, [P.buffer, C.buffer]);
+  postMessage({ P, C, np, nc, valid, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer]);
 };`;
 let integ = null; const applyQ = [];
 function camAligned(a) {                                                       // the worker found how the camera image lines up with the depth
@@ -795,20 +833,26 @@ function camAligned(a) {                                                       /
 function integWorker() {
   if (integ) return integ;
   integ = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' })));
-  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return; d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
+  integ.onmessage = e => { depth.wBusy = false; const d = e.data; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
+    if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
+    if (d.moving) { lagTest(d); if (!depth.lagOK || (d.lagUsed || 0) !== (depth.lag || 0)) return;   // a moving frame is fused only once the lag is known
+      for (let i = 0; i < d.np; i++) d.P[i * 11 + 3] *= .6; d.nc = 0; }                              // and counts for less, and never erases
+    d.i = 0; d.j = 0; d.hit = 0; d.tot = 0; d.ms = 0; applyQ.push(d); depth.lat = performance.now() - depth.postT; depth.rate = .04; };
   integ.onerror = ev => { depth.wBusy = false; depth.noWorker = true; scanErr = 'worker: ' + (ev.message || 'failed'); };
   return integ;
 }
 function postIntegration(M) {                                       // hand a depth frame to the worker (after calibration and warm-up)
-  const cfg = depth.cfg, src = cfg.src === 'info' && M.projI ? 'info' : 'view', inv = src === 'info' ? M.projI : M.projV, xf = src === 'info' ? M.xfI : M.xfV;
+  const cfg = depth.cfg, src = cfg.src === 'info' && M.projI ? 'info' : 'view', inv = src === 'info' ? M.projI : M.projV, L = depth.lag || 0;
+  let xf = src === 'info' ? M.xfI : M.xfV; if (L) { const R = lagRel(M, L, 0); if (R) xf = R.clone().multiply(xf); }   // where the head really was when the depth was taken
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
-  if (M.cam && M.cam.data) { cam = { data: M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; colorCam.data = null; colorCam.t = 0; }   // hand the frame over; grab a fresh one next time
+  if (M.cam && (M.cam.bmp || M.cam.data)) { cam = { bmp: M.cam.bmp || null, data: M.cam.bmp ? null : M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; if (!M.cam.bmp) { colorCam.data = null; colorCam.t = 0; } }   // hand the frame over; grab a fresh one next time
   const msg = { DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
-    head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow };
+    head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow,
+    moving: M.moving, lagUsed: L, lagB: M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(lagRel(M, k, L).elements)) : null };
   depth.wBusy = true; depth.postT = performance.now();
-  integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.data.buffer] : []));
+  integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.bmp || cam.data.buffer] : []));
 }
 const _camW = new V3();
 function applyIntegration(budget) {                                // spread each depth frame over several display frames: never a dropped frame
@@ -1284,13 +1328,14 @@ function toast(m) { toastMsg = m; toastT = 4; }
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
+  if (mapFull) return { title: 'Map full', sub: 'Finish & save, then start a new scan for the next area', p: 1 };
   if (!scanning) return { title: 'Paused', sub: 'Press Resume on your wrist', p: coverage() };
   if (!depth.binding && !depth.cpu) return { title: 'No depth sensor', sub: 'Using the Meta room layout only', p: null };
   if (!depth.cal || !depth.cal.locked) {
     const k = depth.cal ? Math.min(1, (depth.cal.pairs || 0) / (metaSurf.n > 3000 ? 24 : 16)) : 0;
-    return { title: 'Getting ready', sub: depth.steady === false ? 'Hold still a moment…' : 'Look around slowly at walls and floor', p: k, cal: true };
+    return { title: 'Getting ready', sub: depth.tooFast ? 'Hold still a moment…' : 'Look around slowly at walls and floor', p: k, cal: true };
   }
-  const c = coverage(), hint = depth.steady === false ? 'Slow down a little' : c == null ? 'Look around slowly' : c < .98 ? 'Look at every surface from 0.5–3 m' : 'Walk to the next room';
+  const c = coverage(), hint = depth.tooFast ? 'Slow down a little' : c == null ? 'Look around slowly' : c < .98 ? 'Look at every surface from 0.5–3 m' : 'Walk to the next room';
   return { title: 'Scanning', sub: (c != null ? Math.round(c * 100) + '% of this room · ' : '') + area().toFixed(1) + ' m² · ' + hint, p: c };
 }
 const area = () => confirmed * VS * VS;
@@ -1344,7 +1389,7 @@ function drawPanel() {
   } else {
     g.font = '17px monospace'; g.fillStyle = '#8fc4ce';
     const diag = [
-      'depth   ' + (depth.steady === false ? 'paused: turning' : depth.status),
+      'depth   ' + (depth.tooFast ? 'paused: too fast' : depth.status) + ' · lag ' + (depth.lag || 0) + (depth.lagOK ? ' ✓' : ''),
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · cover ' + cov.done.size + '/' + metaSurf.n + ' · edits −' + lay.removed.size + ' +' + lay.added.size,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
       'clean   ' + cleaned.toLocaleString() + ' strays · ' + erased.toLocaleString() + ' moved-away erased · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
@@ -1514,6 +1559,8 @@ renderer.setAnimationLoop((t, frame) => {
     try {
     lastFrame = frame;
     if (!refSpace) refSpace = renderer.xr.getReferenceSpace();
+    { const vp0 = frame.getViewerPose(refSpace); if (vp0) { poseHist.push(Float32Array.from(vp0.transform.matrix)); if (poseHist.length > LAGS) poseHist.shift(); } }
+    camPump();
     if (!originAnchor && frame.createAnchor && !pendingLoad) { originAnchor = 'pending'; frame.createAnchor(new XRRigidTransform(), refSpace).then(a => { originAnchor = a; }).catch(() => { originAnchor = null; }); }
     if (originAnchor === 'pending') { /* waiting */ }
     if (useMeta) { syncLayout(frame, refSpace); if (metaSurf.dirty && clockT - metaSurf.t > 2) { metaSurf.t = clockT; buildMetaSurf(); } }
