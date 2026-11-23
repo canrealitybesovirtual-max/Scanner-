@@ -116,19 +116,27 @@ pg.setAttribute('ang', new THREE.BufferAttribute(ang, 1).setUsage(THREE.DynamicD
 pg.setAttribute('col', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cw', new THREE.BufferAttribute(cw, 1).setUsage(THREE.DynamicDrawUsage));
 pg.setDrawRange(0, 0);
+/* point styles: 0 = scan dots (small, see-through, your real room stays visible), 1 = solid 2 cm tiles, 2 = photo walk-through */
 const pmat = new THREE.ShaderMaterial({
-  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 } },
-  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY, photo; varying vec3 vC; varying float ok;
+  transparent: true, depthWrite: false,
+  uniforms: { time: { value: 0 }, scale: { value: 900 }, size: { value: VS * 1.15 }, minC: { value: 1 }, floorY: { value: 0 }, photo: { value: 0 }, alpha: { value: 1 }, style: { value: 0 } },
+  vertexShader: `attribute float cnt; attribute float born; attribute float ang; attribute vec3 col; attribute float cw; uniform float time, scale, size, minC, floorY, photo, style; varying vec3 vC; varying float ok, va;
     void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
-      ok = step(minC, cnt); gl_PointSize = ok * clamp(size * (1.0 + photo * .8) * scale / max(.05, -mv.z), 1.0, 40.0);
+      float d = -mv.z, fresh = exp(-(time - born) * 1.6);
+      ok = step(minC, cnt) * step(.35, d);                                                                // nothing right in front of your eyes
+      float px = size * scale / max(.05, d);
+      gl_PointSize = ok * (style < .5 ? clamp(px * .45, 1.5, 6.0) * (1.0 + fresh) : clamp(px * (1.0 + photo * .8), 1.0, 40.0));
       float h = clamp((position.y - floorY) / 2.7, 0.0, 1.0);
-      vec3 base = mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));                 // floor warm, walls cool
-      base *= .75 + .25 * clamp(cnt / 24.0, 0.0, 1.0);                                                    // well-seen surfaces brighter
+      vec3 base = style < .5 ? vec3(.72, .9, .96) : mix(vec3(.62, .5, .38), vec3(.78, .84, .9), smoothstep(.02, .3, h));
+      base *= .7 + .3 * clamp(cnt / 24.0, 0.0, 1.0);                                                      // well-seen surfaces brighter
       base = mix(base, col, step(.01, cw));                                                               // real colour from the passthrough camera
-      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * (cw > .01 ? .35 : .7));                       // seen from one angle only: amber
-      float fresh = exp(-(time - born) * 1.6); vC = mix(base, vec3(.25, .95, 1.0), fresh);
-      if (photo > .5) vC = cw > .01 ? col : base * .7; }`,                                           // walk-through: the camera's colours only
-  fragmentShader: `uniform float photo, alpha; varying vec3 vC; varying float ok; void main(){ if (ok < .5) discard; if (photo > .5) { vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; } gl_FragColor = vec4(vC, alpha); }`
+      base = mix(base, vec3(1.0, .68, .2), step(ang, 1.5) * step(3.0, cnt) * (style < .5 ? .45 : .5));     // seen from one angle only: amber hint
+      vC = mix(base, vec3(.25, .95, 1.0), fresh);
+      va = style < .5 ? .55 + .45 * fresh : 1.0;
+      if (photo > .5) { vC = cw > .01 ? col : base * .7; va = 1.0; } }`,
+  fragmentShader: `uniform float photo, alpha, style; varying vec3 vC; varying float ok, va;
+    void main(){ if (ok < .5) discard; if (photo > .5 || style < .5) { vec2 d = gl_PointCoord * 2.0 - 1.0; if (dot(d, d) > 1.0) discard; }
+      gl_FragColor = vec4(vC, alpha * va); }`
 });
 const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
 function flushGeo() {
@@ -288,8 +296,9 @@ const kf = { cv: document.createElement('canvas'), busy: false, t: 0, pos: new V
 function maybeKeyframe(vp, tNow) {
   const c = colorCam; if (!c.on || !scanning || replayMode || kf.busy || !c.video || c.video.readyState < 2) return;
   const m = new M4().fromArray(vp.transform.matrix), p = new V3().setFromMatrixPosition(m), q = new THREE.Quaternion().setFromRotationMatrix(m);
-  const spin = kf.prevT ? kf.prevQ.angleTo(q) / Math.max(1e-3, tNow - kf.prevT) : 9; kf.prevQ.copy(q); kf.prevT = tNow;
-  if (spin > .5) return;                                                           // turning faster than ~30°/s: the frame would be blurred
+  const raw = kf.prevT ? kf.prevQ.angleTo(q) / Math.max(1e-3, tNow - kf.prevT) : 0; kf.prevQ.copy(q); kf.prevT = tNow;
+  kf.spin = (kf.spin || 0) * .8 + raw * .2;
+  if (kf.spin > 1.2) return;                                                       // turning faster than ~70°/s: the frame would be blurred                                                           // turning faster than ~30°/s: the frame would be blurred
   if (kf.has && tNow - kf.t < .35) return;
   if (kf.has && p.distanceTo(kf.pos) < .22 && q.angleTo(kf.q) < .21) return;      // nothing new in view since the last keyframe
   if (!currentId) currentId = 'scan-' + Date.now();
@@ -603,12 +612,12 @@ function analyze(P, masks, planesIn, meshesIn) {
     for (const p of out) { const q = m[m.length - 1]; if (q && p.y - q.y < .15) { if (p.area > q.area) m[m.length - 1] = p; } else m.push(p); }
     return m;
   };
-  let levels = peaks(floorH, 1.5);
+  let levels = peaks(floorH, .5);
   const ssFloors = (planesIn || []).filter(p => p.label === 'floor').map(p => p.m[13]);
   for (const fy of ssFloors) if (!levels.some(l => Math.abs(l.y - fy) < .12)) levels.push({ y: fy, area: 0, fromSetup: true });
   levels.sort((a, b) => a.y - b.y);
   levels = levels.filter((l, i) => i === 0 || l.y - levels[0].y > 1.9 || l.area > 6);          // between-floor ledges (beds, counters) are not levels
-  const ceils = peaks(ceilH, .8);
+  const ceils = peaks(ceilH, .5);
   for (const l of levels) { const c = ceils.find(c => c.y - l.y > 1.9 && c.y - l.y < 4.2); l.ceiling = c ? c.y : null; }
   const levelOf = y => { let best = levels[0]; for (const l of levels) if (l.y <= y + .3) best = l; return best; };
   if (!levels.length) return { levels: [], walls: [], stairs: [], objects: [], points: n };
@@ -801,7 +810,7 @@ const BTN = () => [
   { id: 'room', label: 'Redo Meta room scan' },
   { id: 'under', label: underOn ? 'Understanding: ON' : 'Understanding: OFF', on: underOn },
   { id: 'analyze', label: 'Re-analyse now' },
-  { id: 'view', label: ['View: points + layout', 'View: points', 'View: layout'][showMode] },
+  { id: 'view', label: ['Points: dots', 'Points: solid', 'Points: hidden'][showMode] },
   { id: 'color', label: colorCam.on ? 'Camera colour: ON' : 'Camera colour: OFF', on: colorCam.on },
   ...(replayMode ? [{ id: 'reality', label: ['Showing: captured', 'Showing: blend', 'Showing: real'][reality], on: true }] : []),
   { id: 'flip', label: depth.flipY ? 'Depth Y: flipped' : 'Depth Y: normal' },
@@ -810,7 +819,7 @@ const BTN = () => [
   { id: 'exit', label: 'Exit' }
 ];
 function setReality() {                                    // captured house only, half-and-half, or the real room through passthrough
-  pmat.uniforms.alpha.value = reality === 1 ? .55 : 1; pmat.transparent = reality === 1; pmat.needsUpdate = true;
+  pmat.uniforms.alpha.value = reality === 1 ? .55 : 1; pmat.transparent = true; pmat.needsUpdate = true;
   cloud.visible = reality !== 2; renderer.setClearColor(0x080808, reality === 0 ? 1 : 0);
 }
 function toast(m) { toastMsg = m; toastT = 4; }
@@ -851,7 +860,7 @@ async function press(id, frame) {
   if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s saved room layout (check it is this house)' : 'Ignoring the Quest\'s saved room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
-  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; layout.visible = showMode !== 1; }
+  if (id === 'view') { showMode = (showMode + 1) % 3; cloud.visible = showMode !== 2; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; }
   if (id === 'flip') { depth.flipY = !depth.flipY; toast('If the points looked mirrored up/down, this fixes it. Clear the map after switching.'); }
   if (id === 'save') saveScan(frame);
   if (id === 'clear') { clearMap(); currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
@@ -908,8 +917,8 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = false; cloud.visible = true; $('ui').classList.remove('hide'); listScans(); });
-    if (replayMode) { scanning = false; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
+    s.addEventListener('end', () => { xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; }
     kf.has = false; kf.n = 0;
     if (pendingOpen) { const r = pendingOpen; pendingOpen = null; DB.countFrames(r.id).then(n => kf.n = n || 0).catch(() => {}); setTimeout(() => loadIntoSession(r), 1500); }
