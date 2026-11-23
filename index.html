@@ -232,14 +232,19 @@ function zoneROI(zone, proj, xf, cfg, ndRaw) {
   const cxu = (u0 + u1) / 2, cxv = (v0 + v1) / 2, su = Math.max(.15, u1 - u0), sv = Math.max(.15, v1 - v0);
   return [Math.max(0, Math.min(1 - su, cxu - su / 2)), Math.max(0, Math.min(1 - sv, cxv - sv / 2)), Math.min(1, su), Math.min(1, sv)];
 }
-function startDetail() {                                       // aim: the first surface along your gaze; the zone wraps the object there
+function gazeHit(maxD) {                                          // first confirmed surface along your gaze, in the map frame
+  const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()).applyMatrix4(Dm), f = xc.getWorldDirection(new V3()).transformDirection(Dm);
+  for (let t = .2; t < maxD; t += .01) { const x = o.x + f.x * t, y = o.y + f.y * t, z = o.z + f.z * t, id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS))); if (id !== undefined && cnt[id] >= CONF) return { p: new V3(x, y, z), d: t, id, f }; }
+  return null;
+}
+function startDetail(auto) {                                     // aim: the first surface along your gaze; the zone wraps the object there
   if (det.zones.length >= 8) { toast('8 detail zones already: save, then start a new scan'); return; }
   const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()).applyMatrix4(Dm), f = xc.getWorldDirection(new V3()).transformDirection(Dm); let hit = null;
   for (let t = .2; t < 2.5 && !hit; t += .01) { const x = o.x + f.x * t, y = o.y + f.y * t, z = o.z + f.z * t, id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS))); if (id !== undefined && cnt[id] >= CONF) hit = new V3(x, y, z); }
   const c = hit ? hit.addScaledVector(f, .06) : o.clone().addScaledVector(f, .5);
-  det.cur = { c, r: .24 }; det.zones.push(det.cur); det.on = true; zonesSync();
+  det.cur = { c, r: .24 }; det.zones.push(det.cur); det.on = true; det.auto = !!auto; det.away = 0; zonesSync();
   integWorker().postMessage({ resetFine: true });
-  toast(hit ? 'Detail scan: circle it slowly, 30–60 cm away, look inside too' : 'Nothing seen there yet: zone placed 50 cm ahead');
+  toast(auto ? 'Close-up detected: detail scan on (look away to finish)' : hit ? 'Detail scan: circle it slowly, 30–60 cm away, look inside too' : 'Nothing seen there yet: zone placed 50 cm ahead');
 }
 function endDetail() { det.on = false; det.cur = null; zonesSync(); toast('Detail kept: ' + fconf.toLocaleString() + ' fine points'); }
 function flushGeo() {
@@ -1341,7 +1346,7 @@ async function saveScan(frame) {
       rec.anchor = { uuid: anchorUUID, m: ap ? Array.from(ap.transform.matrix) : null };
     } catch (e) { rec.anchor = null; }
   }
-  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed;
+  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed; autoEnqueue(rec.id);
   toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
 }
 let pendingLoad = null;                                     // waits for the anchor to be found again
@@ -1448,8 +1453,8 @@ function plyBlob(rec) {
 }
 /* glTF binary: coloured point cloud, Quest room meshes (in world space), wall/stair/object boxes, understanding in extras */
 /* offline refinement of a saved scan from its raw depth frames: re-align every frame to the consensus surface and re-fuse */
-async function refineScan(rec) {
-  const st = $('st'); st.textContent = 'Loading depth frames…';
+async function refineScan(rec, say) {
+  const st = { set textContent(m) { (say || (t => $('st').textContent = t))(m); } }; st.textContent = 'Loading depth frames…';
   const fr = (await DB.depthFrames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
   if (fr.length < 20) { st.textContent = 'Not enough raw depth frames saved with this scan (' + fr.length + '). Scans made from now on keep them.'; return; }
   const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' }))), t0 = performance.now();
@@ -1963,6 +1968,8 @@ const BTN = () => page === 0 ? [
   { id: 'view', label: ['Show: dots', 'Show: solid points', 'Show: nothing', 'Show: live mesh'][showMode] },
   { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
   { id: 'drift', label: icpOn ? 'Drift fix ✓' : 'Drift fix', on: icpOn },
+  { id: 'autodet', label: auto.detail ? 'Auto detail ✓' : 'Auto detail', on: auto.detail },
+  { id: 'guide', label: auto.guide ? 'Guidance ✓' : 'Guidance', on: auto.guide },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
   { id: 'clear', label: 'Clear map' },
@@ -1991,7 +1998,7 @@ function diagSave() { try { localStorage.setItem('scanner.diag', JSON.stringify(
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
-  if (det.on && !replayMode) return { title: 'Detail scan', sub: (depth.tooFast ? 'Slow down · ' : '') + fconf.toLocaleString() + ' fine points · circle it 30–60 cm away', p: null };
+  if (det.on && !replayMode) return { title: det.auto ? 'Detail scan (auto)' : 'Detail scan', sub: (depth.tooFast ? 'Slow down · ' : '') + fconf.toLocaleString() + ' fine points · circle it 30–60 cm away', p: null };
   if (mapFull) return { title: 'Map full', sub: 'Finish & save, then start a new scan for the next area', p: 1 };
   if (!scanning) return { title: 'Paused', sub: 'Press Resume on your wrist', p: coverage() };
   if (!depth.binding && !depth.cpu) return { title: 'No depth sensor', sub: 'Using the Meta room layout only', p: null };
@@ -1999,10 +2006,84 @@ function scanPhase() {
     const k = depth.cal ? Math.min(1, (depth.cal.pairs || 0) / (metaSurf.n > 3000 ? 24 : 16)) : 0;
     return { title: 'Getting ready', sub: depth.tooFast ? 'Hold still a moment…' : 'Look around slowly at walls and floor', p: k, cal: true };
   }
-  const c = coverage(), hint = depth.tooFast ? 'Slow down a little' : c == null ? 'Look around slowly' : c < .98 ? 'Look at every surface from 0.5–3 m' : 'Walk to the next room';
+  const c = coverage(), hint = depth.tooFast ? 'Slow down a little' : guide.text ? guide.text : c == null ? 'Look around slowly' : c < .98 ? 'Look at every surface from 0.5–3 m' : 'Walk to the next room';
   return { title: 'Scanning', sub: (c != null ? Math.round(c * 100) + '% of this room · ' : '') + area().toFixed(1) + ' m² · ' + hint, p: c };
 }
 const area = () => confirmed * VS * VS;
+/* ================= autonomy: where to look next, close-ups by themselves, saving by itself ================= */
+const auto = { guide: true, detail: true, dwellP: null, dwellT: 0, lastSave: 0, bins: new Map(), metaArr: null, metaN: -1, tick: 0 };
+const guide = { dir: null, text: '', arrow: null };
+function gazeBins(o, f) {                                         // which directions you've looked from this spot (1.5 m cells): 12 yaw x 4 pitch
+  const k = Math.floor(o.x / 1.5) + ',' + Math.floor(o.z / 1.5); let b = auto.bins.get(k); if (!b) auto.bins.set(k, b = new Uint8Array(48));
+  const yaw = Math.atan2(f.x, -f.z), pitch = Math.asin(Math.max(-1, Math.min(1, f.y))), yi = ((Math.round(yaw / (Math.PI / 6)) % 12) + 12) % 12, pi = Math.max(0, Math.min(3, Math.floor((pitch + Math.PI / 3) / (Math.PI / 6))));
+  b[pi * 12 + yi] = 1; return b;
+}
+function updateGuide() {
+  guide.dir = null; guide.text = '';
+  if (!auto.guide || !scanning || replayMode || det.on || !depth.cal || !depth.cal.locked) return;
+  const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()), f = xc.getWorldDirection(new V3()), b = gazeBins(o, f);
+  let dir = null; const c = coverage();
+  if (c != null && c < .97) {                                     // the corrected room layout says what's still unseen: head for the nearest bulk of it
+    if (auto.metaN !== metaSurf.n) { auto.metaArr = [...metaSurf.set]; auto.metaN = metaSurf.n; }
+    const A = auto.metaArr, sum = new V3(), v = new V3(); let n = 0;
+    for (let i = 0; i < 3000 && A.length; i++) { const k = A[(Math.random() * A.length) | 0]; if (cov.done.has(k) || !metaSurf.set.has(k)) continue; const [x, y, z] = unkey(k);
+      v.set((x + .5) * MG, (y + .5) * MG, (z + .5) * MG).applyMatrix4(Dinv).sub(o); const d = v.length(); if (d < .4 || d > 5) continue; sum.addScaledVector(v.normalize(), 1 / (d + .5)); n++; }
+    if (n >= 25 && sum.length() > .01) dir = sum.normalize();
+  }
+  if (!dir) {                                                     // no layout to go by: point at the directions not yet looked at from here
+    let best = -1, bd = -2; for (let i = 0; i < 48; i++) { if (b[i]) continue; const yaw = (i % 12) * Math.PI / 6, pitch = (Math.floor(i / 12) + .5) * Math.PI / 6 - Math.PI / 3;
+      const d = new V3(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch)), s = d.dot(f); if (s > bd) { bd = s; best = i; dir = d; } }
+    if (best < 0) { guide.text = 'This spot is done: walk on'; return; }
+  }
+  guide.dir = dir;
+  const q = xc.getWorldQuaternion(new THREE.Quaternion()).invert(), loc = dir.clone().applyQuaternion(q), yaw = Math.atan2(loc.x, -loc.z) * 180 / Math.PI, pitch = Math.asin(Math.max(-1, Math.min(1, loc.y))) * 180 / Math.PI;
+  guide.text = Math.abs(yaw) > 120 ? 'Turn around' : yaw > 18 ? 'Look right →' : yaw < -18 ? '← Look left' : pitch > 14 ? 'Look up ↑' : pitch < -14 ? 'Look down ↓' : 'Keep going here';
+}
+function drawGuideArrow() {                                       // a small chevron a little ahead of you, pointing where to look next
+  if (!guide.arrow) { guide.arrow = new THREE.Mesh(new THREE.ConeGeometry(.025, .07, 12).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x7fe3f0, transparent: true, opacity: .85, depthTest: false })); guide.arrow.renderOrder = 61; scene.add(guide.arrow); }
+  const xc = renderer.xr.getCamera(), on = !!guide.dir && renderer.xr.isPresenting && !finishing;
+  if (!on) { guide.arrow.visible = false; return; }
+  const o = xc.getWorldPosition(new V3()), f = xc.getWorldDirection(new V3()), ang = f.angleTo(guide.dir);
+  guide.arrow.visible = ang > .26; if (!guide.arrow.visible) return;
+  guide.arrow.position.copy(o).addScaledVector(f, .6).addScaledVector(guide.dir, .12).y -= .05; guide.arrow.lookAt(guide.arrow.position.clone().add(guide.dir));
+}
+function autoTick(dt) {
+  auto.tick += dt; if (auto.tick < .2) return; const step = auto.tick; auto.tick = 0;
+  if (!renderer.xr.isPresenting || replayMode || !scanning || !workerPathReady()) return;
+  /* close-ups: hold your gaze on something small and near for ~1.5 s and a detail zone opens around it; look away and it closes */
+  if (auto.detail) {
+    const h = gazeHit(.95);
+    if (det.on && det.auto) { const away = !h || h.p.distanceTo(det.cur.c) > det.cur.r + .35; det.away = away ? det.away + step : 0; if (det.away > 2.5) endDetail(); }
+    else if (!det.on && h && h.d < .9 && !tl[h.id] && depth.steady !== false && !det.zones.some(z => z.c.distanceTo(h.p) < z.r)) {
+      if (auto.dwellP && auto.dwellP.distanceTo(h.p) < .08) auto.dwellT += step; else { auto.dwellP = h.p; auto.dwellT = 0; }
+      if (auto.dwellT > 1.6) { auto.dwellT = 0; auto.dwellP = null; startDetail(true); }
+    } else { auto.dwellT = 0; auto.dwellP = null; }
+  }
+  /* saving: every 3 minutes of new scanning, while you're steady */
+  if (confirmed > 2000 && confirmed !== savedConf && clockT - auto.lastSave > 180 && depth.steady !== false && !finishing) { auto.lastSave = clockT; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(() => {}); }
+}
+
+/* ================= after saving: refine, mesh and photo-texture by themselves, one scan at a time ================= */
+const autoQ = [], autoMsg = new Map(), autoPending = new Set(); let autoBusy = false;
+function autoEnqueue(id) { if (!id) return; if (xrSession) { autoPending.add(id); return; } if (!autoQ.includes(id)) autoQ.push(id); autoMsg.set(id, 'queued'); autoShow(id); autoRun(); }
+function autoShow(id) { const el = document.querySelector('[data-auto="' + id + '"]'); if (el) el.textContent = autoMsg.get(id) || ''; }
+async function autoRun() {
+  if (autoBusy || xrSession || !autoQ.length) return; autoBusy = true;
+  const id = autoQ.shift(), say = m => { autoMsg.set(id, m); autoShow(id); };
+  try {
+    let rec = await DB.get(id);
+    if (rec && !(rec.auto && rec.auto.v === 1)) {
+      const nd = await DB.countDepth(id).catch(() => 0), np = await DB.countFrames(id).catch(() => 0);
+      if (nd >= 20 && !rec.refined) { await refineScan(rec, m => say('Refining: ' + m.replace(/^Refining:? ?/, ''))); rec = await DB.get(id); }
+      say('Building surface…'); await recMesh(rec);
+      if (np && nd) { try { await recTexture(rec, m => say('Photo texture: ' + m + '…')); } catch (e) { say('No photo texture: ' + e.message); } }
+      rec.auto = { v: 1, at: Date.now() }; await DB.put(rec);
+    }
+    autoMsg.set(id, 'Ready ✓');
+  } catch (e) { autoMsg.set(id, 'Processing stopped: ' + e.message); try { const rec = await DB.get(id); if (rec) { rec.auto = { v: 1, error: e.message }; await DB.put(rec); } } catch (_) {} }
+  autoBusy = false; autoShow(id); if (!xrSession && !autoQ.length) listScans(); setTimeout(autoRun, 300);
+}
+
 
 /* floating status bar, locked a little below your line of sight */
 const hud = (() => {
@@ -2074,6 +2155,8 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'autodet') { auto.detail = !auto.detail; }
+  if (id === 'guide') { auto.guide = !auto.guide; updateGuide(); }
   if (id === 'drift') { icpOn = !icpOn; toast(icpOn ? 'Drift correction on' : 'Drift correction off'); }
   if (id === 'surf') { surfOn = !surfOn; applySurf(); }
   if (id === 'detail') { if (det.on) endDetail(); else if (!workerPathReady()) toast('Wait until scanning has started'); else startDetail(); }
@@ -2155,7 +2238,7 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
+    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); setTimeout(() => { for (const id of autoPending) autoEnqueue(id); autoPending.clear(); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan(null).catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
@@ -2175,6 +2258,8 @@ async function listScans() {
     const row = document.createElement('div'); row.className = 'scan';
     const n = document.createElement('div'); n.className = 'n'; n.textContent = r.name; const sm = document.createElement('small');
     sm.textContent = new Date(r.date).toLocaleString() + ' · ' + (r.points.length / 3).toLocaleString() + ' pts · ' + r.planes.length + ' planes' + (r.anchor && r.anchor.m ? ' · anchored' : ''); n.appendChild(sm); row.appendChild(n);
+    const as = document.createElement('small'); as.dataset.auto = r.id; as.style.display = 'block'; as.style.color = '#7fe3f0'; as.textContent = r.auto ? (r.auto.error ? 'Processing stopped: ' + r.auto.error : 'Ready: ' + (r.refined ? 'refined, ' : '') + 'meshed' + (r.tex ? ' and photo-textured' : '') + ' ✓') : autoMsg.get(r.id) || ''; row.appendChild(as);
+    if (!r.auto && !autoBusy && !autoQ.includes(r.id) && !xrSession) setTimeout(() => autoEnqueue(r.id), 1500);
     const mk = (label, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); row.appendChild(b); };
     mk('Walk through', () => { pendingOpen = r; replayMode = true; if (!$('bAR').disabled) $('bAR').click(); else { replayMode = false; $('st').textContent = 'Walking through needs the Quest browser. Use View here.'; } });
     mk('Photos .zip', () => exportPhotos(r));
@@ -2267,6 +2352,7 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
+    autoTick(dt); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
