@@ -373,7 +373,7 @@ function tileFlush() {
 const LABEL_COL = { wall: 0x8fb6c9, floor: 0xb8956a, ceiling: 0xcfcfcf, table: 0xd9a54a, couch: 0xa070c0, door: 0x60c080, window: 0x70a8ff, bed: 0xc07070, storage: 0xb0b060, screen: 0x50d0d0, other: 0x9a9a9a };
 const layout = new THREE.Group(); layout.visible = false;   // Meta's layout is never drawn: it's reference data for calibration and checking
 const planes = new Map(), meshes = new Map();
-let showMode = 3;                                          // 0 dots, 1 solid points, 2 hidden, 3 live mesh
+let showMode = 4;                                          // 0 dots, 1 solid points, 2 hidden, 3 live mesh, 4 live mesh painted with your photos
 function planeLine(e) {}
 function meshWire(e) {}
 function clearMeta() { metaSurf.base = new Set(); metaSurf.set = new Set(); metaSurf.n = 0; cov.done.clear(); lay.removed.clear(); lay.added.clear(); planes.clear(); meshes.clear(); metaToWorker(); }
@@ -578,7 +578,7 @@ function captureKeyframe(tCap, want) {
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
   const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(head).elements), m: Array.from(Dm.clone().multiply(head).multiply(colorCam.E || new M4()).elements), k1: colorCam.k1 || 0, camLatMs: tCap != null ? Math.round(performance.now() - tCap) : null, w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(head.elements) };
-  kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
+  kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); const m = new M4().fromArray(rec.m); kfMem.push({ f: rec, m, p: new V3().setFromMatrixPosition(m), d: new V3(-m.elements[8], -m.elements[9], -m.elements[10]).normalize() }); if (kfMem.length > 1500) kfMem.shift(); } kf.busy = false; }, 'image/jpeg', .88);
 }
 function camPump() {                                            // keep one fresh, downscaled camera bitmap ready (decoded asynchronously)
   const c = colorCam; if (!c.on || c.noBmp || c.pending || !c.video || c.video.readyState < 2 || performance.now() - (c.bt || 0) < 90 || typeof createImageBitmap === 'undefined') return;
@@ -1223,7 +1223,7 @@ function liveMeshes(list) {
     if (!m.I.length) continue;
     const g = new THREE.BufferGeometry(), CL = new Float32Array(m.C.length); for (let k = 0; k < CL.length; k++) { const c = m.C[k]; CL[k] = c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }
     g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(m.N, 3)); g.setAttribute('color', new THREE.BufferAttribute(CL, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1));
-    const o = new THREE.Mesh(g, liveMat); o.frustumCulled = false; tsdfG.add(o); liveM.set(m.rk, o);
+    const o = new THREE.Mesh(g, ibr.live && liveIbrMat ? liveIbrMat : liveMat); o.frustumCulled = false; o.layers.enable(3); tsdfG.add(o); liveM.set(m.rk, o);
   }
   applySurf();
 }
@@ -1338,14 +1338,15 @@ const coverage = () => metaSurf.n > 3000 && !depth.metaStale ? Math.min(1, cov.d
 const DB = (() => {
   let db = null;
   const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => {
-    const r = indexedDB.open('house-scanner', 3);
-    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); };
+    const r = indexedDB.open('house-scanner', 4);
+    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('live')) d.createObjectStore('live', { keyPath: 'id' }); };
     r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error);
   });
   const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
   return {
     put: o => tx('scans', 'readwrite', s => s.put(o)), all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => tx('scans', 'readwrite', s => s.delete(id)),
     putFrame: o => tx('frames', 'readwrite', s => s.put(o)), frames: id => tx('frames', 'readonly', s => s.index('scan').getAll(id)), countFrames: id => tx('frames', 'readonly', s => s.index('scan').count(id)),
+    putLive: o => tx('live', 'readwrite', s => s.put(o)), allLive: () => tx('live', 'readonly', s => s.getAll()), delLive: id => tx('live', 'readwrite', s => s.delete(id)),
     putDepth: o => tx('depth', 'readwrite', s => s.put(o)), depthFrames: id => tx('depth', 'readonly', s => s.index('scan').getAll(id)), countDepth: id => tx('depth', 'readonly', s => s.index('scan').count(id)),
     delDepth: id => tx('depth', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; }),
     delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
@@ -1394,7 +1395,7 @@ async function saveScan(frame) {
       rec.anchor = { uuid: anchorUUID, m: ap ? Array.from(ap.transform.matrix) : null };
     } catch (e) { rec.anchor = null; }
   }
-  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed; autoEnqueue(rec.id);
+  await DB.put(rec); currentId = rec.id; lastSave = Date.now(); savedConf = confirmed; DB.delLive(rec.id).catch(() => {}); autoEnqueue(rec.id);
   if (navigator.storage && navigator.storage.persist && !saveScan.persisted) { saveScan.persisted = true; navigator.storage.persist().then(ok => diagLog('storage', ok ? 'persistent' : 'may be evicted')).catch(() => {}); }   // stop the browser deleting scans when space runs low
   toast('Saved · ' + s.points.length.toLocaleString() + ' points' + (rec.anchor && rec.anchor.m ? ' · anchored' : ''));
 }
@@ -1553,7 +1554,8 @@ function plyBlob(rec) {
 /* offline refinement of a saved scan from its raw depth frames: re-align every frame to the consensus surface and re-fuse */
 async function refineScan(rec, say) {
   const st = { set textContent(m) { (say || (t => $('st').textContent = t))(m); } }; st.textContent = 'Loading depth frames…';
-  const fr = (await DB.depthFrames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
+  let fr = (await DB.depthFrames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
+  if (fr.length > 1200) { const k = fr.length / 1200; fr = Array.from({ length: 1200 }, (_, i) => fr[Math.floor(i * k)]); }   // a long scan: an even 1200 frames re-align the whole thing in reasonable time
   if (fr.length < 20) { st.textContent = 'Not enough raw depth frames saved with this scan (' + fr.length + '). Scans made from now on keep them.'; return; }
   const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' }))), t0 = performance.now();
   const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.refineMsg) st.textContent = 'Refining: ' + e.data.refineMsg + '…'; if (e.data.refined) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'refine failed'));
@@ -1711,7 +1713,8 @@ function showMesh(parts, T) {
 }
 function meshClear() { ibrStop(); for (const o of meshG.children) { o.geometry.dispose(); if (o.userData.tex) { o.material.map.dispose(); o.material.dispose(); } } meshG.clear(); }
 function applySurf() {                                          // saved surface mesh, else the live mesh (in mesh mode), else the point map
-  const m = surfOn && meshG.children.length > 0, live = !m && showMode === 3 && liveM.size > 0;
+  const m = surfOn && meshG.children.length > 0, live = !m && (showMode === 3 || showMode === 4) && liveM.size > 0;
+  if (!m && !viewer.on && !replayMode) { if (showMode === 4 && kfMem.length) ibrStartLive(); else if (ibr.live) ibrStop(); }
   meshG.visible = m && reality !== 2; meshMat.opacity = reality === 1 ? .55 : 1; meshMat.depthWrite = reality !== 1;
   for (const o of meshG.children) if (o.userData.tex) { o.material.opacity = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
   tsdfG.visible = live && reality !== 2;
@@ -1808,12 +1811,13 @@ async function recTexture(rec, say = () => {}) {
   const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface to texture');
   const photos = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob), depths = await DB.depthFrames(rec.id).catch(() => []);
   if (!photos.length) throw new Error('no photos saved with this scan (turn on Real colours while scanning)');
-  say('rendering what each photo saw'); const dms = await photoDepths(rec, photos, m => say('occlusion ' + m), true, .25).catch(() => null);
+  say('rendering what each photo saw'); const dms = await photoDepths(rec, photos, m => say('occlusion ' + m), true, .125).catch(() => null);
   if (!dms && !depths.length) throw new Error('no way to check occlusion for this scan');
-  const Q = m.I.length / 6, A = Q < 110000 ? 2048 : Q < 450000 ? 4096 : 8192, Ts = Q < 110000 ? 4 : 4;
+  const Q = m.I.length / 6, opt = [[2048, 4], [4096, 4], [4096, 3], [4096, 2], [8192, 3], [8192, 2]].find(([a, t]) => Math.floor(a / (t + 2)) ** 2 >= Q);   // texel size adapts so a whole house fits
+  if (!opt) throw new Error('mesh too large for one photo texture (' + Q + ' patches)'); const [A, Ts] = opt;
   const w = new Worker(URL.createObjectURL(new Blob([BAKE_SRC], { type: 'text/javascript' })));
   const tex = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.msg) say(e.data.msg); if (e.data.error) no(new Error(e.data.error)); if (e.data.done) ok(e.data.tex); }; w.onerror = e => no(new Error(e.message || 'texture bake failed'));
-    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map((f, i) => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, k1: f.k1 || 0, sharp: f.sharp, t: f.t, dm: dms ? dms[i] : null })), depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }); });
+    w.postMessage({ m: { P: m.P, N: m.N, C: m.C, I: m.I }, photos: photos.map((f, i) => ({ blob: f.blob, m: f.m, hfov: f.hfov, cx: f.cx, cy: f.cy, k1: f.k1 || 0, sharp: f.sharp, t: f.t, dm: dms ? dms[i] : null })), depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })), A, Ts }, dms ? dms.map(d => d.mm.buffer) : []); });
   w.terminate(); rec.tex = tex; if (!String(rec.id).startsWith('file-')) await putIfSame(rec).catch(() => {});
   return tex;
 }
@@ -1958,9 +1962,10 @@ onmessage = async e => {
 };`;
 async function alignPhotos(rec, say = () => {}) {
   const parts = await recMesh(rec), m = parts.find(x => !x.fine); if (!m || !m.I.length) throw new Error('no surface');
-  const frames = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m), depths = await DB.depthFrames(rec.id).catch(() => []);
-  if (frames.length < 5) throw new Error('need at least 5 photos');
-  say('rendering what each photo saw'); const dms = await photoDepths(rec, frames, m => say('occlusion ' + m), true, .25).catch(() => null);
+  const all = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m).sort((a, b) => a.t - b.t), depths = await DB.depthFrames(rec.id).catch(() => []);
+  if (all.length < 5) throw new Error('need at least 5 photos');
+  const stride = Math.max(1, Math.ceil(all.length / 220)), frames = all.filter((_, i) => i % stride === 0);   // the solve uses an even subset; the result applies to all
+  say('rendering what each photo saw'); const dms = await photoDepths(rec, frames, m => say('occlusion ' + m), true, .2).catch(() => null);
   let E0 = null; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.E) E0 = c.E; } catch (e) {}
   if (!E0) E0 = new M4().elements.slice();
   const w = new Worker(URL.createObjectURL(new Blob([PALIGN_SRC], { type: 'text/javascript' })));
@@ -1968,14 +1973,20 @@ async function alignPhotos(rec, say = () => {}) {
     let K10 = 0; try { const c = JSON.parse(localStorage.getItem('scanner.camCal') || 'null'); if (c && c.k1) K10 = c.k1; } catch (e) {}
     w.postMessage({ P: m.P, N: m.N, E0, K10, W: 400,
       photos: frames.map((f, i) => ({ dm: dms ? dms[i] : null, blob: f.blob, m0: f.m0 || (f.E ? new M4().fromArray(f.m).multiply(new M4().fromArray(f.E).invert()).elements.slice() : f.m), hfov: f.hfov0 || f.hfov, cx: f.cx0 != null ? f.cx0 : f.cx, cy: f.cy0 != null ? f.cy0 : f.cy, t: f.t })),
-      depths: depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }); });
+      depths: dms ? [] : depths.map(d => ({ mm: d.mm, DW: d.DW, DH: d.DH, PRJ: d.PRJ, NDI: d.NDI, flip: d.flip, R0: d.R0, jx: d.jx, jy: d.jy, X: d.X, t: d.t })) }, dms ? dms.map(d => d.mm.buffer) : []); });
   w.terminate();
   if (!(res.edge1 < res.edge0 - .05 || res.rms1 < res.rms0)) throw new Error('photo matching did not improve (edges ' + (res.edge0 || 0).toFixed(2) + ' px, colour ' + res.rms0.toFixed(3) + ')');
   { const Em = new M4().fromArray(res.E), off = new V3().setFromMatrixPosition(Em).length(), rot = new THREE.Quaternion().setFromRotationMatrix(Em).angleTo(new THREE.Quaternion()) * 180 / Math.PI;
     if (off > .1 || rot > 6 || Math.abs(res.s) > .18) throw new Error('implausible camera calibration rejected (' + (off * 100).toFixed(0) + ' cm, ' + rot.toFixed(1) + '°)'); }
+  const solved = new Map();
   for (const p of res.photos) { const f = frames[p.k];
     if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
-    f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.k1 = p.k1; f.gain = p.gain; f.aligned = true; await DB.putFrame(f); }
+    f.m = p.m; f.hfov = p.hfov; f.cx = p.cx; f.cy = p.cy; f.k1 = p.k1; f.gain = p.gain; f.aligned = true; solved.set(f.k, f); await DB.putFrame(f); }
+  const sv = [...solved.values()], Em = new M4().fromArray(res.E);
+  for (const f of all) { if (solved.has(f.k)) continue;                // the rest: same camera offset and lens, gain from the nearest solved photo in time
+    if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
+    f.m = Array.from(new M4().fromArray(f.m0).multiply(Em).elements); f.hfov = 2 * Math.atan(Math.tan(f.hfov0 / 2) / (1 + res.s)); f.cx = f.cx0 + res.cx; f.cy = f.cy0 + res.cy; f.k1 = res.k1 || 0;
+    let nb = sv[0], bd = 1e18; for (const g of sv) { const dt = Math.abs(g.t - f.t); if (dt < bd) { bd = dt; nb = g; } } f.gain = nb ? nb.gain : 1; f.aligned = true; await DB.putFrame(f); }
   /* the camera calibration carries over: future scans colour and photograph with it */
   try { localStorage.setItem('scanner.camCal', JSON.stringify({ E: res.E, s: res.s, cx: res.cx, cy: res.cy, k1: res.k1, at: Date.now() })); } catch (e) {}
   colorCam.E = new M4().fromArray(res.E); const fp = res.photos[res.photos.length - 1]; colorCam.f = 1 / Math.tan(fp.hfov / 2); colorCam.cx = fp.cx; colorCam.cy = fp.cy; colorCam.k1 = res.k1 || 0; colorCam.aligned = true;
@@ -1987,7 +1998,8 @@ async function alignPhotos(rec, say = () => {}) {
 /* ================= live photo view: walk through your house the way the camera saw it =================
    The 4 photos taken nearest your eye (position and direction) are projected onto the surface in real time and blended
    by how closely each photo's viewing ray matches yours; each photo's own depth map hides what it couldn't see. */
-const IBR_K = 6, ibr = { on: false, rec: null, frames: [], T: new M4(), Ti: new M4(), slots: [], t: 0, loading: false, gains: new Map() };
+const kfMem = [];                                               // this session's photos, for the live photo mesh
+const IBR_K = 6, ibr = { on: false, live: false, rec: null, frames: [], T: new M4(), Ti: new M4(), slots: [], t: 0, loading: false, gains: new Map() };
 const ibrDist = new THREE.ShaderMaterial({ side: THREE.DoubleSide, vertexShader: 'varying float vz; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vz = -mv.z; gl_Position = projectionMatrix * mv; }',
   fragmentShader: 'varying float vz; void main(){ gl_FragColor = vec4(vz, 0.0, 0.0, 1.0); }' });
 const ibrCam = new THREE.PerspectiveCamera(); ibrCam.matrixAutoUpdate = false; ibrCam.matrixWorldAutoUpdate = false; ibrCam.layers.set(3);
@@ -2025,6 +2037,12 @@ function ibrMaterial(useMap, map) {
         #include <colorspace_fragment>
       }` });
 }
+let liveIbrMat = null;
+function ibrStartLive() {                                           // photo-paint the live mesh (map frame -> world through D⁻¹)
+  if (ibr.live || !kfMem.length) return; ibrStop(); ibr.live = true; ibr.on = true; ibr.rec = null; ibr.frames = kfMem; ibr.gains = new Map();
+  if (!liveIbrMat) liveIbrMat = ibrMaterial(false); for (const o of liveM.values()) { o.material = liveIbrMat; o.layers.enable(3); }
+  for (const sl of ibr.slots) { sl.idx = -1; sl.on = 0; } ibr.t = 0;
+}
 async function ibrStart(rec, T) {                                    // turn the live photo view on for a shown saved scan
   ibr.on = false; ibr.rec = rec; ibr.T.copy(T); ibr.Ti.copy(T).invert(); for (const s of ibr.slots) { s.idx = -1; s.on = 0; }
   const fr = (await DB.frames(rec.id).catch(() => [])).filter(f => f.blob && f.m);
@@ -2034,7 +2052,7 @@ async function ibrStart(rec, T) {                                    // turn the
   for (const o of meshG.children) { o.layers.enable(3); if (!o.userData.ibr) { o.userData.base = o.material; o.material = ibrMaterial(!!o.userData.tex, o.userData.tex ? o.material.map : null); o.userData.ibr = true; } }
   ibr.on = true; ibr.t = 0; applySurf();
 }
-function ibrStop() { ibr.on = false; ibr.rec = null; ibr.frames = []; for (const s of ibr.slots) { s.idx = -1; s.on = 0; if (s.bmp) { s.bmp.close(); s.bmp = null; } } }
+function ibrStop() { if (ibr.live) for (const o of liveM.values()) { o.material = liveMat; } ibr.live = false; ibr.on = false; ibr.rec = null; ibr.frames = []; for (const s of ibr.slots) { s.idx = -1; s.on = 0; if (s.bmp) { s.bmp.close(); s.bmp = null; } } }
 async function ibrLoad(slot, k) {                                    // decode one photo into a slot and render that photo's depth view of the surface
   const F = ibr.frames[k], f = F.f; ibr.loading = true;
   try {
@@ -2043,25 +2061,36 @@ async function ibrLoad(slot, k) {                                    // decode o
     if (slot.bmp) slot.bmp.close(); slot.bmp = bmp; slot.tex.image = bmp; slot.tex.needsUpdate = true;
     const Mw = ibr.T.clone().multiply(F.m), fx = 1 / Math.tan(f.hfov / 2), asp = w / h;
     slot.view.copy(Mw).invert(); slot.intr.set(fx, asp, f.cx || 0, f.cy || 0); slot.pos.setFromMatrixPosition(Mw); slot.gain = f.gain || ibr.gains.get(f.t) || 1; slot.k1 = f.k1 || 0; slot.idx = k;
-    /* the photo's own depth view (for occlusion), same projection as the photo */
+    ibrShadow(slot, F, fx, asp);
+    slot.on = 1; slot.fade = 0;
+  } catch (e) { diagLog('ibr', e.message); }
+  ibr.loading = false;
+}
+function ibrShadow(slot, F, fx0, asp0) {                             // the photo's own depth view (for occlusion), same projection as the photo
+  if (!F) return; const f = F.f, fx = fx0 || slot.intr.x, asp = asp0 || slot.intr.y, Mw = ibr.T.clone().multiply(F.m);
+  {
     const P = ibrCam.projectionMatrix, n = .05, fa = 30; P.set(fx, 0, -2 * (f.cx || 0), 0, 0, fx * asp, 2 * (f.cy || 0), 0, 0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n), 0, 0, -1, 0); ibrCam.projectionMatrixInverse.copy(P).invert();
     ibrCam.matrixWorld.copy(Mw); ibrCam.matrixWorldInverse.copy(slot.view);
     const prevT = renderer.getRenderTarget(), xrEn = renderer.xr.enabled, cc = new THREE.Color(), ca = renderer.getClearAlpha(); renderer.getClearColor(cc);
     renderer.xr.enabled = false; scene.overrideMaterial = ibrDist; renderer.setRenderTarget(slot.rt); renderer.setClearColor(new THREE.Color(1000, 0, 0), 1); renderer.clear();
     renderer.render(scene, ibrCam);
     scene.overrideMaterial = null; renderer.setRenderTarget(prevT); renderer.xr.enabled = xrEn; renderer.setClearColor(cc, ca);
-    slot.on = 1; slot.fade = 0;
-  } catch (e) { diagLog('ibr', e.message); }
-  ibr.loading = false;
+  }
 }
 function ibrUpdate(eyeCam) {                                         // pick the photos for where you are now (a few times a second), feed the shaders
   if (!ibr.on) return;
+  if (ibr.live) {                                                    // live: the map frame drifts a little (drift fix), so re-place photos every frame
+    ibr.T.copy(mapRoot.matrix); ibr.Ti.copy(ibr.T).invert();
+    for (const sl of ibr.slots) if (sl.idx >= 0 && ibr.frames[sl.idx]) { const Mw = ibr.T.clone().multiply(ibr.frames[sl.idx].m); sl.view.copy(Mw).invert(); sl.pos.setFromMatrixPosition(Mw); }
+    if (clockT - (ibr.shT || 0) > .7 && !ibr.loading) { ibr.shT = clockT; const sl = ibr.slots[(ibr.shI = ((ibr.shI || 0) + 1) % IBR_K)]; if (sl.on) ibrShadow(sl, ibr.frames[sl.idx]); }   // the mesh keeps growing: refresh one occlusion map at a time
+  }
   /* frame-rate guard: blend fewer photos if the headset is struggling, more when there's headroom */
   if (renderer.xr.isPresenting) { ibr.slow = fps < 62 ? (ibr.slow || 0) + 1 : 0; ibr.fast = fps > 70 ? (ibr.fast || 0) + 1 : 0;
     if (ibr.slow > 90 && (ibr.k || IBR_K) > 3) { ibr.k = (ibr.k || IBR_K) - 1; ibr.slow = 0; } if (ibr.fast > 300 && (ibr.k || IBR_K) < IBR_K) { ibr.k = (ibr.k || IBR_K) + 1; ibr.fast = 0; } }
   const kAct = ibr.k || IBR_K;
   for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k]; sl.fade = Math.min(1, (sl.fade || 0) + 1 / 20); }       // ~1/3 s fade-in for a newly loaded photo
-  for (const o of meshG.children) if (o.userData.ibr) { const U = o.material.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = meshMat.opacity; o.material.depthWrite = meshMat.depthWrite; }
+  const mats = ibr.live ? (liveIbrMat ? [liveIbrMat] : []) : meshG.children.filter(o => o.userData.ibr).map(o => o.material);
+  for (const mt of mats) { const U = mt.uniforms; for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k], live = sl.on && (sl.rank == null || sl.rank < kAct); U.phOn.value[k] = live ? 1 : 0; U.phG.value[k] = sl.gain; U.phF.value[k] = sl.fade || 0; U.phK.value[k] = sl.k1 || 0; } U.opacity.value = ibr.live ? .9 : meshMat.opacity; mt.depthWrite = ibr.live ? true : meshMat.depthWrite; }
   if (ibr.loading || clockT - ibr.t < .2) return; ibr.t = clockT;
   const eye = eyeCam.getWorldPosition(new V3()).applyMatrix4(ibr.Ti), dir = eyeCam.getWorldDirection(new V3()).transformDirection(ibr.Ti);
   const sc = ibr.frames.map((F, k) => [F.p.distanceTo(eye) + .6 * Math.acos(Math.max(-1, Math.min(1, F.d.dot(dir)))), k]).sort((a, b) => a[0] - b[0]).slice(0, IBR_K);
@@ -2419,7 +2448,7 @@ const BTN = () => page === 0 ? [
   { id: 'more', label: 'More  ›', big: true }
 ] : [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
-  { id: 'view', label: ['Show: dots', 'Show: solid points', 'Show: nothing', 'Show: live mesh'][showMode] },
+  { id: 'view', label: ['Show: dots', 'Show: solid points', 'Show: nothing', 'Show: live mesh', 'Show: photo mesh'][showMode] },
   { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
   { id: 'drift', label: icpOn ? 'Drift fix ✓' : 'Drift fix', on: icpOn },
   { id: 'autodet', label: auto.detail ? 'Auto detail ✓' : 'Auto detail', on: auto.detail },
@@ -2445,7 +2474,7 @@ function diagSnapshot() {
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, clock: colorCam.clock || null, latencyMs: colorCam.lat != null ? Math.round(colorCam.lat) : null, k1: colorCam.k1 || 0, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
-    storage: diag.storage || null, map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
+    storage: diag.storage || null, quickSaves: diag.quickSaves || 0, map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
 }
 async function storageInfo() { try { const e = await navigator.storage.estimate(), p = navigator.storage.persisted ? await navigator.storage.persisted() : null; diag.storage = { usedMB: Math.round(e.usage / 1e6), quotaMB: Math.round(e.quota / 1e6), persisted: p }; } catch (err) {} }
@@ -2522,8 +2551,14 @@ function autoTick(dt) {
       if (auto.dwellT > 1.6) { auto.dwellT = 0; auto.dwellP = null; startDetail(true); }
     } else { auto.dwellT = 0; auto.dwellP = null; }
   }
-  /* saving: every 3 minutes of new scanning, while you're steady */
-  if (confirmed > 2000 && confirmed !== savedConf && clockT - auto.lastSave > 180 && depth.steady !== false && !finishing) { auto.lastSave = clockT; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(e => { toast('Auto-save failed: ' + (e && e.name === 'QuotaExceededError' ? 'headset storage is full' : e.message)); diagLog('save', e && e.message); }); }
+  /* save as you go: the fused surface every ~45 s (packed in the worker, no frame hitch); a crash loses seconds, not the scan */
+  const wallS = performance.now() / 1000; if (!auto.quick) auto.quick = wallS;
+  if (currentId && depth.tsdfRegions > 20 && wallS - auto.quick > 45 && !finishing && !auto.quickBusy) { auto.quick = wallS; auto.quickBusy = true;
+    const id = currentId, name = cont ? cont.rec.name : 'House scan';
+    tsdfDump().then(t => t && t.keys.length ? DB.putLive({ id, name, tsdf: t, D: Array.from(Dm.elements), floorY: pmat.uniforms.floorY.value, zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), at: Date.now(), photos: kf.n }) : null)
+      .then(() => { diag.quickSaves = (diag.quickSaves || 0) + 1; }).catch(e => diagLog('quicksave', e.message)).finally(() => auto.quickBusy = false); }
+  /* full save: every 3 minutes of new scanning, while you're steady */
+  if (confirmed > 2000 && confirmed !== savedConf && wallS - (auto.lastSaveW || (auto.lastSaveW = wallS)) > 180 && depth.steady !== false && !finishing) { auto.lastSaveW = wallS; saveScan(lastFrame).then(() => toast('Auto-saved')).catch(e => { toast('Auto-save failed: ' + (e && e.name === 'QuotaExceededError' ? 'headset storage is full' : e.message)); diagLog('save', e && e.message); }); }
 }
 
 
@@ -2555,6 +2590,9 @@ async function calibrateCameraLive() {                               // photo-ma
     const t = await tsdfDump(); if (!t || !t.keys.length) throw new Error('no surface yet');
     const m = await tsdfMeshOf(t, det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), pmat.uniforms.floorY.value); if (!m.I.length) throw new Error('no surface yet');
     const a = await alignPhotos({ id: currentId, live: true, meshCache: { v: 2, parts: [m] } }, msg => sweep.msg = msg);
+    const fresh = new Map((await DB.frames(currentId).catch(() => [])).map(f => [f.k, f]));   // the live photo mesh uses the corrected photos too
+    for (const e of kfMem) { const f = fresh.get(e.f.k); if (!f) continue; e.f = f; e.m = new M4().fromArray(f.m); e.p.setFromMatrixPosition(e.m); e.d.set(-e.m.elements[8], -e.m.elements[9], -e.m.elements[10]).normalize(); }
+    for (const sl of ibr.slots) { sl.idx = -1; sl.on = 0; }
     toast('Camera calibrated: colours and photos locked in (' + Math.round(new V3().setFromMatrixPosition(new M4().fromArray(a.E)).length() * 100) + ' cm offset)');
   } catch (e) { toast('Camera calibration later: ' + e.message); diagLog('livecal', e.message); }
   sweep.calibrating = false;
@@ -2668,7 +2706,7 @@ async function press(id, frame) {
   if (id === 'analyze') { runUnderstanding(); toast('Analysing in the background…'); }
   if (id === 'meta') { useMeta = !useMeta; if (!useMeta) clearMeta(); toast(useMeta ? 'Using the Quest\'s room layout' : 'Ignoring the Quest\'s room layout'); }
   if (id === 'room') { useMeta = true; if (xrSession && xrSession.initiateRoomCapture) { try { await xrSession.initiateRoomCapture(); } catch (e) { toast('Room setup: ' + e.message); } } else toast('Room setup not available in this browser'); }
-  if (id === 'view') { showMode = (showMode + 1) % 4; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
+  if (id === 'view') { showMode = (showMode + 1) % 5; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.needsUpdate = true; tmat.depthWrite = showMode === 1; tmat.needsUpdate = true; applySurf(); }
   if (id === 'recal') { colorCam.aligned = false; try { localStorage.removeItem('scanner.camAlign'); } catch (e) {} if (integ) integ.postMessage({ resetAlign: true }); depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; try { localStorage.removeItem('scanner.depthCfg'); } catch (e) {} resetLiveMap(); toast('Recalibrating: look around slowly'); }
   if (id === 'save') await saveScan(frame);
   if (id === 'finish') {
@@ -2677,7 +2715,7 @@ async function press(id, frame) {
     try { await saveScan(frame); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
     setTimeout(() => { finishing = false; xrSession && xrSession.end(); }, 2500);
   }
-  if (id === 'clear') { clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; kfMem.length = 0; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -2731,7 +2769,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
+    clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; kfMem.length = 0; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT; auto.lastSaveW = 0; auto.quick = 0;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
@@ -2751,9 +2789,23 @@ let savedConf = -1, pendingOpen = null, askedRoom = true, useMeta = true, scanEr
 
 /* ================= 2D: saved scans, viewing them on a flat screen ================= */
 const viewer = { on: false, group: null, yaw: .6, pitch: .5, dist: 8, target: new V3(), drag: null };
+async function recoverLive(L, existing) {                         // turn a save-as-you-go entry into a proper scan (surface -> points, normals, colours)
+  $('st').textContent = 'Recovering…'; const m = await tsdfMeshOf(L.tsdf, L.zones || [], L.floorY || 0);
+  const n = m.P.length / 3, Nr = new Int8Array(n * 3), Cl = new Uint8Array(n * 4), Cn = new Uint16Array(n).fill(CONF + 2);
+  for (let i = 0; i < n; i++) { for (let a = 0; a < 3; a++) { Nr[i * 3 + a] = Math.round(m.N[i * 3 + a] * 127); Cl[i * 4 + a] = Math.round(Math.min(1, m.C[i * 3 + a]) * 255); } Cl[i * 4 + 3] = 255; }
+  const rec = existing ? Object.assign(existing, { tsdf: L.tsdf, D: L.D, date: L.at }) : { id: L.id, name: (L.name || 'House scan') + ' (recovered)', date: L.at, voxelSize: VS, points: m.P, counts: Cn, masks: null, colors: Cl, normals: Nr, understanding: null, planes: [], meshes: [], floorY: L.floorY || 0, tsdf: L.tsdf, D: L.D, zones: L.zones || [] };
+  delete rec.meshCache; delete rec.tex; delete rec.auto; delete rec.refined; delete rec.photoAlign;
+  await DB.put(rec); await DB.delLive(L.id); $('st').textContent = 'Recovered "' + rec.name + '"'; listScans();
+}
 async function listScans() {
   const el = $('scans'); el.innerHTML = '';
   let all = []; try { all = (await DB.all()).sort((a, b) => b.date - a.date); } catch (e) {}
+  let lives = []; try { lives = (await DB.allLive()).filter(L => !xrSession || L.id !== currentId); } catch (e) {}
+  for (const L of lives) { const ex = all.find(r => r.id === L.id); if (ex && ex.date >= L.at) { DB.delLive(L.id).catch(() => {}); continue; }
+    const row = document.createElement('div'); row.className = 'scan'; const n = document.createElement('div'); n.className = 'n'; n.textContent = (ex ? ex.name + ': newer unsaved scanning' : (L.name || 'Scan') + ': unsaved (the session ended early)');
+    const sm = document.createElement('small'); sm.textContent = new Date(L.at).toLocaleString() + ' · ' + L.tsdf.keys.length + ' surface blocks · ' + (L.photos || 0) + ' photos'; n.appendChild(sm); row.appendChild(n);
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Recover'; b.addEventListener('click', () => recoverLive(L, ex).catch(e => $('st').textContent = 'Recover failed: ' + e.message)); row.appendChild(b);
+    const d2 = document.createElement('button'); d2.type = 'button'; d2.textContent = 'Discard'; d2.addEventListener('click', async () => { await DB.delLive(L.id); listScans(); }); row.appendChild(d2); el.appendChild(row); }
   if (!all.length) return;
   const h = document.createElement('div'); h.className = 'sub'; h.style.margin = '6px 0 0'; h.textContent = 'Saved on this device'; el.appendChild(h);
   for (const r of all) {
@@ -2794,7 +2846,7 @@ function openViewer(rec) {
   recMesh(rec).then(async parts => { if (!viewer.on || viewer.id !== rec.id) return; if (rec.tex) await showTexMesh(rec.tex, new M4(), parts.filter(p => p.fine)); else showMesh(parts, new M4()); ibrStart(rec, new M4()); const t = parts.reduce((a, m) => a + m.I.length / 3, 0); $('vInfo').textContent = info + (t ? ' · ' + t.toLocaleString() + ' triangles' : ' · no surface (older scan without normals)'); })
     .catch(e => { $('vInfo').textContent = info + ' · surface failed: ' + e.message; });
 }
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 3; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }
 $('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
   download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
@@ -2856,7 +2908,8 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); sweepTick(); relocTick(); if (replayMode) ibrUpdate(renderer.xr.getCamera()); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
+    autoTick(dt); sweepTick(); relocTick(); if (replayMode || ibr.live) ibrUpdate(renderer.xr.getCamera());
+    if (showMode === 4 && !ibr.live && kfMem.length && !replayMode && Math.floor(clockT) !== Math.floor(clockT - dt)) applySurf(); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
