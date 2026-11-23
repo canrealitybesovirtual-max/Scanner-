@@ -79,7 +79,7 @@ input[type=file]{display:none}
   <div id="scans"></div>
   <div id="st"></div>
 </div></div>
-<div id="vbar"><button id="vBack" type="button">← Back</button><button id="vSurf" type="button">Show points</button><button id="vCut" type="button">Cut away ceiling</button><button id="vTop" type="button">Top view</button><span id="vInfo"></span></div>
+<div id="vbar"><button id="vBack" type="button">← Back</button><button id="vSurf" type="button">Show points</button><button id="vCut" type="button">Cut away ceiling</button><button id="vTop" type="button">Top view</button><button id="vMeas" type="button">Measure</button><span id="vInfo"></span></div>
 
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
 <script type="module">
@@ -2854,6 +2854,7 @@ const BTN = () => page === 0 ? [
   ...(sweep.on ? [{ id: 'skipsweep', label: 'Skip sweep', big: true }] : []),
   ...(relocate ? [{ id: 'skipreloc', label: relocate.guess ? 'Use saved anchor now' : 'Skip search: load here', big: true }] : []),
   ...(replayMode ? [] : [{ id: 'detail', label: det.on ? 'Finish detail' : 'Detail scan (object)', on: det.on, big: true }]),
+  { id: 'measure', label: meas.on ? (meas.a ? 'Measuring: pick 2nd point' : 'Measuring ✓ (tap to stop)') : 'Measure', on: meas.on, big: true },
   { id: 'more', label: 'More  ›', big: true }
 ] : [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
@@ -3137,6 +3138,7 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'measure') { meas.on = !meas.on; if (!meas.on) measClear(); toast(meas.on ? 'Point at a surface, pull the trigger (or pinch) at both ends' : 'Measurements cleared'); }
   if (id === 'tune') { page = 0; tuneStart(); }
   if (id === 'skipsweep') { sweep.on = false; toast('Sweep skipped'); }
   if (id === 'skipreloc' && relocate) { const R = relocate; relocate = null; finishContinue(R.rec, R.guess || new M4()); toast(R.guess ? 'Placed by the saved anchor' : 'Loaded where you started this session'); }
@@ -3165,6 +3167,37 @@ async function press(id, frame) {
   if (id === 'clear') { clearMap(); cont = null; relocate = null; sweep.on = false; sweep.centres = []; kfMem.length = 0; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
+/* ================= measure: two points on the surface -> distance (headset: point + trigger or pinch; viewer: click twice) ================= */
+const meas = { on: false, a: null, aDot: null, list: [], prev: null, hit: null, n: 0, ray: new THREE.Raycaster(), dotGeo: new THREE.SphereGeometry(.012, 12, 8),
+  mat: new THREE.MeshBasicMaterial({ color: 0xffd24a, depthTest: false }), lmat: new THREE.LineBasicMaterial({ color: 0xffd24a, depthTest: false }) };
+const fmtLen = d => d < 1 ? Math.round(d * 100) + ' cm' : d.toFixed(2) + ' m';
+function measLabel(text) {
+  const c = document.createElement('canvas'); c.width = 320; c.height = 96; const g = c.getContext('2d'); g.fillStyle = 'rgba(16,18,20,.88)'; rr(g, 4, 4, 312, 88, 30); g.fill();
+  g.fillStyle = '#ffd24a'; g.font = '600 52px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 160, 50);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false, sizeAttenuation: false }));
+  sp.scale.set(.2, .06, 1); sp.renderOrder = 70; return sp;
+}
+function measTargets() { const t = []; for (const o of meshG.children) t.push(o); for (const o of liveM.values()) t.push(o); return t; }
+function measCast(origin, dir) { meas.ray.ray.origin.copy(origin); meas.ray.ray.direction.copy(dir); meas.ray.far = 12; const h = meas.ray.intersectObjects(measTargets(), false)[0]; return h ? h.point.clone() : null; }
+function measDot(pw) { const d = new THREE.Mesh(meas.dotGeo, meas.mat); d.renderOrder = 69; d.position.copy(mapRoot.worldToLocal(pw.clone())); mapRoot.add(d); return d; }
+function measPick(pw) {                                             // first press: start; second: finish a measurement
+  if (!pw) { toast('Point at a surface to measure'); return; }
+  if (!meas.a) { meas.a = mapRoot.worldToLocal(pw.clone()); meas.aDot = measDot(pw); return; }
+  const b = mapRoot.worldToLocal(pw.clone()), d = meas.a.distanceTo(b), g = new THREE.Group();
+  const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([meas.a, b]), meas.lmat); ln.renderOrder = 69; g.add(ln, meas.aDot, measDot(pw));
+  const lb = measLabel(fmtLen(d)); lb.position.copy(meas.a).add(b).multiplyScalar(.5); g.add(lb); mapRoot.add(g);
+  meas.list.push({ g, d }); meas.a = null; meas.aDot = null; meas.n++; diagLog('measure', d.toFixed(3));
+  toast('Measured ' + fmtLen(d));
+}
+function measClear() { for (const m of meas.list) { mapRoot.remove(m.g); m.g.traverse(o => { if (o.isSprite) { o.material.map.dispose(); o.material.dispose(); } if (o.isLine) o.geometry.dispose(); }); }
+  if (meas.aDot) mapRoot.remove(meas.aDot); meas.list = []; meas.a = null; meas.aDot = null; measPreview(null); }
+function measPreview(pw) {                                          // rubber band from the first point to where you point now
+  if (!pw || !meas.a) { if (meas.prev) { mapRoot.remove(meas.prev.g); meas.prev = null; } return; }
+  if (!meas.prev) { const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3()]), meas.lmat), lb = measLabel(''); ln.renderOrder = 69; const g = new THREE.Group(); g.add(ln, lb); mapRoot.add(g); meas.prev = { g, ln, lb, txt: '' }; }
+  const b = mapRoot.worldToLocal(pw.clone()), P = meas.prev.ln.geometry.attributes.position; P.setXYZ(0, meas.a.x, meas.a.y, meas.a.z); P.setXYZ(1, b.x, b.y, b.z); P.needsUpdate = true; meas.prev.ln.geometry.computeBoundingSphere();
+  meas.prev.lb.position.copy(meas.a).add(b).multiplyScalar(.5); const t = fmtLen(meas.a.distanceTo(b));
+  if (t !== meas.prev.txt) { meas.prev.txt = t; const old = meas.prev.lb; const nl = measLabel(t); nl.position.copy(old.position); meas.prev.g.remove(old); old.material.map.dispose(); old.material.dispose(); meas.prev.g.add(nl); meas.prev.lb = nl; }
+}
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
 laser.scale.z = 2;
 let lastFrame = null;
@@ -3174,13 +3207,15 @@ for (const i of [0, 1]) {
     c.userData.hand = ev.data.handedness;
     c.userData.src = ev.data; if (ev.data.handedness === 'left') grip.add(panel.mesh); else { rightCtl.c = c; c.add(laser); }
   });
-  c.addEventListener('selectstart', () => { if (c.userData.hand !== 'left' && panel.hover >= 0) { buzz(c.userData.src, .5, 30); press(panel.buttons[panel.hover].id, lastFrame).catch(e => toast('Error: ' + e.message)).then(drawPanel); } });
+  c.addEventListener('selectstart', () => { if (c.userData.hand !== 'left' && panel.hover < 0 && meas.on) { buzz(c.userData.src, .4, 20); measPick(meas.hit); return; }
+    if (c.userData.hand !== 'left' && panel.hover >= 0) { buzz(c.userData.src, .5, 30); press(panel.buttons[panel.hover].id, lastFrame).catch(e => toast('Error: ' + e.message)).then(drawPanel); } });
 }
 function updatePointer() {
   panel.hover = -1; if (!rightCtl.c || !panel.mesh.parent) return;
   const c = rightCtl.c; pointerRay.ray.origin.setFromMatrixPosition(c.matrixWorld); pointerRay.ray.direction.set(0, 0, -1).transformDirection(c.matrixWorld);
   const h = pointerRay.intersectObject(panel.mesh)[0];
   laser.scale.z = h ? h.distance : 2;
+  if (meas.on && !h && (fpsN & 1) === 0) { meas.hit = measCast(pointerRay.ray.origin, pointerRay.ray.direction); if (meas.hit) laser.scale.z = meas.hit.distanceTo(pointerRay.ray.origin); measPreview(meas.hit); }
   if (!h) return;
   const px = h.uv.x * 640, py = (1 - h.uv.y) * 800;
   panel.hover = panel.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
@@ -3226,7 +3261,7 @@ $('bAR').addEventListener('click', async () => {
     if (hasDepth && s.depthUsage === 'cpu-optimized') depth.cpu = true;
     else if (hasDepth) { try { depth.binding = new XRWebGLBinding(s, renderer.getContext()); } catch (e) { depth.status = 'binding failed: ' + e.message; } }
     $('ui').classList.add('hide');
-    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); tune.on = false; pendingLoad = null; relocate = null; setTimeout(() => { const ids = [...autoPending]; autoPending.clear(); ids.forEach(autoEnqueue); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan().catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); setTimeout(clear2D, 50); });
+    s.addEventListener('end', () => { diagLog('session', 'ended'); diagSave(); tune.on = false; pendingLoad = null; relocate = null; meas.on = false; measClear(); setTimeout(() => { const ids = [...autoPending]; autoPending.clear(); ids.forEach(autoEnqueue); }, 4000); hud.mesh.visible = false; if (replayMode) meshClear(); if (det.on) endDetail(); if (!replayMode && confirmed > 500 && confirmed !== savedConf) saveScan().catch(() => {}); xrSession = null; replayMode = false; scanning = true; renderer.setClearColor(0, 0); pmat.uniforms.alpha.value = 1; pmat.transparent = true; pmat.uniforms.style.value = showMode === 1 ? 1 : 0; pmat.depthWrite = showMode === 1; pmat.uniforms.photo.value = 0; pmat.needsUpdate = true; cloud.visible = showMode !== 2; $('ui').classList.remove('hide'); listScans(); setTimeout(clear2D, 50); });
     if (replayMode) { scanning = false; pmat.uniforms.style.value = 1; pmat.depthWrite = true; pmat.uniforms.photo.value = 1; pmat.uniforms.minC.value = CONF; layout.visible = false; underOn = false; underG.visible = false; reality = 0; setReality(); }
     else { pmat.uniforms.photo.value = 0; pmat.uniforms.minC.value = 1; renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; }   // Meta's saved layout is used for checking, not drawn
     kf.has = false; kf.n = 0;
@@ -3333,22 +3368,27 @@ function openViewer(rec) {
 }
 document.addEventListener('click', e => document.querySelectorAll('.scan details[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }));   // one menu open at a time
 function clear2D() { renderer.setRenderTarget(null); renderer.setClearColor(0, 0); renderer.clear(); }   // the start page shows its own background, not the last 3D frame
-function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = tune.saved ? tune.saved.showMode : 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; viewer.cut = false; applyCut(); document.body.classList.remove('viewing'); renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; requestAnimationFrame(clear2D); }
+function closeViewer() { if (viewer.on) { clearMap(); flushGeo(); pmat.uniforms.scale.value = 900; pmat.uniforms.minC.value = 1; showMode = tune.saved ? tune.saved.showMode : 4; pmat.uniforms.style.value = 0; pmat.depthWrite = tmat.depthWrite = false; pmat.needsUpdate = tmat.needsUpdate = true; } if (viewer.group) { scene.remove(viewer.group); viewer.group.traverse(o => o.geometry && o.geometry.dispose()); viewer.group = null; } viewer.on = false; viewer.cut = false; applyCut(); meas.on = false; measClear(); $('vMeas').textContent = 'Measure'; document.body.classList.remove('viewing'); renderer.setClearColor(0, 0); cloud.visible = true; layout.visible = false; requestAnimationFrame(clear2D); }
 $('bDiag').addEventListener('click', () => { let t = null; try { t = localStorage.getItem('scanner.diag'); } catch (e) {}
   download('house-scanner-diagnostics.json', new Blob([t || JSON.stringify(diagSnapshot(), null, 1)], { type: 'application/json' })); });
 $('vSurf').addEventListener('click', () => { surfOn = !surfOn; applySurf(); });
 $('vCut').addEventListener('click', () => { viewer.cut = !viewer.cut; applyCut(); $('vCut').textContent = viewer.cut ? 'Show ceiling' : 'Cut away ceiling'; });
+$('vMeas').addEventListener('click', () => { meas.on = !meas.on; if (!meas.on) measClear(); $('vMeas').textContent = meas.on ? 'Stop measuring' : 'Measure'; $('vInfo').textContent = meas.on ? 'Click two points on the surface' : ''; });
 $('vTop').addEventListener('click', () => { const top = viewer.pitch < 1.3; viewer.pitch = top ? 1.52 : .85; if (top) { viewer.dist = Math.max(3, (viewer.ext || 5) * 1.15); if (!viewer.cut) $('vCut').click(); } $('vTop').textContent = top ? 'Angled view' : 'Top view'; });
 $('vBack').addEventListener('click', () => { closeViewer(); $('vbar').classList.remove('on'); $('ui').classList.remove('hide'); });
 const cv = renderer.domElement, ptrs = new Map();
-cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointerdown', e => { if (!viewer.on) return; ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY }); cv.setPointerCapture(e.pointerId); });
 cv.addEventListener('pointermove', e => {
   if (!viewer.on || !ptrs.has(e.pointerId)) return; const p = ptrs.get(e.pointerId);
   if (ptrs.size === 1) { viewer.yaw -= (e.clientX - p.x) * .006; viewer.pitch = Math.max(-1.4, Math.min(1.55, viewer.pitch + (e.clientY - p.y) * .006)); }
   else if (ptrs.size === 2) { const [a, b] = [...ptrs.values()], d0 = Math.hypot(a.x - b.x, a.y - b.y); p.x = e.clientX; p.y = e.clientY; const [c, d] = [...ptrs.values()], d1 = Math.hypot(c.x - d.x, c.y - d.y); viewer.dist = Math.max(.5, viewer.dist * d0 / Math.max(1, d1)); return; }
   p.x = e.clientX; p.y = e.clientY;
 });
-const up = e => ptrs.delete(e.pointerId); cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+const up = e => { const p = ptrs.get(e.pointerId); ptrs.delete(e.pointerId);
+  if (viewer.on && meas.on && p && e.type === 'pointerup' && Math.hypot(e.clientX - p.x0, e.clientY - p.y0) < 6) {   // a click, not an orbit drag
+    const r2 = cv.getBoundingClientRect(), ndc = new V3((e.clientX - r2.left) / r2.width * 2 - 1, -(e.clientY - r2.top) / r2.height * 2 + 1, .5); camera.updateMatrixWorld();
+    const dir = ndc.unproject(camera).sub(camera.position).normalize(); measPick(measCast(camera.position, dir)); $('vInfo').textContent = meas.a ? 'Click the second point' : meas.list.length ? 'Measured ' + fmtLen(meas.list[meas.list.length - 1].d) + ' · click to measure again' : ''; } };
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
 cv.addEventListener('wheel', e => { if (viewer.on) { viewer.dist = Math.max(.5, viewer.dist * Math.exp(e.deltaY * .001)); e.preventDefault(); } }, { passive: false });
 $('fOpen').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
