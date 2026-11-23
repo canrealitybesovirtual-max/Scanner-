@@ -1372,6 +1372,12 @@ async function saveScan(frame) {
 let pendingLoad = null;                                     // waits for the anchor to be found again
 async function loadIntoSession(rec) {
   currentId = rec.id; let T = new M4();
+  if (!replayMode) {                                               // continuing: find the old scan in what you see now, then load it exactly there
+    relocate = { rec, guess: null, t: clockT, tries: 0, busy: false, last: null };
+    if (rec.anchor && rec.anchor.uuid && rec.anchor.m && xrSession.restorePersistentAnchor) {
+      try { const a = await xrSession.restorePersistentAnchor(rec.anchor.uuid); originAnchor = a; anchorUUID = rec.anchor.uuid; pendingLoad = { rec, anchor: a, tries: 0, guessOnly: true }; } catch (e) {} }
+    toast('Look around: finding your last scan…'); return;
+  }
   if (rec.anchor && rec.anchor.uuid && rec.anchor.m && xrSession.restorePersistentAnchor) {
     try { const a = await xrSession.restorePersistentAnchor(rec.anchor.uuid); originAnchor = a; anchorUUID = rec.anchor.uuid; pendingLoad = { rec, anchor: a, tries: 0 }; toast('Finding where this scan was taken…'); return; }
     catch (e) { toast('Anchor not found here: loaded at the session origin'); }
@@ -1755,6 +1761,99 @@ async function showTexMesh(tex, T, extraParts) {
   const o = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map: t, side: THREE.DoubleSide, transparent: true })); o.matrixAutoUpdate = false; o.matrix.copy(T); o.frustumCulled = false; o.userData.tex = true; meshG.add(o); applySurf();
 }
 
+/* ================= finding a saved scan again: match the walls around you to the saved walls (no anchor needed) =================
+   Both sessions are gravity-aligned, so the search is yaw + floor offset + a shift across the floor: Hough voting on a 20 cm wall map,
+   a fine search on 5 cm, then point-to-plane ICP in full 6-DoF. */
+const RELOC_SRC = `
+function floorOf(P, N) { const h = new Map(); for (let i = 0; i < P.length / 3; i++) if (N[i * 3 + 1] > .8) { const k = Math.round(P[i * 3 + 1] / .04); h.set(k, (h.get(k) || 0) + 1); }
+  let best = null, bc = 0; const ks = [...h.keys()].sort((a, b) => a - b); for (const k of ks) { const c = h.get(k) + (h.get(k - 1) || 0) + (h.get(k + 1) || 0); if (c > bc * 1.5 && c > 40) { best = k; bc = c; } } return best == null ? null : best * .04; }
+function walls(P, N, fy) { const out = []; for (let i = 0; i < P.length / 3; i++) { if (Math.abs(N[i * 3 + 1]) > .35) continue; const y = P[i * 3 + 1] - fy; if (y < .25 || y > 2) continue; const l = Math.hypot(N[i * 3], N[i * 3 + 2]) || 1; out.push(P[i * 3], P[i * 3 + 2], N[i * 3] / l, N[i * 3 + 2] / l); } return out; }
+function cells(W, g) {                                             // 2D wall cells with their mean facing direction
+  const m = new Map(); for (let i = 0; i < W.length; i += 4) { const k = Math.floor(W[i] / g) * 100000 + Math.floor(W[i + 1] / g); let c = m.get(k); if (!c) m.set(k, c = [0, 0, 0]); c[0]++; c[1] += W[i + 2]; c[2] += W[i + 3]; }
+  const out = []; for (const [k, c] of m) { if (c[0] < 2) continue; const l = Math.hypot(c[1], c[2]); if (l < c[0] * .6) continue; const x = Math.floor(k / 100000), z = k - x * 100000; out.push((x + .5) * g, (z + .5) * g, c[1] / l, c[2] / l); } return out; }
+const fineSet = (W, g) => { const s = new Set(); for (let i = 0; i < W.length; i += 4) { const x = Math.floor(W[i] / g), z = Math.floor(W[i + 1] / g); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) s.add((x + a) * 100000 + z + b); } return s; };
+const areaSet = (P, g) => { const s = new Set(); for (let i = 0; i < P.length / 3; i++) { const x = Math.floor(P[i * 3] / g), z = Math.floor(P[i * 3 + 2] / g); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) s.add((x + a) * 100000 + z + b); } return s; };
+function solve6(H, g) { const A = []; for (let i = 0; i < 6; i++) A.push(H.slice(i * 6, i * 6 + 6).concat([g[i]]));
+  for (let c = 0; c < 6; c++) { let p = c; for (let r = c + 1; r < 6; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r; [A[c], A[p]] = [A[p], A[c]]; if (Math.abs(A[c][c]) < 1e-12) return null; for (let r = c + 1; r < 6; r++) { const f = A[r][c] / A[c][c]; for (let k = c; k < 7; k++) A[r][k] -= f * A[c][k]; } }
+  const x = [0, 0, 0, 0, 0, 0]; for (let r = 5; r >= 0; r--) { let s = A[r][6]; for (let k = r + 1; k < 6; k++) s -= A[r][k] * x[k]; x[r] = s / A[r][r]; } return x; }
+onmessage = e => {
+  const { SP, SN, LP, LN, guess } = e.data, SNf = new Float32Array(SN.length); for (let i = 0; i < SN.length; i++) SNf[i] = SN[i] / 127;
+  const fS = floorOf(SP, SNf), fL = floorOf(LP, LN), dy = fS != null && fL != null ? fL - fS : 0, fy0 = fS != null ? fS : 0;
+  const WS = walls(SP, SNf, fy0), WL = walls(LP, LN, fy0 + dy), CS = cells(WS, .2), CL = cells(WL, .2), FS = fineSet(WS, .05);
+  if (CL.length < 100) { postMessage({ ok: false, need: true, wallCells: CL.length / 4 }); return; }
+  const FL = fineSet(WL, .05), OL = areaSet(LP, .2);               // live walls (fine) and the area the live session has seen
+  const lw = [], sw = []; { const st = Math.max(1, Math.floor(WL.length / 4 / 700)); for (let i = 0; i < WL.length; i += 4 * st) lw.push(WL[i], WL[i + 1]); const s2 = Math.max(1, Math.floor(WS.length / 4 / 4000)); for (let i = 0; i < WS.length; i += 4 * s2) sw.push(WS[i], WS[i + 1]); }
+  /* score both ways: live walls that land on saved walls, and saved walls (inside the area seen now) that land on live walls */
+  const fine = (th, tx, tz) => { const c = Math.cos(th), s = Math.sin(th); let hit = 0, rin = 0, rhit = 0;
+    for (let i = 0; i < lw.length; i += 2) { const x = lw[i] - tx, z = lw[i + 1] - tz, sx = c * x - s * z, sz = s * x + c * z; if (FS.has(Math.floor(sx / .05) * 100000 + Math.floor(sz / .05))) hit++; }
+    for (let i = 0; i < sw.length; i += 2) { const lx = c * sw[i] + s * sw[i + 1] + tx, lz = -s * sw[i] + c * sw[i + 1] + tz; if (!OL.has(Math.floor(lx / .2) * 100000 + Math.floor(lz / .2))) continue; rin++; if (FL.has(Math.floor(lx / .05) * 100000 + Math.floor(lz / .05))) rhit++; }
+    const pr = hit / (lw.length / 2), rc = rin > 20 ? rhit / rin : 0; return pr + rc > 0 ? 2 * pr * rc / (pr + rc) : 0; };
+  const cands = [];
+  if (guess) { const th = Math.atan2(guess[8], guess[0]); cands.push({ th, tx: guess[12], tz: guess[14], s: 1e9 }); }
+  /* Hough: every live wall cell votes for the shift that would put each saved wall cell on it */
+  const sl = [], ss = []; { const a = Math.max(1, Math.floor(CL.length / 4 / 260)), b = Math.max(1, Math.floor(CS.length / 4 / 2600)); for (let i = 0; i < CL.length; i += 4 * a) sl.push(CL[i], CL[i + 1], CL[i + 2], CL[i + 3]); for (let i = 0; i < CS.length; i += 4 * b) ss.push(CS[i], CS[i + 1], CS[i + 2], CS[i + 3]); }
+  const R = 75, G = .2, acc = new Int32Array((2 * R + 1) * (2 * R + 1));
+  for (let deg = 0; deg < 360; deg += 2) {
+    const th = deg * Math.PI / 180, c = Math.cos(th), s = Math.sin(th); acc.fill(0);
+    for (let j = 0; j < ss.length; j += 4) { const rx = c * ss[j] + s * ss[j + 1], rz = -s * ss[j] + c * ss[j + 1], nx = c * ss[j + 2] + s * ss[j + 3], nz = -s * ss[j + 2] + c * ss[j + 3];
+      for (let i = 0; i < sl.length; i += 4) { if (nx * sl[i + 2] + nz * sl[i + 3] < .85) continue; const ix = Math.round((sl[i] - rx) / G) + R, iz = Math.round((sl[i + 1] - rz) / G) + R; if (ix < 0 || iz < 0 || ix > 2 * R || iz > 2 * R) continue; acc[ix * (2 * R + 1) + iz]++; } }
+    for (let pk = 0; pk < 3; pk++) {                               // the 3 strongest separate peaks for this yaw
+      let bv = 0, bi = 0; for (let k = 0; k < acc.length; k++) if (acc[k] > bv) { bv = acc[k]; bi = k; } if (!bv) break;
+      const bx = Math.floor(bi / (2 * R + 1)), bz = bi % (2 * R + 1); cands.push({ th, tx: (bx - R) * G, tz: (bz - R) * G, s: bv });
+      for (let a = -2; a <= 2; a++) for (let b = -2; b <= 2; b++) { const x = bx + a, z = bz + b; if (x >= 0 && z >= 0 && x <= 2 * R && z <= 2 * R) acc[x * (2 * R + 1) + z] = 0; } }
+  }
+  cands.sort((a, b) => b.s - a.s); const pre = cands.slice(0, 80); for (const cd of pre) cd.f0 = fine(cd.th, cd.tx, cd.tz);   // quick check of the 80 best votes
+  pre.sort((a, b) => b.f0 - a.f0); const top = pre.slice(0, 8);
+  /* fine: ±2° and ±20 cm around each, scored on the 5 cm wall map */
+  for (const cd of top) { let best = fine(cd.th, cd.tx, cd.tz), bt = cd.th, bx = cd.tx, bz = cd.tz;
+    for (let dth = -2; dth <= 2; dth += .5) for (let dx = -.2; dx <= .201; dx += .05) for (let dz = -.2; dz <= .201; dz += .05) { const f = fine(cd.th + dth * Math.PI / 180, cd.tx + dx, cd.tz + dz); if (f > best) { best = f; bt = cd.th + dth * Math.PI / 180; bx = cd.tx + dx; bz = cd.tz + dz; } }
+    Object.assign(cd, { f: best, th: bt, tx: bx, tz: bz }); }
+  top.sort((a, b) => b.f - a.f); const B = top[0], other = top.find(c => Math.hypot(c.tx - B.tx, c.tz - B.tz) > .5 || Math.abs(Math.atan2(Math.sin(c.th - B.th), Math.cos(c.th - B.th))) > .17), ratio = other ? B.f / Math.max(.01, other.f) : 9;
+  /* A: saved -> live.  p_live = Ry(th) p_saved + (tx, dy, tz) */
+  const c = Math.cos(B.th), s = Math.sin(B.th); let A = [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, B.tx, dy, B.tz, 1];
+  /* 6-DoF point-to-plane ICP: live points onto the saved surface */
+  const hash = new Map(), HG = .1; for (let i = 0; i < SP.length / 3; i++) { const k = Math.floor(SP[i * 3] / HG) * 1e8 + Math.floor(SP[i * 3 + 1] / HG) * 1e4 + Math.floor(SP[i * 3 + 2] / HG); let a = hash.get(k); if (!a) hash.set(k, a = []); a.push(i); }
+  const inv = M => { const R2 = [M[0], M[4], M[8], 0, M[1], M[5], M[9], 0, M[2], M[6], M[10], 0, 0, 0, 0, 1]; R2[12] = -(R2[0] * M[12] + R2[4] * M[13] + R2[8] * M[14]); R2[13] = -(R2[1] * M[12] + R2[5] * M[13] + R2[9] * M[14]); R2[14] = -(R2[2] * M[12] + R2[6] * M[13] + R2[10] * M[14]); return R2; };
+  let Bm = inv(A); const lst = Math.max(1, Math.floor(LP.length / 3 / 3000)); let inl = 0, tot = 0;
+  for (let it = 0; it < 12; it++) {
+    const H = new Array(36).fill(0), g = [0, 0, 0, 0, 0, 0]; inl = 0; tot = 0; const maxd = it < 4 ? .12 : it < 8 ? .06 : .03;
+    for (let q = 0; q < LP.length / 3; q += lst) {
+      const px = LP[q * 3], py = LP[q * 3 + 1], pz = LP[q * 3 + 2], x = Bm[0] * px + Bm[4] * py + Bm[8] * pz + Bm[12], y = Bm[1] * px + Bm[5] * py + Bm[9] * pz + Bm[13], z = Bm[2] * px + Bm[6] * py + Bm[10] * pz + Bm[14];
+      const hx = Math.floor(x / HG), hy = Math.floor(y / HG), hz = Math.floor(z / HG); let bd = maxd * maxd, bj = -1; tot++;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let cc = -1; cc <= 1; cc++) { const L = hash.get((hx + a) * 1e8 + (hy + b) * 1e4 + hz + cc); if (L) for (const j of L) { const d2 = (SP[j * 3] - x) ** 2 + (SP[j * 3 + 1] - y) ** 2 + (SP[j * 3 + 2] - z) ** 2; if (d2 < bd) { bd = d2; bj = j; } } }
+      if (bj < 0) continue; const nx = SNf[bj * 3], ny = SNf[bj * 3 + 1], nz = SNf[bj * 3 + 2]; if (!(nx || ny || nz)) continue; inl++;
+      const r = nx * (x - SP[bj * 3]) + ny * (y - SP[bj * 3 + 1]) + nz * (z - SP[bj * 3 + 2]), J = [nx, ny, nz, y * nz - z * ny, z * nx - x * nz, x * ny - y * nx];
+      for (let i = 0; i < 6; i++) { g[i] -= J[i] * r; for (let j = 0; j < 6; j++) H[i * 6 + j] += J[i] * J[j]; }
+    }
+    if (inl < 200) break; const sol = solve6(H, g); if (!sol) break;
+    const [tx, ty, tz, ox, oy, oz] = sol, th = Math.hypot(ox, oy, oz), kx = th ? ox / th : 0, ky = th ? oy / th : 0, kz = th ? oz / th : 0, C = Math.cos(th), S = Math.sin(th), V = 1 - C;
+    const Rm = [C + kx * kx * V, ky * kx * V + kz * S, kz * kx * V - ky * S, 0, kx * ky * V - kz * S, C + ky * ky * V, kz * ky * V + kx * S, 0, kx * kz * V + ky * S, ky * kz * V - kx * S, C + kz * kz * V, 0, tx, ty, tz, 1];
+    const N2 = new Array(16); for (let cI = 0; cI < 4; cI++) for (let rI = 0; rI < 4; rI++) N2[cI * 4 + rI] = Rm[rI] * Bm[cI * 4] + Rm[4 + rI] * Bm[cI * 4 + 1] + Rm[8 + rI] * Bm[cI * 4 + 2] + Rm[12 + rI] * Bm[cI * 4 + 3]; Bm = N2;
+    if (Math.hypot(tx, ty, tz) < 2e-4 && th < 2e-4) break;
+  }
+  A = inv(Bm); const overlap = tot ? inl / tot : 0;
+  postMessage({ ok: B.f > .5 && ratio > 1.2 && overlap > .45, A, wallFit: B.f, ratio, overlap, wallCells: CL.length / 4, dy });
+};`;
+function relocSearch(rec, guess) {                                  // live confirmed points (map frame) vs the saved scan
+  const idx = []; for (let i = 0; i < N; i++) if (cnt[i] >= CONF && (nrm[i * 3] || nrm[i * 3 + 1] || nrm[i * 3 + 2])) idx.push(i);
+  const st = Math.max(1, Math.floor(idx.length / 60000)), n = Math.ceil(idx.length / st), LP = new Float32Array(n * 3), LN = new Float32Array(n * 3);
+  for (let k = 0, j = 0; k < idx.length; k += st, j++) { const i = idx[k], l = Math.hypot(nrm[i * 3], nrm[i * 3 + 1], nrm[i * 3 + 2]); LP.set(pos.subarray(i * 3, i * 3 + 3), j * 3); LN[j * 3] = nrm[i * 3] / l; LN[j * 3 + 1] = nrm[i * 3 + 1] / l; LN[j * 3 + 2] = nrm[i * 3 + 2] / l; }
+  const w = new Worker(URL.createObjectURL(new Blob([RELOC_SRC], { type: 'text/javascript' })));
+  return new Promise(res => { w.onmessage = e => { w.terminate(); res(e.data); }; w.onerror = e => { w.terminate(); res({ ok: false, error: e.message }); };
+    w.postMessage({ SP: rec.points, SN: rec.normals || new Int8Array(rec.points.length), LP, LN, guess: guess ? Array.from(guess.elements) : null }); });
+}
+/* continuing: look for the saved scan around you every few seconds until it locks */
+let relocate = null;
+async function relocTick() {
+  const R = relocate; if (!R || R.busy || !workerPathReady() || clockT - R.t < 2.5) return;
+  R.busy = true; R.t = clockT; R.tries++;
+  const res = await relocSearch(R.rec, R.guess); R.busy = false; if (relocate !== R) return;
+  R.last = res;
+  if (res.ok) { relocate = null; finishContinue(R.rec, new M4().fromArray(res.A)); toast('Found your last scan · ' + Math.round(res.overlap * 100) + '% overlap'); diagLog('reloc', JSON.stringify({ fit: res.wallFit, ratio: res.ratio, overlap: res.overlap, tries: R.tries })); return; }
+  if (R.tries > 30 && R.guess) { relocate = null; finishContinue(R.rec, R.guess); toast('Using the saved anchor (walls did not confirm it)'); }
+}
+function finishContinue(rec, A) { mergeRecord(Object.assign({}, rec, { D: null }), A); }   // A: saved map frame -> this map frame
+
 /* ================= understanding the house: floors, ceilings, walls, stairs, objects =================
    Works on the confirmed points (plus, when known, which directions each was seen from) and the
    Space Setup planes. Everything is measured in a 10 cm grid seen from above:
@@ -1995,6 +2094,7 @@ const BTN = () => page === 0 ? [
   { id: 'save', label: 'Save', big: true },
   { id: 'finish', label: 'Finish & save', on: true, big: true },
   ...(replayMode ? [{ id: 'reality', label: ['Captured', 'Blend', 'Real room'][reality], big: true }, { id: 'surf', label: surfOn ? 'Showing surfaces' : 'Showing points', big: true }] : []),
+  ...(relocate ? [{ id: 'skipreloc', label: relocate.guess ? 'Use saved anchor now' : 'Skip search: load here', big: true }] : []),
   ...(replayMode ? [] : [{ id: 'detail', label: det.on ? 'Finish detail' : 'Detail scan (object)', on: det.on, big: true }]),
   { id: 'more', label: 'More  ›', big: true }
 ] : [
@@ -2032,6 +2132,7 @@ function diagSave() { try { localStorage.setItem('scanner.diag', JSON.stringify(
 function scanPhase() {
   if (replayMode) return { title: 'Walk-through', sub: 'Your saved house, ' + confirmed.toLocaleString() + ' points', p: null };
   if (finishing) return { title: 'Saving…', sub: 'Keep the headset on for a moment', p: null };
+  if (relocate && workerPathReady()) { const L = relocate.last; return { title: 'Finding your last scan', sub: !L ? 'Look around at the walls' : L.need ? 'Look at more of the walls around you' : 'Matching… ' + Math.round((L.wallFit || 0) * 100) + '% fit · keep looking around', p: L && !L.need ? Math.min(1, (L.wallFit || 0) / .5) : Math.min(1, ((L && L.wallCells) || 0) / 100) }; }
   if (det.on && !replayMode) return { title: det.auto ? 'Detail scan (auto)' : 'Detail scan', sub: (depth.tooFast ? 'Slow down · ' : '') + fconf.toLocaleString() + ' fine points · circle it 30–60 cm away', p: null };
   if (mapFull) return { title: 'Map full', sub: 'Finish & save, then start a new scan for the next area', p: 1 };
   if (!scanning) return { title: 'Paused', sub: 'Press Resume on your wrist', p: coverage() };
@@ -2189,6 +2290,7 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'skipreloc' && relocate) { const R = relocate; relocate = null; finishContinue(R.rec, R.guess || new M4()); toast(R.guess ? 'Placed by the saved anchor' : 'Loaded where you started this session'); }
   if (id === 'autodet') { auto.detail = !auto.detail; }
   if (id === 'guide') { auto.guide = !auto.guide; updateGuide(); }
   if (id === 'drift') { icpOn = !icpOn; toast(icpOn ? 'Drift correction on' : 'Drift correction off'); }
@@ -2210,7 +2312,7 @@ async function press(id, frame) {
     try { await saveScan(frame); toast('Saved · ' + area().toFixed(1) + ' m² · ' + kf.n + ' photos'); } catch (e) { toast('Save failed: ' + e.message); finishing = false; return; }
     setTimeout(() => { finishing = false; xrSession && xrSession.end(); }, 2500);
   }
-  if (id === 'clear') { clearMap(); cont = null; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
+  if (id === 'clear') { clearMap(); cont = null; relocate = null; currentId = null; kf.n = 0; kf.has = false; understanding = null; underG.clear(); toast('Map cleared (saved scans are untouched)'); }
   if (id === 'exit') xrSession && xrSession.end();
 }
 const pointerRay = new THREE.Raycaster(), rightCtl = { c: null }, laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9ae6f2 }));
@@ -2264,7 +2366,7 @@ $('bAR').addEventListener('click', async () => {
     const feats = s.enabledFeatures || [];
     renderer.xr.setReferenceSpaceType(feats.includes('unbounded') ? 'unbounded' : 'local-floor');      // unbounded: tracking across the whole house
     await renderer.xr.setSession(s); xrSession = s; refSpace = null; originAnchor = null; anchorUUID = null;
-    clearMap(); cont = null; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
+    clearMap(); cont = null; relocate = null; currentId = null; kf.n = 0; kf.has = false; savedConf = -1; sessionT0 = Date.now(); auto.lastSave = clockT;
     depth.binding = null; depth.cpu = false; depth.frames = 0; depth.meta = null; depth.mode = null; depth.flipAuto = 0; depth.flipY = false; depth.cal = { pairs: 0, score: new Map(), prev: null, locked: false }; depth.cfg = null; depth.metaStale = false;
     try { const sv = localStorage.getItem('scanner.depthCfg'); if (sv) { depth.cfg = JSON.parse(sv); depth.cal.locked = true; } } catch (e) {} DR.sync = null; clearMeta();
     const hasDepth = feats.includes('depth-sensing') || !!s.depthUsage;
@@ -2364,8 +2466,9 @@ renderer.setAnimationLoop((t, frame) => {
     if (useMeta) { syncLayout(frame, refSpace); if (metaSurf.dirty && clockT - metaSurf.t > 2) { metaSurf.t = clockT; buildMetaSurf(); } }
     if (pendingLoad) {                                       // the saved anchor has been found: map old coordinates into this session's
       const ap = frame.getPose(pendingLoad.anchor.anchorSpace, refSpace);
-      if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m); mergeRecord(pendingLoad.rec, now.multiply(then.invert())); pendingLoad = null; }
-      else if (++pendingLoad.tries > 600) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); pendingLoad = null; }
+      if (ap) { const now = new M4().fromArray(ap.transform.matrix), then = new M4().fromArray(pendingLoad.rec.anchor.m), T = now.multiply(then.invert());
+        if (pendingLoad.guessOnly) { if (relocate) relocate.guess = T.multiply(new M4().fromArray(pendingLoad.rec.D || new M4().elements).invert()); } else mergeRecord(pendingLoad.rec, T); pendingLoad = null; }
+      else if (++pendingLoad.tries > 600) { if (!pendingLoad.guessOnly) { mergeRecord(pendingLoad.rec, new M4()); toast('Could not find the anchor: loaded at the session origin'); } pendingLoad = null; }
     }
     if (depth.meta && (depth.metaReady || (depth.metaReady = depthReady()))) {   // pixels stay ready while the frame waits its turn
       const M = depth.meta;
@@ -2387,7 +2490,7 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
+    autoTick(dt); relocTick(); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
   } else if (viewer.on) {
