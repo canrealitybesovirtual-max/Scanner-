@@ -78,6 +78,10 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWid
 renderer.xr.enabled = true;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, .02, 400); camera.position.set(0, 1.6, 0); scene.add(camera);
+/* the map lives in its own frame; D maps headset-world -> map (drift correction). Everything scanned is drawn through D⁻¹ so it sits on the real room */
+const mapRoot = new THREE.Group(); mapRoot.matrixAutoUpdate = false; scene.add(mapRoot);
+const Dm = new M4(), Dinv = new M4(); let icpOn = true;
+function setD(m) { Dm.copy(m); Dinv.copy(m).invert(); mapRoot.matrix.copy(Dinv); mapRoot.matrixWorldNeedsUpdate = true; }
 addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
 
 /* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
@@ -124,7 +128,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { mapFull = false; meshClear(); liveClear(); if (integ) integ.postMessage({ tsdfReset: true }); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { mapFull = false; setD(new M4()); meshClear(); liveClear(); if (integ) integ.postMessage({ tsdfReset: true }); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -169,7 +173,7 @@ const pmat = new THREE.ShaderMaterial({
         vec3 X = pf * (dot(vVN, vVC) / den); if (distance(X, vVC) > vR) discard; }
       gl_FragColor = vec4(vC, alpha * va); }`
 });
-const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; scene.add(cloud);
+const cloud = new THREE.Points(pg, pmat); cloud.frustumCulled = false; mapRoot.add(cloud);
 
 /* ================= detail scans: a 5 mm map inside small zones (a shoe, a pencil on a desk), fed by full-resolution depth crops ================= */
 const VSF = .005, MAXF = 1500000;
@@ -198,7 +202,7 @@ const fg = new THREE.BufferGeometry();
 for (const [n, a, k] of [['position', fpos, 3], ['cnt', fcnt, 1], ['born', fborn, 1], ['ang', fang, 1], ['col', fcol, 3], ['cw', fcw, 1], ['nrm', fnrm, 3], ['tl', ftl, 1]]) fg.setAttribute(n, new THREE.BufferAttribute(a, k).setUsage(THREE.DynamicDrawUsage));
 fg.setDrawRange(0, 0);
 const fmat = pmat.clone(); fmat.uniforms.size.value = VSF * 1.25; fmat.uniforms.nearCut.value = .1; fmat.uniforms.nz.value = 0;
-const fcloud = new THREE.Points(fg, fmat); fcloud.frustumCulled = false; scene.add(fcloud);
+const fcloud = new THREE.Points(fg, fmat); fcloud.frustumCulled = false; mapRoot.add(fcloud);
 function flushFine() {
   for (const n of ['time', 'scale', 'minC', 'floorY', 'photo', 'alpha', 'style']) fmat.uniforms[n].value = pmat.uniforms[n].value;
   if (fmat.depthWrite !== pmat.depthWrite) { fmat.depthWrite = pmat.depthWrite; fmat.needsUpdate = true; }
@@ -209,7 +213,7 @@ function flushFine() {
 function fineClear() { fmap.clear(); FN = 0; fconf = 0; fNewLo = 0; fLo = Infinity; fHi = -1; fg.setDrawRange(0, 0); det.zones = []; det.on = false; det.cur = null; zonesSync(); }
 function zonesSync() {                                         // tell the coarse map where detail zones are; draw the active zone's outline
   const Z = pmat.uniforms.zones.value; det.zones.slice(-8).forEach((z, i) => Z[i].set(z.c.x, z.c.y, z.c.z, z.r)); pmat.uniforms.nz.value = Math.min(8, det.zones.length);
-  if (!det.box) { det.box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x9ae6f2, transparent: true, opacity: .35, depthWrite: false })); det.box.renderOrder = 40; scene.add(det.box); }
+  if (!det.box) { det.box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x9ae6f2, transparent: true, opacity: .35, depthWrite: false })); det.box.renderOrder = 40; mapRoot.add(det.box); }
   det.box.visible = !!det.cur; if (det.cur) { det.box.position.copy(det.cur.c); det.box.scale.setScalar(det.cur.r * 2); }
 }
 /* the depth-image region (texture uv) that covers a zone, so the detail read spends every sample on it */
@@ -230,7 +234,7 @@ function zoneROI(zone, proj, xf, cfg, ndRaw) {
 }
 function startDetail() {                                       // aim: the first surface along your gaze; the zone wraps the object there
   if (det.zones.length >= 8) { toast('8 detail zones already: save, then start a new scan'); return; }
-  const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()), f = xc.getWorldDirection(new V3()); let hit = null;
+  const xc = renderer.xr.getCamera(), o = xc.getWorldPosition(new V3()).applyMatrix4(Dm), f = xc.getWorldDirection(new V3()).transformDirection(Dm); let hit = null;
   for (let t = .2; t < 2.5 && !hit; t += .01) { const x = o.x + f.x * t, y = o.y + f.y * t, z = o.z + f.z * t, id = vmap.get(keyOf(Math.floor(x / VS), Math.floor(y / VS), Math.floor(z / VS))); if (id !== undefined && cnt[id] >= CONF) hit = new V3(x, y, z); }
   const c = hit ? hit.addScaledVector(f, .06) : o.clone().addScaledVector(f, .5);
   det.cur = { c, r: .24 }; det.zones.push(det.cur); det.on = true; zonesSync();
@@ -293,7 +297,7 @@ const tmat = new THREE.ShaderMaterial({
       gl_FragColor = vec4(c, alpha * min(1.0, a)); }`
 });
 const tiles = new THREE.InstancedMesh(tileGeo, tmat, TMAX); tiles.count = 0; tiles.frustumCulled = false; tiles.renderOrder = -1;
-tiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage); scene.add(tiles);
+tiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage); mapRoot.add(tiles);
 const tFree = []; let tLo = Infinity, tHi = -1, tileN = 0; const TXA = new Float32Array(36 * 4), TXB = new Uint32Array(28), NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const _tm = new M4(), _tn = new V3(), _tu = new V3(), _tv = new V3(), _tc = new V3(), UPV = new V3(0, 1, 0), XV = new V3(1, 0, 0);
 function tileSet(c, m, words) {
@@ -543,7 +547,7 @@ function maybeKeyframe(vp, tNow) {
   if (sharp < kf.best * .45) { kf.blurred = (kf.blurred || 0) + 1; return; }
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
-  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(vp.transform.matrix), w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(vp.transform.matrix) };
+  const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m: Array.from(Dm.clone().multiply(new M4().fromArray(vp.transform.matrix)).elements), w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(vp.transform.matrix) };
   kf.cv.toBlob(b => { if (b) { rec.blob = b; DB.putFrame(rec).then(() => kf.n++).catch(() => {}); } kf.busy = false; }, 'image/jpeg', .88);
 }
 function camPump() {                                            // keep one fresh, downscaled camera bitmap ready (decoded asynchronously)
@@ -836,7 +840,7 @@ function alignFrame(cam, V, list, n) {
 
 /* ---------- TSDF: every 2 cm voxel near a surface stores its signed distance to it (truncated at 6 cm), averaged over frames ---------- */
 const TV = .02, BS = 8, B3 = 512, MU = .06, WMAX = 24, RB = 4;
-const TB = new Map(), TREG = new Map(), tDirty = new Map(), tMeshed = new Map();
+let TB = new Map(), TREG = new Map(); const tDirty = new Map(), tMeshed = new Map();
 const bk3 = (i, j, k) => ((i + 8192) * 16384 + (j + 8192)) * 16384 + (k + 8192);
 const unbk = k => { const z = k % 16384 - 8192, r = (k - (z + 8192)) / 16384, y = r % 16384 - 8192, x = (r - (y + 8192)) / 16384 - 8192; return [x, y, z]; };
 function tBlock(bi, bj, bk, make) {
@@ -942,12 +946,103 @@ function concatParts(list) {
   for (const m of list) { P.set(m.P, ov * 3); N.set(m.N, ov * 3); C.set(m.C, ov * 3); for (let k = 0; k < m.I.length; k++) I[oi + k] = m.I[k] + ov; ov += m.P.length / 3; oi += m.I.length; }
   return { P, N, C, I };
 }
+
+/* ---------- tracking: align each new depth frame to the fused surface (SDF tracking, point-to-surface Gauss-Newton) ---------- */
+function tsdfSample(x, y, z, out) {                               // trilinear distance (metres) + gradient; null where the field isn't known
+  const u = x / TV - .5, v = y / TV - .5, w = z / TV - .5, i0 = Math.floor(u), j0 = Math.floor(v), k0 = Math.floor(w), fx = u - i0, fy = v - j0, fz = w - k0;
+  const D = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (let o = 0; o < 8; o++) { const i = i0 + (o & 1), j = j0 + ((o >> 1) & 1), k = k0 + (o >> 2), bi = Math.floor(i / BS), bj = Math.floor(j / BS), bk = Math.floor(k / BS), b = TB.get(bk3(bi, bj, bk)); if (!b) return null;
+    const vi = (i - bi * BS) + (j - bj * BS) * BS + (k - bk * BS) * BS * BS; if (b.w[vi] < .5) return null; D[o] = b.d[vi] * MU; }
+  const c00 = D[0] + (D[1] - D[0]) * fx, c10 = D[2] + (D[3] - D[2]) * fx, c01 = D[4] + (D[5] - D[4]) * fx, c11 = D[6] + (D[7] - D[6]) * fx, c0 = c00 + (c10 - c00) * fy, c1 = c01 + (c11 - c01) * fy;
+  out[0] = c0 + (c1 - c0) * fz;
+  out[1] = ((D[1] - D[0]) * (1 - fy) * (1 - fz) + (D[3] - D[2]) * fy * (1 - fz) + (D[5] - D[4]) * (1 - fy) * fz + (D[7] - D[6]) * fy * fz) / TV;
+  out[2] = ((c10 - c00) * (1 - fz) + (c11 - c01) * fz) / TV; out[3] = (c1 - c0) / TV; return out;
+}
+function camPoints(zf, c, stride) {                               // camera-space points from a depth image (for tracking)
+  const pts = []; const I = c.I, ND = c.ND, R0 = c.R0, DW = c.DW, DH = c.DH;
+  for (let y = 2; y < DH - 2; y += stride) for (let x = 2 + (y / stride & 1) * (stride >> 1); x < DW - 2; x += stride) {
+    const z = zf[y * DW + x]; if (!(z > .25 && z < 3.5)) continue;
+    const u = R0[0] + R0[2] * ((x + .5) / DW + c.jx), v = R0[1] + R0[3] * ((y + .5) / DH + c.jy); let vu = u, vv = v;
+    if (ND) { vu = ND[0] * u + ND[4] * v + ND[12]; vv = ND[1] * u + ND[5] * v + ND[13]; } if (c.flip) vv = 1 - vv;
+    const cx = vu * 2 - 1, cy = vv * 2 - 1, qw = I[3] * cx + I[7] * cy - I[11] + I[15];
+    let px = (I[0] * cx + I[4] * cy - I[8] + I[12]) / qw, py = (I[1] * cx + I[5] * cy - I[9] + I[13]) / qw, pz = (I[2] * cx + I[6] * cy - I[10] + I[14]) / qw; const sc = z / -pz;
+    pts.push(px * sc, py * sc, pz * sc);
+  }
+  return new Float32Array(pts);
+}
+function solve6(H, g) {                                           // H x = g, 6x6, Gaussian elimination with partial pivoting
+  const A = []; for (let i = 0; i < 6; i++) A.push(H.slice(i * 6, i * 6 + 6).concat([g[i]]));
+  for (let c = 0; c < 6; c++) { let p = c; for (let r = c + 1; r < 6; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r; [A[c], A[p]] = [A[p], A[c]]; if (Math.abs(A[c][c]) < 1e-12) return null;
+    for (let r = c + 1; r < 6; r++) { const f = A[r][c] / A[c][c]; for (let k = c; k < 7; k++) A[r][k] -= f * A[c][k]; } }
+  const x = [0, 0, 0, 0, 0, 0]; for (let r = 5; r >= 0; r--) { let s = A[r][6]; for (let k = r + 1; k < 6; k++) s -= A[r][k] * x[k]; x[r] = s / A[r][r]; } return x;
+}
+function minEigRatio(H) {                                         // smallest/largest eigenvalue of the (scaled) 6x6 system: near 0 = sliding along a plane or corridor
+  const A = []; for (let i = 0; i < 6; i++) A.push(H.slice(i * 6, i * 6 + 6));
+  for (let sweep = 0; sweep < 12; sweep++) for (let p = 0; p < 5; p++) for (let q = p + 1; q < 6; q++) { if (Math.abs(A[p][q]) < 1e-14) continue;
+    const th = (A[q][q] - A[p][p]) / (2 * A[p][q]), t = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1)), c = 1 / Math.sqrt(t * t + 1), sn = t * c;
+    for (let k = 0; k < 6; k++) { const a = A[k][p], b = A[k][q]; A[k][p] = c * a - sn * b; A[k][q] = sn * a + c * b; }
+    for (let k = 0; k < 6; k++) { const a = A[p][k], b = A[q][k]; A[p][k] = c * a - sn * b; A[q][k] = sn * a + c * b; } }
+  const ev = A.map((r, i) => r[i]); return Math.min(...ev) / Math.max(...ev);
+}
+function icp(pts, X0, iters, maxT, maxR) {
+  let X = X0.slice(); const n = pts.length / 3, s = [0, 0, 0, 0], K = .012; let used = 0, rms = 0, ratio = 0;
+  for (let it = 0; it < iters; it++) {
+    const H = new Array(36).fill(0), g = [0, 0, 0, 0, 0, 0], cx = X[12], cy = X[13], cz = X[14]; used = 0; let e2 = 0;
+    for (let q = 0; q < n; q++) {
+      const a = pts[q * 3], b = pts[q * 3 + 1], c = pts[q * 3 + 2], wx = X[0] * a + X[4] * b + X[8] * c + X[12], wy = X[1] * a + X[5] * b + X[9] * c + X[13], wz = X[2] * a + X[6] * b + X[10] * c + X[14];
+      if (!tsdfSample(wx, wy, wz, s)) continue; const r = s[0]; if (Math.abs(r) > .8 * MU) continue; const gl = Math.hypot(s[1], s[2], s[3]); if (gl < .5) continue;
+      const gx = s[1] / gl, gy = s[2] / gl, gz = s[3] / gl, rr = r / gl, px = wx - cx, py = wy - cy, pz = wz - cz;
+      const J = [gx, gy, gz, py * gz - pz * gy, pz * gx - px * gz, px * gy - py * gx], hw = Math.abs(rr) < K ? 1 : K / Math.abs(rr);
+      for (let i = 0; i < 6; i++) { g[i] -= hw * J[i] * rr; for (let j = 0; j < 6; j++) H[i * 6 + j] += hw * J[i] * J[j]; } used++; e2 += rr * rr;
+    }
+    if (used < 150) return { ok: false, used };
+    rms = Math.sqrt(e2 / used); if (it === 0) ratio = minEigRatio(H);
+    for (let i = 0; i < 6; i++) H[i * 7] *= 1.0001;
+    const x = solve6(H, g); if (!x) return { ok: false, used };
+    const [tx, ty, tz, ox, oy, oz] = x, th = Math.hypot(ox, oy, oz);
+    let R; if (th < 1e-9) R = [1, 0, 0, 0, 1, 0, 0, 0, 1]; else { const kx = ox / th, ky = oy / th, kz = oz / th, c = Math.cos(th), sn = Math.sin(th), v = 1 - c;
+      R = [c + kx * kx * v, ky * kx * v + kz * sn, kz * kx * v - ky * sn, kx * ky * v - kz * sn, c + ky * ky * v, kz * ky * v + kx * sn, kx * kz * v + ky * sn, ky * kz * v - kx * sn, c + kz * kz * v]; }   // column-major 3x3
+    const Y = X.slice();                                           // X <- [R about camera centre, t] · X
+    for (let col = 0; col < 3; col++) for (let row = 0; row < 3; row++) Y[col * 4 + row] = R[row] * X[col * 4] + R[3 + row] * X[col * 4 + 1] + R[6 + row] * X[col * 4 + 2];
+    Y[12] = cx + tx; Y[13] = cy + ty; Y[14] = cz + tz; X = Y;
+    if (Math.hypot(tx, ty, tz) < 1e-4 && th < 1e-4) break;
+  }
+  const dt = Math.hypot(X[12] - X0[12], X[13] - X0[13], X[14] - X0[14]), dr = Math.acos(Math.min(1, (X[0] * X0[0] + X[1] * X0[1] + X[2] * X0[2] + X[4] * X0[4] + X[5] * X0[5] + X[6] * X0[6] + X[8] * X0[8] + X[9] * X0[9] + X[10] * X0[10] - 1) / 2));
+  return { X, ok: used >= 150 && rms < .012 && ratio > 2e-4 && dt < maxT && dr < maxR, used, rms, ratio, dt, dr };
+}
+const mul4 = (A, B) => { const C = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) C[c * 4 + r] = A[r] * B[c * 4] + A[4 + r] * B[c * 4 + 1] + A[8 + r] * B[c * 4 + 2] + A[12 + r] * B[c * 4 + 3]; return C; };
+const inv4r = X => { const R = [X[0], X[4], X[8], 0, X[1], X[5], X[9], 0, X[2], X[6], X[10], 0, 0, 0, 0, 1]; R[12] = -(R[0] * X[12] + R[4] * X[13] + R[8] * X[14]); R[13] = -(R[1] * X[12] + R[5] * X[13] + R[9] * X[14]); R[14] = -(R[2] * X[12] + R[6] * X[13] + R[10] * X[14]); return R; };
+/* a stored raw frame -> what integration needs */
+function rawCtx(f, X) {
+  const n = f.DW * f.DH, zf = new Float32Array(n); for (let k = 0; k < n; k++) zf[k] = f.mm[k] / 1000;
+  const c = { I: f.INV, ND: f.ND, R0: f.R0, DW: f.DW, DH: f.DH, jx: f.jx, jy: f.jy, flip: f.flip }, pts = camPoints(zf, c, 2), rays = new Float32Array(pts.length / 3 * 4);
+  for (let q = 0; q < pts.length / 3; q++) { const a = pts[q * 3], b = pts[q * 3 + 1], cc = pts[q * 3 + 2]; rays[q * 4] = X[0] * a + X[4] * b + X[8] * cc + X[12]; rays[q * 4 + 1] = X[1] * a + X[5] * b + X[9] * cc + X[13]; rays[q * 4 + 2] = X[2] * a + X[6] * b + X[10] * cc + X[14]; rays[q * 4 + 3] = -cc; }
+  return { X, rays, nr: pts.length / 3, PRJ: f.PRJ, NDI: f.NDI, flip: f.flip, R0: f.R0, DW: f.DW, DH: f.DH, jx: f.jx, jy: f.jy, zf, cam: null, V: null, moving: false, now: 0 };
+}
+/* offline refinement: fuse everything, re-align every frame to that consensus surface, fuse again with the corrected poses */
+function refine(frames, oldT, report) {
+  const OLD = new Map(); if (oldT) { tsdfUnpack(oldT, null); for (const [k, b] of TB) OLD.set(k, b); }
+  const fuse = Xs => { TB = new Map(); TREG = new Map(); frames.forEach((f, i) => tsdfIntegrate(rawCtx(f, Xs[i]))); };
+  let Xs = frames.map(f => f.X), moved = [];
+  for (let pass = 0; pass < 2; pass++) {
+    fuse(Xs); report('pass ' + (pass + 1) + ': re-aligning ' + frames.length + ' frames');
+    Xs = frames.map((f, i) => { const zf = new Float32Array(f.DW * f.DH); for (let k = 0; k < zf.length; k++) zf[k] = f.mm[k] / 1000;
+      const r = icp(camPoints(zf, { I: f.INV, ND: f.ND, R0: f.R0, DW: f.DW, DH: f.DH, jx: f.jx, jy: f.jy, flip: f.flip }, 3), Xs[i], 8, .15, .1); if (r.ok) { moved[i] = r.dt; return r.X; } moved[i] = 0; return Xs[i]; });
+  }
+  { const G = mul4(frames[0].X, inv4r(Xs[0])); Xs = Xs.map(X => mul4(G, X)); }   // keep the first frame where it was: the scan doesn't slide as a whole
+  fuse(Xs); report('colouring');
+  for (const [k, b] of TB) { const o = OLD.get(k); if (!o) continue; for (let v = 0; v < B3; v++) if (o.cw[v] > 0) { b.c[v * 3] = o.c[v * 3]; b.c[v * 3 + 1] = o.c[v * 3 + 1]; b.c[v * 3 + 2] = o.c[v * 3 + 2]; b.cw[v] = o.cw[v]; } }
+  const corr = frames.map((f, i) => mul4(Xs[i], inv4r(f.X)));
+  const mv = moved.filter(x => x > 0).sort((a, b) => a - b);
+  return { corr, median: mv.length ? mv[mv.length >> 1] : 0, aligned: mv.length };
+}
 let OC = null, OCX = null;
 onmessage = e => {
   const d = e.data;
   if (d.resetAlign) { AL.slots.clear(); AL.acc.fill(0); AL.frames = 0; AL.done = false; return; }
   if (d.resetKnown) { HK.fill(0); hN = 0; FK.clear(); return; }
   if (d.tsdfReset) { TB.clear(); TREG.clear(); tDirty.clear(); tMeshed.clear(); return; }
+  if (d.refine) { const res = refine(d.frames, d.tsdf, m => postMessage({ refineMsg: m })); const t = tsdfPack(); postMessage({ refined: d.refine, t, corr: res.corr, median: res.median, aligned: res.aligned }); return; }
   if (d.tsdfLoad) { tsdfUnpack(d.tsdfLoad, d.T); return; }
   if (d.tsdfDump) { const t = tsdfPack(); postMessage({ tsdfDump: d.tsdfDump, t }, [t.keys.buffer, t.d.buffer, t.w.buffer, t.c.buffer]); return; }
   if (d.tsdfMeshAll) { const all = concatParts(meshRegions([...TREG.keys()], d.zones || [], d.floorY || 0)); postMessage({ meshAll: d.tsdfMeshAll, m: all }, [all.P.buffer, all.N.buffer, all.C.buffer, all.I.buffer]); return; }
@@ -982,7 +1077,12 @@ onmessage = e => {
     for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) { if (!i && !j) continue; const zn = zs[k + j * DW + i]; if (Math.abs(zn - z) > tol) continue; const w = i && j ? .25 : .5; sw += w; sz += zn * w; }
     zf[k] = sz / sw;
   }
-  const I = d.inv, X = d.xf, ND = d.nd, flip = d.flip, fpx = 2 * R0[2] / (d.P0 * DW), fpy = 2 * R0[3] / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
+  let X = d.xf; const I = d.inv, ND = d.nd, flip = d.flip, fpx = 2 * R0[2] / (d.P0 * DW), fpy = 2 * R0[3] / (d.P5 * DH), H = d.head, hands = d.hands, cam = d.cam, V = d.vinv;
+  let track = null;
+  if (!F && d.tsdf && d.icp && TB.size > 150) {                     // align to the surface fused so far: removes drift and leftover lag
+    const t0 = performance.now(), r = icp(camPoints(zf, { I, ND, R0, DW, DH, jx: d.jx, jy: d.jy, flip }, 4), X, 6, .04, .035);
+    track = { ok: r.ok, used: r.used, rms: r.rms, ratio: r.ratio, dt: r.dt, ms: performance.now() - t0 }; if (r.ok) X = r.X;
+  }
   const VS = F ? d.VSF : d.VS, key = (x, y, z) => ((Math.floor(x / VS) + 8192) * 16384 + (Math.floor(y / VS) + 8192)) * 16384 + (Math.floor(z / VS) + 8192);
   const vox = new Map(), car = new Map(), out = new Float32Array(n * 11), rays = new Float32Array(n); let np = 0, nr = 0; FR++; const fo = FR % 2, go = ((FR / 2) | 0) % 2;
   const TR = F ? .25 : .42, TT = F ? -.3 : .25, HR = F ? .01 : .0256;   // close-up work: a slimmer body/hand exclusion so near objects survive
@@ -1048,7 +1148,9 @@ onmessage = e => {
   let align = null;
   if (!F && cam && cam.align && !AL.done) { const L = new Float32Array(np * 4); let m = 0; for (const [vk, o] of vox) { if (vk % 53) continue; L[m * 4] = out[o]; L[m * 4 + 1] = out[o + 1]; L[m * 4 + 2] = out[o + 2]; L[m * 4 + 3] = vk; m++; } align = alignFrame(cam, V, L, m); }
   const P = out.slice(0, np * 11);
-  let meshes = null, tsdfBlocks = 0, tms = 0;
+  let meshes = null, tsdfBlocks = 0, tms = 0, raw = null;
+  if (!F && d.tsdf && d.saveRaw) { const mm = new Uint16Array(DW * DH); for (let k = 0; k < mm.length; k++) { const z = zf[k]; mm[k] = z > .2 && z < 6 ? Math.round(z * 1000) : 0; }
+    raw = { mm, DW, DH, INV: I, PRJ: d.PRJ, NDI: d.NDI, ND, flip, R0, jx: d.jx, jy: d.jy, X: Array.from(X) }; }
   if (!F && d.tsdf && d.PRJ) {
     const t0 = performance.now(), now = t0;
     tsdfBlocks = tsdfIntegrate({ X, rays, nr, PRJ: d.PRJ, NDI: d.NDI, flip, R0, DW, DH, jx: d.jx, jy: d.jy, zf, cam, V, moving: d.moving, now, gain: d.gain });
@@ -1057,12 +1159,12 @@ onmessage = e => {
     if (pick.length) { meshes = meshRegions(pick, d.zones || [], d.floorY || 0); for (const rk of pick) { tMeshed.set(rk, now); tDirty.delete(rk); } }
     tms = performance.now() - t0;
   }
-  postMessage({ P, C, np, nc, valid, meshes, tsdfBlocks, tms, regions: TREG.size, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer].concat(meshes ? meshes.flatMap(m => [m.P.buffer, m.N.buffer, m.C.buffer, m.I.buffer]) : []));
+  postMessage({ P, C, np, nc, valid, meshes, tsdfBlocks, tms, regions: TREG.size, track, raw, corr: track && track.ok ? mul4(X, inv4r(d.xf)) : null, cam: [X[12], X[13], X[14]], t: d.t, gen: d.gen, align, rem, add, noOC, fine: F, moving: d.moving, lagB: d.lagB, lagUsed: d.lagUsed }, [P.buffer, C.buffer].concat(raw ? [raw.mm.buffer] : [], meshes ? meshes.flatMap(m => [m.P.buffer, m.N.buffer, m.C.buffer, m.I.buffer]) : []));
 };`;
 let integ = null; const applyQ = [], wReq = new Map(); let wReqN = 0, tsdfOn = true;
 function workerAsk(w, msg, key) { return new Promise(res => { const id = ++wReqN; wReq.set(id, res); msg[key] = id; w.postMessage(msg); }); }
 /* the live mesh: one small mesh per 64 cm region, replaced as the worker re-meshes it */
-const tsdfG = new THREE.Group(); scene.add(tsdfG); const liveM = new Map();
+const tsdfG = new THREE.Group(); mapRoot.add(tsdfG); const liveM = new Map();
 const liveMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: .8 });
 function liveMeshes(list) {
   for (const m of list) {
@@ -1095,6 +1197,9 @@ function integWorker() {
     if (d.tsdfDump || d.meshAll) { const f = wReq.get(d.tsdfDump || d.meshAll); wReq.delete(d.tsdfDump || d.meshAll); if (f) f(d.t || d.m); return; }
     depth.wBusy = false; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
     if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
+    if (d.corr) { setD(new M4().fromArray(d.corr).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
+    if (d.track) { depth.track = d.track; depth.trackOK = (depth.trackOK || 0) * .9 + (d.track.ok ? .1 : 0); }
+    if (d.raw && scanning && !replayMode) { if (!currentId) currentId = 'scan-' + Date.now(); DB.putDepth(Object.assign(d.raw, { scan: currentId, k: currentId + '/d' + Date.now(), t: Date.now() })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
     if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
     exposureMatch(d);
     if (d.moving) { lagTest(d); if (!depth.lagOK || (d.lagUsed || 0) !== (depth.lag || 0)) return;   // a moving frame is fused only once the lag is known
@@ -1106,16 +1211,19 @@ function integWorker() {
 function postIntegration(M) {                                       // hand a depth frame to the worker (after calibration and warm-up)
   const cfg = depth.cfg, src = cfg.src === 'info' && M.projI ? 'info' : 'view', inv = src === 'info' ? M.projI : M.projV, L = depth.lag || 0;
   let xf = src === 'info' ? M.xfI : M.xfV; if (L) { const R = lagRel(M, L, 0); if (R) xf = R.clone().multiply(xf); }   // where the head really was when the depth was taken
+  xf = Dm.clone().multiply(xf);                                    // into the map frame
+  const hd = M.head.clone().applyMatrix4(Dm), vinvD = M.vinv.clone().multiply(Dinv), nowMs = Date.now(), saveRaw = !M.fine && !M.moving && nowMs - (depth.rawT || 0) > 500;
+  if (saveRaw) depth.rawT = nowMs;
   let nd = null; if (cfg.nd && M.ndRaw) nd = Array.from((cfg.nd === 1 ? new M4().copy(M.ndRaw).invert() : M.ndRaw).elements);
   let cam = null;
   if (M.cam && (M.cam.bmp || M.cam.data)) { cam = { bmp: M.cam.bmp || null, data: M.cam.bmp ? null : M.cam.data, w: M.cam.w, h: M.cam.h, f: M.cam.f, asp: M.cam.asp, cx: M.cam.cx || 0, cy: M.cam.cy, align: !colorCam.aligned }; if (!M.cam.bmp) { colorCam.data = null; colorCam.t = 0; } }   // hand the frame over; grab a fresh one next time
   const msg = { DW, DH, VS, MG, metaEdit: useMeta && !depth.metaStale && depth.agree != null && depth.agree > .4, gen: depth.gen || 0, buf: depthBuf.slice(), near: M.near, far: M.far, r2m: M.r2m, rvm: M.rvm, lumA: M.lumA, mode: cfg.mode || depth.mode, jx: M.jx, jy: M.jy,
     inv: Array.from(inv.elements), xf: Array.from(xf.elements), nd, flip: !!cfg.flip, P0: 1 / inv.elements[0], P5: 1 / inv.elements[5],
-    head: [M.head.x, M.head.y, M.head.z], hands: M.hands.map(h => [h.x, h.y, h.z]), cam, vinv: Array.from(M.vinv.elements), t: M.tNow,
+    head: [hd.x, hd.y, hd.z], hands: M.hands.map(h => { const v = h.clone().applyMatrix4(Dm); return [v.x, v.y, v.z]; }), cam, vinv: Array.from(vinvD.elements), t: M.tNow, icp: icpOn, saveRaw,
     fine: !!M.fine, VSF, roi: M.roi || null, zone: M.zone || null,
     PRJ: Array.from(inv.clone().invert().elements), NDI: cfg.nd && M.ndRaw ? Array.from((cfg.nd === 1 ? M.ndRaw : new M4().copy(M.ndRaw).invert()).elements) : null,
     tsdf: !M.fine && tsdfOn && (!M.moving || (depth.lagOK && L === (depth.lag || 0))), zones: det.zones.map(z => [z.c.x, z.c.y, z.c.z, z.r]), floorY: pmat.uniforms.floorY.value, gain: depth.expGain || 1,
-    moving: M.moving, lagUsed: L, lagB: !M.fine && M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(lagRel(M, k, L).elements)) : null };
+    moving: M.moving, lagUsed: L, lagB: !M.fine && M.moving && M.H && M.H.length >= LAGS ? Array.from({ length: LAGS }, (_, k) => Array.from(Dm.clone().multiply(lagRel(M, k, L)).multiply(Dinv).elements)) : null };
   depth.wBusy = true; depth.postT = performance.now();
   integWorker().postMessage(msg, [msg.buf.buffer].concat(cam ? [cam.bmp || cam.data.buffer] : []));
 }
@@ -1178,14 +1286,16 @@ const coverage = () => metaSurf.n > 3000 && !depth.metaStale ? Math.min(1, cov.d
 const DB = (() => {
   let db = null;
   const open = () => db ? Promise.resolve(db) : new Promise((res, rej) => {
-    const r = indexedDB.open('house-scanner', 2);
-    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); };
+    const r = indexedDB.open('house-scanner', 3);
+    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('scans')) d.createObjectStore('scans', { keyPath: 'id' }); if (!d.objectStoreNames.contains('frames')) d.createObjectStore('frames', { keyPath: 'k' }).createIndex('scan', 'scan'); if (!d.objectStoreNames.contains('depth')) d.createObjectStore('depth', { keyPath: 'k' }).createIndex('scan', 'scan'); };
     r.onsuccess = () => res(db = r.result); r.onerror = () => rej(r.error);
   });
   const tx = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), st = t.objectStore(store), q = fn(st); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
   return {
     put: o => tx('scans', 'readwrite', s => s.put(o)), all: () => tx('scans', 'readonly', s => s.getAll()), get: id => tx('scans', 'readonly', s => s.get(id)), del: id => tx('scans', 'readwrite', s => s.delete(id)),
     putFrame: o => tx('frames', 'readwrite', s => s.put(o)), frames: id => tx('frames', 'readonly', s => s.index('scan').getAll(id)), countFrames: id => tx('frames', 'readonly', s => s.index('scan').count(id)),
+    putDepth: o => tx('depth', 'readwrite', s => s.put(o)), depthFrames: id => tx('depth', 'readonly', s => s.index('scan').getAll(id)), countDepth: id => tx('depth', 'readonly', s => s.index('scan').count(id)),
+    delDepth: id => tx('depth', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; }),
     delFrames: id => tx('frames', 'readwrite', s => { const ix = s.index('scan'), q = ix.openKeyCursor(IDBKeyRange.only(id)); q.onsuccess = () => { const c = q.result; if (c) { s.delete(c.primaryKey); c.continue(); } }; return null; })
   };
 })();
@@ -1220,7 +1330,7 @@ function snapshot() {
 }
 async function saveScan(frame) {
   const tsdf = await Promise.race([tsdfDump(), new Promise(r => setTimeout(() => r(null), 4000))]);
-  const s = snapshot(); if (tsdf && tsdf.keys.length) s.tsdf = tsdf; if (!s.points.length) { toast('Nothing captured yet'); return; }
+  const s = snapshot(); if (tsdf && tsdf.keys.length) s.tsdf = tsdf; s.D = Array.from(Dm.elements); if (!s.points.length) { toast('Nothing captured yet'); return; }
   const rec = Object.assign(s, { id: currentId || ('scan-' + Date.now()), name: currentId ? undefined : 'House scan', date: Date.now() });
   if (!rec.name) { const old = await DB.get(currentId); rec.name = old ? old.name : 'House scan'; }
   /* a persistent anchor at the scan origin: next time, the headset relocates it and the scan snaps back into place */
@@ -1244,6 +1354,7 @@ async function loadIntoSession(rec) {
   mergeRecord(rec, T);
 }
 function mergeRecord(rec, T) {
+  if (rec.D && !viewer.on) T = T.clone().multiply(new M4().fromArray(rec.D).invert());   // saved in that session's map frame
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
   fineIn(rec, T);
@@ -1336,6 +1447,23 @@ function plyBlob(rec) {
   return new Blob([head, body.buffer], { type: 'application/octet-stream' });
 }
 /* glTF binary: coloured point cloud, Quest room meshes (in world space), wall/stair/object boxes, understanding in extras */
+/* offline refinement of a saved scan from its raw depth frames: re-align every frame to the consensus surface and re-fuse */
+async function refineScan(rec) {
+  const st = $('st'); st.textContent = 'Loading depth frames…';
+  const fr = (await DB.depthFrames(rec.id).catch(() => [])).sort((a, b) => a.t - b.t);
+  if (fr.length < 20) { st.textContent = 'Not enough raw depth frames saved with this scan (' + fr.length + '). Scans made from now on keep them.'; return; }
+  const w = new Worker(URL.createObjectURL(new Blob([INTEG_SRC], { type: 'text/javascript' }))), t0 = performance.now();
+  const res = await new Promise((ok, no) => { w.onmessage = e => { if (e.data.refineMsg) st.textContent = 'Refining: ' + e.data.refineMsg + '…'; if (e.data.refined) ok(e.data); }; w.onerror = e => no(new Error(e.message || 'refine failed'));
+    st.textContent = 'Refining ' + fr.length + ' frames…'; w.postMessage({ refine: 1, frames: fr, tsdf: rec.tsdf || null }); }).catch(e => { st.textContent = 'Refine failed: ' + e.message; return null; });
+  w.terminate(); if (!res) return;
+  rec.tsdf = res.t; delete rec.meshCache; rec.refined = { frames: fr.length, aligned: res.aligned, median_m: res.median, at: Date.now() };
+  /* photos: move each one by the correction of the depth frame taken closest to it */
+  const kfs = await DB.frames(rec.id).catch(() => []); let moved = 0;
+  for (const k of kfs) { let best = -1, bd = 2500; fr.forEach((f, i) => { const dt = Math.abs(f.t - k.t); if (dt < bd) { bd = dt; best = i; } });
+    if (best >= 0) { k.m = Array.from(new M4().fromArray(res.corr[best]).multiply(new M4().fromArray(k.m)).elements); await DB.putFrame(k); moved++; } }
+  await DB.put(rec);
+  st.textContent = 'Refined in ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s: ' + res.aligned + '/' + fr.length + ' frames re-aligned (median shift ' + (res.median * 1000).toFixed(0) + ' mm), ' + moved + ' photos updated';
+}
 async function exportGLB(rec) {
   $('st').textContent = rec.meshCache ? 'Packing the mesh…' : 'Building the 3D mesh… (up to a minute for a whole house)'; await new Promise(r => setTimeout(r, 30));
   let parts; try { parts = await recMesh(rec); } catch (e) { $('st').textContent = 'Meshing failed: ' + e.message; return; }
@@ -1735,6 +1863,7 @@ const BTN = () => page === 0 ? [
   { id: 'color', label: colorCam.on ? 'Camera colour ✓' : 'Camera colour', on: colorCam.on },
   { id: 'view', label: ['Show: dots', 'Show: solid points', 'Show: nothing', 'Show: live mesh'][showMode] },
   { id: 'meta', label: useMeta ? 'Use Meta data ✓' : 'Use Meta data', on: useMeta },
+  { id: 'drift', label: icpOn ? 'Drift fix ✓' : 'Drift fix', on: icpOn },
   { id: 'recal', label: 'Recalibrate' },
   { id: 'room', label: 'Redo Meta scan' },
   { id: 'clear', label: 'Clear map' },
@@ -1753,7 +1882,7 @@ function diagSnapshot() {
   return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps),
     session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
-      lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
+      lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
     map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
@@ -1828,7 +1957,7 @@ function drawPanel() {
       'depth   ' + (depth.tooFast ? 'paused: too fast' : depth.status) + ' · lag ' + (depth.lag || 0) + (depth.lagOK ? ' ✓' : ''),
       'meta    ' + (metaSurf.n > 3000 ? (depth.agree != null ? Math.round(depth.agree * 100) + '% match' : 'checking') : 'no scan') + ' · cover ' + cov.done.size + '/' + metaSurf.n + ' · edits −' + lay.removed.size + ' +' + lay.added.size,
       'sensor  ' + (depth.sensor || '-') + ' ' + (depth.modeName || ''),
-      'mesh    ' + liveM.size + ' regions · fuse ' + (depth.tsdfMs || 0).toFixed(0) + ' ms',
+      'mesh    ' + liveM.size + ' regions · fuse ' + (depth.tsdfMs || 0).toFixed(0) + ' ms · track ' + Math.round((depth.trackOK || 0) * 100) + '% · drift ' + (new V3().setFromMatrixPosition(Dm).length() * 100).toFixed(1) + ' cm · raw ' + (depth.rawN || 0),
       'clean   ' + cleaned.toLocaleString() + ' strays · ' + erased.toLocaleString() + ' moved-away erased · ' + tileN.toLocaleString() + ' flat tiles · fps ' + Math.round(fps),
       'camera  ' + colorCam.status + (colorCam.on ? (colorCam.aligned ? ' · aligned' : ' · aligning…') + ' · exposure ×' + (depth.expGain || 1).toFixed(2) : ''),
             ...(scanErr ? ['ERROR   ' + scanErr] : [])
@@ -1846,6 +1975,7 @@ function buzz(src, k = .4, ms = 25) { try { const a = src && src.gamepad && src.
 async function press(id, frame) {
   if (id === 'scan') { scanning = !scanning; toast(scanning ? 'Scanning' : 'Paused'); }
   if (id === 'more') page = 1;
+  if (id === 'drift') { icpOn = !icpOn; toast(icpOn ? 'Drift correction on' : 'Drift correction off'); }
   if (id === 'surf') { surfOn = !surfOn; applySurf(); }
   if (id === 'detail') { if (det.on) endDetail(); else if (!workerPathReady()) toast('Wait until scanning has started'); else startDetail(); }
   if (id === 'back') page = 0;
@@ -1952,8 +2082,9 @@ async function listScans() {
     mk('Continue', () => { pendingOpen = r; if (!$('bAR').disabled) $('bAR').click(); else $('st').textContent = 'Continuing a scan needs the Quest browser.'; });
     mk('View', () => openViewer(r));
     mk('.json', () => exportJSON(r)); mk('.ply', () => exportPLY(r)); mk('.glb', () => exportGLB(r));
+    mk('Refine', () => refineScan(r));
     mk('Rename', async () => { const nm = prompt('Name this scan', r.name); if (nm) { r.name = nm; await DB.put(r); listScans(); } });
-    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
+    mk('Delete', async () => { if (confirm('Delete "' + r.name + '"?')) { if (r.anchor && r.anchor.uuid && xrSession && xrSession.deletePersistentAnchor) xrSession.deletePersistentAnchor(r.anchor.uuid).catch(() => {}); await DB.del(r.id); DB.delDepth(r.id).catch(() => {}); await DB.delFrames(r.id).catch(() => {}); listScans(); } });
     el.appendChild(row);
   }
 }
