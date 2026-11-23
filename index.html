@@ -196,32 +196,38 @@ const depthBuf = new Uint8Array(DW * DH * 4);
 /* after raw GL work, three.js must be told its state is unknown, but the reset also forgets the headset's
    render target: put it back, or the whole view is drawn off-screen (a black headset) */
 function glBack() { const rt = renderer.getRenderTarget(); renderer.resetState(); renderer.setRenderTarget(rt); }
-const DR = { gl: null, prog: null, fbo: null, tex: null, vbo: null, u: {} };
-function depthReaderInit(gl) {
+const DR = { progs: {}, isInt: null, gl: null, prog: null, fbo: null, tex: null, vbo: null, u: {} };
+function depthProgram(gl, isArr, isInt) {
+  const key = (isArr ? 'a' : '2') + (isInt ? 'u' : 'f'); if (DR.progs[key]) return DR.progs[key];
   const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+  const samp = (isInt ? 'u' : '') + (isArr ? 'sampler2DArray' : 'sampler2D');
+  const fetch = isArr ? 'texelFetch(t, ivec3(c, layer), 0)' : 'texelFetch(t, c, 0)';
   const vs = `#version 300 es
     in vec2 p; out vec2 uv; void main(){ uv = p * .5 + .5; gl_Position = vec4(p, 0., 1.); }`;
   const fs = `#version 300 es
-    precision highp float; precision highp int; precision highp sampler2DArray;
-    uniform sampler2DArray tA; uniform sampler2D t2; uniform int arr, layer, fmt; uniform vec2 jit; in vec2 uv; out vec4 o;
+    precision highp float; precision highp int; precision highp ${samp};
+    uniform ${samp} t; uniform int layer, fmt; uniform vec2 jit; in vec2 uv; out vec4 o;
     vec3 pack24(float v){ v = clamp(v, 0., 1.) * 16777215.; float r = floor(v / 65536.), g = floor((v - r * 65536.) / 256.), b = v - r * 65536. - g * 256.; return vec3(r, g, b) / 255.; }
     void main(){
-      ivec2 sz = arr == 1 ? textureSize(tA, 0).xy : textureSize(t2, 0);
-      ivec2 c = ivec2(clamp(uv + jit, 0., .9999) * vec2(sz));
-      vec4 s = arr == 1 ? texelFetch(tA, ivec3(c, layer), 0) : texelFetch(t2, c, 0);
+      ivec2 sz = textureSize(t, 0).xy; ivec2 c = ivec2(clamp(uv + jit, 0., .9999) * vec2(sz));
+      ${isInt ? 'float raw = float(' + fetch + '.r) / 65535.; o = vec4(pack24(raw), 0.); return;' : `vec4 s = ${fetch};
       if (fmt == 1) { o = vec4(s.r, s.a, 0., 128. / 255.); return; }
       float raw = s.r;
-      if (raw > 1.0) o = vec4(pack24(raw / 32.), 1.); else o = vec4(pack24(raw), 0.);
+      if (raw > 1.0) o = vec4(pack24(raw / 32.), 1.); else o = vec4(pack24(raw), 0.);`}
     }`;
   const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr);
   if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
-  DR.prog = pr; for (const n of ['tA', 't2', 'arr', 'layer', 'fmt', 'jit']) DR.u[n] = gl.getUniformLocation(pr, n);
+  const P = { pr, t: gl.getUniformLocation(pr, 't'), layer: gl.getUniformLocation(pr, 'layer'), fmt: gl.getUniformLocation(pr, 'fmt'), jit: gl.getUniformLocation(pr, 'jit'), loc: gl.getAttribLocation(pr, 'p') };
+  return DR.progs[key] = P;
+}
+function depthReaderInit(gl) {
+  DR.progs = {};
   DR.vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, DR.vbo); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
   DR.tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, DR.tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, DW, DH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   DR.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, DR.fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, DR.tex, 0);
   if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('depth framebuffer incomplete');
-  DR.gl = gl;
+  DR.gl = gl; DR.isInt = null;
 }
 function depthReady() {                                    // true once the background copy has landed in depthBuf
   if (!DR.sync) return false;
@@ -231,23 +237,31 @@ function depthReady() {                                    // true once the back
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, depthBuf); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   glBack(); return true;
 }
-function readDepth(info, isArr, layer, lumA, jx, jy) {
+function readDepth(info, isArr, layer, lumA, jx, jy, fmtName) {
   const gl = renderer.getContext();
   if (!DR.gl) depthReaderInit(gl);
+  /* 16-bit depth may arrive as an integer texture (needs an integer sampler) or a normalised one: try float, fall back on a GL error */
+  if (DR.isInt === null) DR.isInt = false;
   const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, DR.fbo); gl.viewport(0, 0, DW, DH);
-  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.disable(gl.SCISSOR_TEST); gl.colorMask(true, true, true, true);
-  gl.useProgram(DR.prog);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, isArr ? info.texture : null);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, isArr ? null : info.texture);
-  gl.uniform1i(DR.u.tA, 0); gl.uniform1i(DR.u.t2, 1); gl.uniform1i(DR.u.arr, isArr ? 1 : 0); gl.uniform1i(DR.u.layer, layer); gl.uniform1i(DR.u.fmt, lumA ? 1 : 0); gl.uniform2f(DR.u.jit, jx, jy);
-  gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, DR.vbo);
-  const loc = gl.getAttribLocation(DR.prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const P = depthProgram(gl, isArr, DR.isInt);
+    while (gl.getError() !== gl.NO_ERROR) {}                                  // clear stale errors
+    gl.bindFramebuffer(gl.FRAMEBUFFER, DR.fbo); gl.viewport(0, 0, DW, DH);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.disable(gl.SCISSOR_TEST); gl.colorMask(true, true, true, true);
+    gl.useProgram(P.pr);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(isArr ? gl.TEXTURE_2D_ARRAY : gl.TEXTURE_2D, info.texture);
+    gl.uniform1i(P.t, 0); gl.uniform1i(P.layer, layer); gl.uniform1i(P.fmt, lumA ? 1 : 0); gl.uniform2f(P.jit, jx, jy);
+    gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, DR.vbo); gl.enableVertexAttribArray(P.loc); gl.vertexAttribPointer(P.loc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const err = gl.getError();
+    gl.disableVertexAttribArray(P.loc);
+    if (err === gl.NO_ERROR) break;
+    if (attempt === 0 && !lumA) { DR.isInt = !DR.isInt; continue; }                // wrong sampler kind for this texture: switch and retry
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB); glBack(); throw new Error('GL error ' + err + ' reading ' + (fmtName || 'depth'));
+  }
   if (!DR.pbo) { DR.pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.bufferData(gl.PIXEL_PACK_BUFFER, DW * DH * 4, gl.STREAM_READ); }
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, DR.pbo); gl.readPixels(0, 0, DW, DH, gl.RGBA, gl.UNSIGNED_BYTE, 0); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   DR.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); gl.flush();             // the GPU copies it out in the background
-  gl.disableVertexAttribArray(loc);
   gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
   glBack();                                               // hand GL back to three.js, keeping the headset's target
 }
@@ -296,7 +310,7 @@ function sampleDepth(frame, ref, session, tNow) {
   depth.vi = (depth.vi + 1) % vp.views.length; const view = vp.views[depth.vi] || vp.views[0]; let info = null;
   const freeze = (extra) => Object.assign({
     tNow, xf: new M4().fromArray(((info && info.transform) || view.transform).matrix), inv: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).invert(),
-    PE: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).elements, nd: new M4(), head: new V3().setFromMatrixPosition(vp.transform.matrix), fwdY: -vp.transform.matrix[9],
+    PE: new M4().fromArray((info && info.projectionMatrix) || view.projectionMatrix).elements, nd: new M4(), head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), fwdY: -vp.transform.matrix[9],
     hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix) }, extra);
   if (depth.cpu) {                                               // CPU depth: the browser hands us metres directly
     try { info = frame.getDepthInformation(view); } catch (e) { depth.status = 'error: ' + e.message; return; }
@@ -310,7 +324,7 @@ function sampleDepth(frame, ref, session, tNow) {
   if (!info || !info.texture) { depth.status = 'waiting'; return; }
   const isArr = info.textureType === 'texture-array', lumA = session.depthDataFormat === 'luminance-alpha';
   const jx = Math.random() / DW, jy = Math.random() / DH;          // sub-pixel jitter: over time every depth pixel gets read
-  try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
+  try { readDepth(info, isArr, info.imageIndex ?? depth.vi, lumA, jx, jy, session.depthDataFormat); } catch (e) { depth.status = 'read failed: ' + e.message; glBack(); return; }
   /* everything the integration needs, frozen at this instant (the pixels arrive a frame or two later) */
   depth.sensor = (isArr ? 'array' : '2d') + ' ' + (info.width || '?') + '×' + (info.height || '?') + ' near ' + (+(info.depthNear ?? session.renderState.depthNear)).toFixed(2) + ' far ' + (+(info.depthFar ?? session.renderState.depthFar)).toFixed(1);
   depth.meta = {
@@ -320,7 +334,7 @@ function sampleDepth(frame, ref, session, tNow) {
     xf: new M4().fromArray((info.transform || view.transform).matrix),
     nd: new M4(),
     near: info.depthNear ?? session.renderState.depthNear, far: info.depthFar ?? session.renderState.depthFar, r2m: info.rawValueToMeters || .001, rvm: info.rawValueToMeters || 1,
-    head: new V3().setFromMatrixPosition(vp.transform.matrix), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
+    head: new V3(vp.transform.matrix[12], vp.transform.matrix[13], vp.transform.matrix[14]), hands: handsNow(), cam: camFrame(vp), vinv: new M4().fromArray(vp.transform.inverse.matrix)
   };
 }
 function integrateDepth() {
@@ -341,7 +355,7 @@ function integrateDepth() {
       reversed: rw => rw <= 0 ? 0 : isFinite(far) ? near * far / (near + rw * (far - near)) : near / rw,
       u16: rw => rw * 65535 * r2m                                                          // 16-bit raw units
     };
-    const cands = lumA ? ['mm'] : flagged ? ['metres'] : ['ndc', 'reversed', 'u16', 'metres'];
+    const cands = lumA ? ['mm'] : flagged ? ['metres'] : ['ndc', 'u16', 'reversed', 'metres'];          // ties go to the earlier, likelier one
     if (!depth.mode || !cands.includes(depth.mode) || depth.frames % 40 === 0) {
       let best = null, bs = -1;
       for (const m of cands) { let sc = 0; for (let k = 0; k < DW * DH; k += 7) { const z = MODES[m](raws[k]); if (z > .3 && z < 5) sc++; } if (sc > bs) { bs = sc; best = m; } }
@@ -392,7 +406,7 @@ function integrateDepth() {
     if (depth.flipVotes >= 3 && depth.flipAuto < 2) { depth.flipY = !depth.flipY; depth.flipAuto++; depth.flipVotes = 0; clearMap(); toast('Depth image was upside down: corrected automatically'); } }
   const ms = performance.now() - t0; depth.ms = depth.ms ? depth.ms * .8 + ms * .2 : ms;
   depth.rate = Math.max(.07, depth.ms * 4 / 1000);                    // keep integration under ~25% of the frame budget
-  depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms';
+  depth.status = 'LIVE · ' + added + ' pts · ' + valid + ' px · ' + depth.ms.toFixed(1) + ' ms' + (DR.isInt ? ' · int' : '');
 }
 
 /* ================= saving: IndexedDB on the headset, anchored so it lines up next session ================= */
