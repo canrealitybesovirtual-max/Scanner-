@@ -81,14 +81,18 @@ const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, .02, 40
 /* the map lives in its own frame; D maps headset-world -> map (drift correction). Everything scanned is drawn through D⁻¹ so it sits on the real room */
 const mapRoot = new THREE.Group(); mapRoot.matrixAutoUpdate = false; scene.add(mapRoot);
 const Dm = new M4(), Dinv = new M4(); let icpOn = true;
-function setD(m) { Dm.copy(m); Dinv.copy(m).invert(); mapRoot.matrix.copy(Dinv); mapRoot.matrixWorldNeedsUpdate = true; }
+function rigidify(m) {                                             // re-orthonormalise: products of thousands of small corrections drift away from a rotation
+  const e = m.elements, x = new V3(e[0], e[1], e[2]).normalize(), y0 = new V3(e[4], e[5], e[6]), z = new V3().crossVectors(x, y0).normalize(), y = new V3().crossVectors(z, x);
+  e[0] = x.x; e[1] = x.y; e[2] = x.z; e[3] = 0; e[4] = y.x; e[5] = y.y; e[6] = y.z; e[7] = 0; e[8] = z.x; e[9] = z.y; e[10] = z.z; e[11] = 0; e[15] = 1; return m;
+}
+function setD(m) { Dm.copy(m); rigidify(Dm); Dinv.copy(Dm).invert(); mapRoot.matrix.copy(Dinv); mapRoot.matrixWorldNeedsUpdate = true; }
 addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
 
 /* ================= the voxel map: every 2 cm cube of space a surface was seen in ================= */
 const VS = .02, CONF = 3, MAX = 2000000;                 // voxel size (m), sightings before a voxel counts as real, capacity
 const vmap = new Map();
 const pos = new Float32Array(MAX * 3), cnt = new Float32Array(MAX), born = new Float32Array(MAX), dirs = new Uint32Array(MAX), ang = new Float32Array(MAX), col = new Float32Array(MAX * 3), cw = new Float32Array(MAX), nrm = new Float32Array(MAX * 3), tl = new Uint8Array(MAX);   // tl: covered by a flat tile. dirs: which of 26 directions each voxel was seen from
-let N = 0, confirmed = 0, newLo = 0, mapFull = false;
+let N = 0, confirmed = 0, newLo = 0, mapFull = false; const vkey = new Float64Array(MAX), seenT = new Float32Array(MAX), freeIds = [];
 const dmark = new Uint8Array(MAX); let dlist = [];
 const markDirty = id => { if (!dmark[id]) { dmark[id] = 1; dlist.push(id); } };
 const keyOf = (ix, iy, iz) => ((ix + 8192) * 16384 + (iy + 8192)) * 16384 + (iz + 8192);   // ±163 m at 2 cm, exact in a double
@@ -96,12 +100,12 @@ function addSighting(x, y, z, t, w = 1, cam = null, mask = 0, nx = 0, ny = 0, nz
   const ix = Math.floor(x / VS), iy = Math.floor(y / VS), iz = Math.floor(z / VS);
   if (ix < -8190 || ix > 8190 || iy < -8190 || iy > 8190 || iz < -8190 || iz > 8190) return -1;
   const k = keyOf(ix, iy, iz); let id = vmap.get(k);
-  if (id === undefined) { if (N >= MAX) { mapFull = true; return -1; } id = N++; vmap.set(k, id); tl[id] = 0; cellAdd(ix, iy, iz, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
+  if (id === undefined) { if (freeIds.length) id = freeIds.pop(); else if (N >= MAX) { mapFull = true; return -1; } else id = N++; vmap.set(k, id); vkey[id] = k; born[id] = 0; tl[id] = 0; cellAdd(ix, iy, iz, id); dirs[id] = 0; ang[id] = 0; cw[id] = 0; pos[id * 3] = x; pos[id * 3 + 1] = y; pos[id * 3 + 2] = z; nrm[id * 3] = nrm[id * 3 + 1] = nrm[id * 3 + 2] = 0; cnt[id] = 0; }
   else { const a = w / (Math.min(cnt[id], 30) + w); pos[id * 3] += (x - pos[id * 3]) * a; pos[id * 3 + 1] += (y - pos[id * 3 + 1]) * a; pos[id * 3 + 2] += (z - pos[id * 3 + 2]) * a; }   // the true surface point, not the grid corner
   if (nx || ny || nz) { nrm[id * 3] += nx * w; nrm[id * 3 + 1] += ny * w; nrm[id * 3 + 2] += nz * w; }
   if (cam) { const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z, l = Math.hypot(dx, dy, dz) || 1, q = v => v / l > .38 ? 2 : v / l < -.38 ? 0 : 1; mask |= 1 << (q(dx) * 9 + q(dy) * 3 + q(dz)); }
   if (mask && (dirs[id] | mask) !== dirs[id]) { dirs[id] |= mask; ang[id] = popc(dirs[id]); }
-  const before = cnt[id]; cnt[id] = Math.min(60, before + w);                     // capped so a point that's gone can be outvoted quickly
+  seenT[id] = performance.now() / 1000; const before = cnt[id]; cnt[id] = Math.min(60, before + w);                     // capped so a point that's gone can be outvoted quickly
   if (before < CONF && cnt[id] >= CONF) { confirmed++; born[id] = t; covMark(pos[id * 3], pos[id * 3 + 1], pos[id * 3 + 2]); cellDirty(ix, iy, iz); }
   else if (before < 12 && cnt[id] >= 12) cellDirty(ix, iy, iz);          // settled: refit its tile
   markDirty(id);
@@ -128,7 +132,7 @@ function tint(id, r, g, b, w) {                            // running average of
   if (cw[id] < 1.5 && cw[id] + w >= 1.5 && tl[id]) cellDirty(Math.floor(pos[id * 3] / VS), Math.floor(pos[id * 3 + 1] / VS), Math.floor(pos[id * 3 + 2] / VS));   // tile gets this colour
   const k = cw[id] + w, a = w / k; col[id * 3] += (r - col[id * 3]) * a; col[id * 3 + 1] += (g - col[id * 3 + 1]) * a; col[id * 3 + 2] += (b - col[id * 3 + 2]) * a; cw[id] = Math.min(50, k);
 }
-function clearMap() { mapFull = false; setD(new M4()); meshClear(); liveClear(); if (integ) integ.postMessage({ tsdfReset: true }); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
+function clearMap() { mapFull = false; freeIds.length = 0; setD(new M4()); meshClear(); liveClear(); if (integ) integ.postMessage({ tsdfReset: true }); fineClear(); if (integ) integ.postMessage({ resetKnown: true }); depth.gen = (depth.gen || 0) + 1; applyQ.length = 0; tilesClear(); cov.done.clear(); vmap.clear(); N = 0; confirmed = 0; newLo = 0; for (const id of dlist) dmark[id] = 0; dlist = []; pg.setDrawRange(0, 0); }
 const pg = new THREE.BufferGeometry();
 pg.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
 pg.setAttribute('cnt', new THREE.BufferAttribute(cnt, 1).setUsage(THREE.DynamicDrawUsage));
@@ -573,8 +577,8 @@ function captureKeyframe(tCap, want) {
   sg.drawImage(v, 0, 0, 160, 120); const px = sg.getImageData(0, 0, 160, 120).data; let sm = 0, sq = 0, nn = 0;
   for (let y = 1; y < 119; y += 1) for (let x = 1; x < 159; x += 1) { const i = (y * 160 + x) * 4, L = (k) => px[k] * .3 + px[k + 1] * .59 + px[k + 2] * .11;
     const lap = 4 * L(i) - L(i - 4) - L(i + 4) - L(i - 640) - L(i + 640); sm += lap; sq += lap * lap; nn++; }
-  const sharp = sq / nn - (sm / nn) ** 2; kf.best = Math.max((kf.best || 0) * .995, sharp);
-  if (sharp < kf.best * .45) { kf.blurred = (kf.blurred || 0) + 1; return; }
+  const sharp = sq / nn - (sm / nn) ** 2; (kf.sh || (kf.sh = [])).push(sharp); if (kf.sh.length > 40) kf.sh.shift(); const med = kf.sh.slice().sort((a, b) => a - b)[kf.sh.length >> 1]; kf.best = med;
+  if (kf.sh.length > 8 && sharp < med * .55) { kf.blurred = (kf.blurred || 0) + 1; return; }   // clearly blurrier than this camera's usual frames
   kf.cv.width = w; kf.cv.height = h; kf.cv.getContext('2d').drawImage(v, 0, 0, w, h);
   kf.busy = true; kf.t = tNow; kf.pos.copy(p); kf.q.copy(q); kf.has = true;
   const rec = { scan: currentId, k: currentId + '/' + Date.now() + '-' + (kf.n), i: kf.n, t: Date.now(), m0: Array.from(Dm.clone().multiply(head).elements), m: Array.from(Dm.clone().multiply(head).multiply(colorCam.E || new M4()).elements), k1: colorCam.k1 || 0, camLatMs: tCap != null ? Math.round(performance.now() - tCap) : null, w, h, hfov: 2 * Math.atan(1 / c.f), cx: c.cx || 0, cy: c.cy, sharp, aligned: !!c.aligned, head: Array.from(head.elements) };
@@ -674,9 +678,10 @@ function lagTest(d) {
       for (const [a, b, c] of NB7) { const j = vmap.get(keyOf(ix + a, iy + b, iz + c)); if (j !== undefined && cnt[j] >= CONF) { hits[k]++; break; } } } }
   const S = depth.lagS || (depth.lagS = new Float32Array(LAGS)); depth.lagN = (depth.lagN || 0) + 1;
   for (let k = 0; k < LAGS; k++) S[k] = S[k] * .96 + hits[k] / tot;
-  if (depth.lagN < 25) return;
+  if (depth.lagN < 60) return;
   const L = d.lagUsed || 0; let best = L; for (let k = 0; k < LAGS; k++) if (S[k] > S[best]) best = k;
-  if (best !== L && S[best] > S[L] * 1.04) { depth.lag = best; depth.lagS = null; depth.lagN = 0; depth.lagOK = false; try { localStorage.setItem('scanner.depthLag', best); } catch (e) {} toast('Depth timing tuned: ' + best + ' frame' + (best === 1 ? '' : 's') + ' behind your head'); return; }
+  if (best !== L && S[best] > S[L] * 1.08) { best = L + Math.sign(best - L); depth.lag = best;   // one frame at a time, and only on a clear win
+    depth.lagS = null; depth.lagN = 0; depth.lagOK = false; try { localStorage.setItem('scanner.depthLag', best); } catch (e) {} toast('Depth timing tuned: ' + best + ' frame' + (best === 1 ? '' : 's') + ' behind your head'); return; }
   depth.lagOK = S[L] / (1 / (1 - .96)) > .3;            // the current lag is the best one and the map agrees: moving frames are safe to fuse
 }
 function depthModes(M) {
@@ -846,7 +851,7 @@ function hHas(k) { let i = hIdx(k); const v = k + 1; while (HK[i] !== 0) { if (H
 /* camera alignment: the browser gives no camera intrinsics, so try a grid of field-of-view / centre guesses and keep the one
    that makes each surface spot the same colour from every angle you see it */
 const AL = { cands: [], slots: new Map(), acc: null, frames: 0, done: false, S: 4096 };
-for (const h of [66, 72, 78, 84, 90, 96]) for (const cx of [-.04, 0, .04]) for (const cy of [-.06, -.03, 0, .03, .06]) AL.cands.push({ f: 1 / Math.tan(h * Math.PI / 360), cx, cy, hfov: h });
+for (const h of [62, 66, 70, 74, 78, 84, 90]) for (const cx of [-.1, -.05, 0, .05, .1]) for (const cy of [-.12, -.06, 0, .06, .12]) AL.cands.push({ f: 1 / Math.tan(h * Math.PI / 360), cx, cy, hfov: h });
 AL.acc = new Float32Array(AL.cands.length * AL.S * 5);
 function alignFrame(cam, V, list, n) {
   const C = AL.cands, S = AL.S;
@@ -1024,7 +1029,7 @@ function minEigRatio(H) {                                         // smallest/la
   const ev = A.map((r, i) => r[i]); return Math.min(...ev) / Math.max(...ev);
 }
 function icp(pts, X0, iters, maxT, maxR) {
-  let X = X0.slice(); const n = pts.length / 3, s = [0, 0, 0, 0], K = .012; let used = 0, rms = 0, ratio = 0;
+  let X = X0.slice(); const n = pts.length / 3, s = [0, 0, 0, 0], K = .02; let used = 0, rms = 0, ratio = 0;
   for (let it = 0; it < iters; it++) {
     const H = new Array(36).fill(0), g = [0, 0, 0, 0, 0, 0], cx = X[12], cy = X[13], cz = X[14]; used = 0; let e2 = 0;
     for (let q = 0; q < n; q++) {
@@ -1047,7 +1052,7 @@ function icp(pts, X0, iters, maxT, maxR) {
     if (Math.hypot(tx, ty, tz) < 1e-4 && th < 1e-4) break;
   }
   const dt = Math.hypot(X[12] - X0[12], X[13] - X0[13], X[14] - X0[14]), dr = Math.acos(Math.min(1, (X[0] * X0[0] + X[1] * X0[1] + X[2] * X0[2] + X[4] * X0[4] + X[5] * X0[5] + X[6] * X0[6] + X[8] * X0[8] + X[9] * X0[9] + X[10] * X0[10] - 1) / 2));
-  return { X, ok: used >= 150 && rms < .012 && ratio > 2e-4 && dt < maxT && dr < maxR, used, rms, ratio, dt, dr };
+  return { X, ok: used >= 150 && rms < .03 && ratio > 2e-4 && dt < maxT && dr < maxR, used, rms, ratio, dt, dr };      // Quest depth noise is ~2 cm at room range
 }
 let relocT = 0;
 function reloc(pts, X) {                                          // coarse search of shifts up to ±12 cm: which one puts the most points on the surface?
@@ -1223,9 +1228,13 @@ function liveMeshes(list) {
     if (!m.I.length) continue;
     const g = new THREE.BufferGeometry(), CL = new Float32Array(m.C.length); for (let k = 0; k < CL.length; k++) { const c = m.C[k]; CL[k] = c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }
     g.setAttribute('position', new THREE.BufferAttribute(m.P, 3)); g.setAttribute('normal', new THREE.BufferAttribute(m.N, 3)); g.setAttribute('color', new THREE.BufferAttribute(CL, 3)); g.setIndex(new THREE.BufferAttribute(m.I, 1));
-    const o = new THREE.Mesh(g, ibr.live && liveIbrMat ? liveIbrMat : liveMat); o.frustumCulled = false; o.layers.enable(3); tsdfG.add(o); liveM.set(m.rk, o);
+    g.computeBoundingSphere(); const o = new THREE.Mesh(g, ibr.live && liveIbrMat ? liveIbrMat : liveMat); o.frustumCulled = true; o.layers.enable(3); tsdfG.add(o); liveM.set(m.rk, o);   // off-screen regions are skipped
   }
   applySurf();
+}
+function liveCull() {                                               // regions far behind you cost draw calls for nothing
+  const eye = renderer.xr.getCamera().getWorldPosition(new V3()).applyMatrix4(Dm); let shown = 0;
+  for (const o of liveM.values()) { const bs = o.geometry.boundingSphere; o.visible = !bs || bs.center.distanceTo(eye) - bs.radius < 7; if (o.visible) shown++; } depth.liveShown = shown;
 }
 function liveClear() { for (const o of liveM.values()) { tsdfG.remove(o); o.geometry.dispose(); } liveM.clear(); }
 const tsdfDump = () => integ ? workerAsk(integ, {}, 'tsdfDump') : Promise.resolve(null);
@@ -1248,7 +1257,7 @@ function integWorker() {
     if (d.tsdfDump || d.meshAll) { const f = wReq.get(d.tsdfDump || d.meshAll); wReq.delete(d.tsdfDump || d.meshAll); if (f) f(d.t || d.m); return; }
     depth.wBusy = false; if (d.align) camAligned(d.align); if (d.noOC) colorCam.noBmp = true;
     if ((d.rem && d.rem.length) || (d.add && d.add.length)) layoutEdit(d.rem, d.add); if (d.gen !== (depth.gen || 0)) return;
-    if (d.corr) { setD(new M4().fromArray(d.corr).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
+    if (d.corr) { setD(rigidify(new M4().fromArray(d.corr)).multiply(Dm)); }          // the frame was aligned to the surface: carry the correction forward
     if (d.track) { depth.track = d.track; depth.trackOK = (depth.trackOK || 0) * .9 + (d.track.ok ? .1 : 0); }
     if (d.raw && scanning && !replayMode) { if (!currentId) currentId = 'scan-' + Date.now(); DB.putDepth(Object.assign(d.raw, { scan: currentId, k: currentId + '/d' + d.raw.tCap, t: d.raw.tCap })).then(() => depth.rawN = (depth.rawN || 0) + 1).catch(() => {}); }
     if (d.meshes) liveMeshes(d.meshes); if (d.tsdfBlocks) { depth.tsdfMs = d.tms; depth.tsdfRegions = d.regions; }
@@ -1309,12 +1318,18 @@ function metaNear(ix, iy, iz) { const S = metaSurf.set; for (const [a, b, c] of 
 function metaHas(x, y, z) { return metaNear(Math.floor(x / MG), Math.floor(y / MG), Math.floor(z / MG)); }
 
 /* ================= self-cleaning: stray points with no neighbours fade out, a slice per frame ================= */
-let cleanAt = 0, cleaned = 0;
+let cleanAt = 0, cleaned = 0, recycled = 0;
 const NB6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 function cleanSlice(budget) {
   const end = Math.min(N, cleanAt + budget);
   for (let id = cleanAt; id < end; id++) {
-    if (cnt[id] < CONF || cnt[id] >= 10) continue;
+    if (cnt[id] < CONF) {                                             // never confirmed (noise) or erased: fade, then free the slot
+      if (vkey[id] < 0) continue; const idle = performance.now() / 1000 - seenT[id];
+      // erased and gone 3 s, or never confirmed in 20 s: free the slot
+      if (idle > (cnt[id] <= .01 ? 3 : 20)) { vmap.delete(vkey[id]); const ix = Math.floor(pos[id * 3] / VS), iy = Math.floor(pos[id * 3 + 1] / VS), iz = Math.floor(pos[id * 3 + 2] / VS), c = cells.get(ckey(ix, iy, iz));
+        if (c) { const j = c.ids.indexOf(id); if (j >= 0) c.ids.splice(j, 1); } vkey[id] = -1; tl[id] = 0; cw[id] = 0; markDirty(id); freeIds.push(id); recycled++; if (mapFull) mapFull = false; }
+      continue; }
+    if (cnt[id] >= 10) continue;
     const ix = Math.floor(pos[id * 3] / VS), iy = Math.floor(pos[id * 3 + 1] / VS), iz = Math.floor(pos[id * 3 + 2] / VS);
     let lonely = true;
     for (const [a, b, c] of NB6) { const j = vmap.get(keyOf(ix + a, iy + b, iz + c)); if (j !== undefined && cnt[j] >= 1) { lonely = false; break; } }
@@ -1428,7 +1443,7 @@ async function moveOldFrames(id, M, before) {                       // old photo
 }
 function mergeRecord(rec, T, reload) {
   if (!viewer.on && !replayMode && !reload) cont = { rec, T0: T.clone(), M: null, moved: false };
-  if (rec.D && !viewer.on) T = T.clone().multiply(new M4().fromArray(rec.D).invert());   // saved in that session's map frame
+  if (rec.D && !viewer.on) T = T.clone().multiply(rigidify(new M4().fromArray(rec.D)).invert());   // saved in that session's map frame
   if (cont && cont.rec === rec) cont.M = T.clone();
   const P = rec.points, C = rec.counts, v = new V3(), t = clockT;
   for (let k = 0; k < P.length / 3; k++) { v.set(P[k * 3], P[k * 3 + 1], P[k * 3 + 2]).applyMatrix4(T); const Nr = rec.normals, nn = Nr && (Nr[k * 3] | Nr[k * 3 + 1] | Nr[k * 3 + 2]) ? _c.set(Nr[k * 3], Nr[k * 3 + 1], Nr[k * 3 + 2]).transformDirection(T) : null; addSighting(v.x, v.y, v.z, t - 10, C ? C[k] : CONF, null, rec.masks ? rec.masks[k] : 0, nn ? nn.x : 0, nn ? nn.y : 0, nn ? nn.z : 0); if (rec.colors && rec.colors[k * 4 + 3]) { const id = vmap.get(keyOf(Math.floor(v.x / VS), Math.floor(v.y / VS), Math.floor(v.z / VS))); if (id !== undefined) tint(id, rec.colors[k * 4] / 255, rec.colors[k * 4 + 1] / 255, rec.colors[k * 4 + 2] / 255, 1); } }
@@ -1920,7 +1935,9 @@ onmessage = async e => {
       for (let j = 0; j < nEdge; j++) { if (base[j] >= 6) continue; for (let a = 0; a < NP; a++) { g[a] -= cols[a][j] * base[j]; for (let c = 0; c < NP; c++) A[a * NP + c] += cols[a][j] * cols[c][j]; } }
       let tr = 0; for (let a = 0; a < NP; a++) tr += A[a * NP + a]; for (let a = 0; a < NP; a++) A[a * NP + a] += tr / NP * .2 + 1e-9;
       const x = solve(A, g, NP); if (!x) continue;
-      const cand = [mul(E, rig([x[0], x[1], x[2]].map(v => Math.max(-.02, Math.min(.02, v))), [x[3], x[4], x[5]].map(v => Math.max(-.03, Math.min(.03, v))))), Math.max(-.2, Math.min(.2, gs + Math.max(-.03, Math.min(.03, x[6])))), Math.max(-.08, Math.min(.08, gcx + Math.max(-.015, Math.min(.015, x[7])))), Math.max(-.08, Math.min(.08, gcy + Math.max(-.015, Math.min(.015, x[8]))))];
+      // the camera's position on the headset trades off with its rotation: small steps, and never more than 6 cm from the head centre
+      const capT = M => { const l = Math.hypot(M[12], M[13], M[14]); if (l > .06) { M[12] *= .06 / l; M[13] *= .06 / l; M[14] *= .06 / l; } return M; };
+      const cand = [capT(mul(E, rig([x[0], x[1], x[2]].map(v => Math.max(-.01, Math.min(.01, v))), [x[3], x[4], x[5]].map(v => Math.max(-.03, Math.min(.03, v)))))), Math.max(-.2, Math.min(.2, gs + Math.max(-.03, Math.min(.03, x[6])))), Math.max(-.08, Math.min(.08, gcx + Math.max(-.015, Math.min(.015, x[7])))), Math.max(-.08, Math.min(.08, gcy + Math.max(-.015, Math.min(.015, x[8]))))];
       cand.push(NP > 9 ? Math.max(-.35, Math.min(.35, gk + Math.max(-.05, Math.min(.05, x[9])))) : gk);
       if (edgeCost(lv, cand[0], cand[1], cand[2], cand[3], null, cand[4]) < edgeCost(lv, E, gs, gcx, gcy, null, gk)) { [E, gs, gcx, gcy, gk] = cand; }   // only accept steps that help
     }
@@ -1977,7 +1994,7 @@ async function alignPhotos(rec, say = () => {}) {
   w.terminate();
   if (!(res.edge1 < res.edge0 - .05 || res.rms1 < res.rms0)) throw new Error('photo matching did not improve (edges ' + (res.edge0 || 0).toFixed(2) + ' px, colour ' + res.rms0.toFixed(3) + ')');
   { const Em = new M4().fromArray(res.E), off = new V3().setFromMatrixPosition(Em).length(), rot = new THREE.Quaternion().setFromRotationMatrix(Em).angleTo(new THREE.Quaternion()) * 180 / Math.PI;
-    if (off > .1 || rot > 6 || Math.abs(res.s) > .18) throw new Error('implausible camera calibration rejected (' + (off * 100).toFixed(0) + ' cm, ' + rot.toFixed(1) + '°)'); }
+    if (off > .12 || rot > 8 || Math.abs(res.s) > .2) throw new Error('implausible camera calibration rejected (' + (off * 100).toFixed(0) + ' cm, ' + rot.toFixed(1) + '°)'); }
   const solved = new Map();
   for (const p of res.photos) { const f = frames[p.k];
     if (!f.m0) { f.m0 = f.m; f.hfov0 = f.hfov; f.cx0 = f.cx || 0; f.cy0 = f.cy || 0; }
@@ -2039,7 +2056,7 @@ function ibrMaterial(useMap, map) {
 }
 let liveIbrMat = null;
 function ibrStartLive() {                                           // photo-paint the live mesh (map frame -> world through D⁻¹)
-  if (ibr.live || !kfMem.length) return; ibrStop(); ibr.live = true; ibr.on = true; ibr.rec = null; ibr.frames = kfMem; ibr.gains = new Map();
+  if (ibr.live || !kfMem.length) return; ibrStop(); ibr.live = true; ibr.on = true; ibr.k = 3; ibr.rec = null; ibr.frames = kfMem; ibr.gains = new Map();   // scanning already keeps the headset busy: 3 photos at a time
   if (!liveIbrMat) liveIbrMat = ibrMaterial(false); for (const o of liveM.values()) { o.material = liveIbrMat; o.layers.enable(3); }
   for (const sl of ibr.slots) { sl.idx = -1; sl.on = 0; } ibr.t = 0;
 }
@@ -2086,7 +2103,8 @@ function ibrUpdate(eyeCam) {                                         // pick the
   }
   /* frame-rate guard: blend fewer photos if the headset is struggling, more when there's headroom */
   if (renderer.xr.isPresenting) { ibr.slow = fps < 62 ? (ibr.slow || 0) + 1 : 0; ibr.fast = fps > 70 ? (ibr.fast || 0) + 1 : 0;
-    if (ibr.slow > 90 && (ibr.k || IBR_K) > 3) { ibr.k = (ibr.k || IBR_K) - 1; ibr.slow = 0; } if (ibr.fast > 300 && (ibr.k || IBR_K) < IBR_K) { ibr.k = (ibr.k || IBR_K) + 1; ibr.fast = 0; } }
+    if (ibr.slow > 90 && (ibr.k || IBR_K) > (ibr.live ? 2 : 3)) { ibr.k = (ibr.k || IBR_K) - 1; ibr.slow = 0; } if (ibr.fast > 300 && (ibr.k || IBR_K) < (ibr.live ? 4 : IBR_K)) { ibr.k = (ibr.k || IBR_K) + 1; ibr.fast = 0; } }
+  if (ibr.live && (ibr.k || IBR_K) <= 2 && ibr.slow > 240) { showMode = 3; ibr.slow = 0; applySurf(); toast('Switched to the plain live mesh to keep it smooth (More › Show to change)'); diagLog('fps', 'photo mesh off: too slow'); return; }
   const kAct = ibr.k || IBR_K;
   for (let k = 0; k < IBR_K; k++) { const sl = ibr.slots[k]; sl.fade = Math.min(1, (sl.fade || 0) + 1 / 20); }       // ~1/3 s fade-in for a newly loaded photo
   const mats = ibr.live ? (liveIbrMat ? [liveIbrMat] : []) : meshG.children.filter(o => o.userData.ibr).map(o => o.material);
@@ -2466,15 +2484,16 @@ function setReality() {                                    // captured house onl
 }
 function toast(m) { toastMsg = m; toastT = 4; diagLog('toast', m); }
 /* diagnostics: what the headset actually did, saved every 10 s so it survives a crash; downloadable from the start page */
-const diag = { log: [] };
+const diag = { log: [], fpsH: [] };
 function diagLog(kind, msg) { diag.log.push([Math.round(performance.now()), kind, String(msg).slice(0, 160)]); if (diag.log.length > 80) diag.log.shift(); }
 function diagSnapshot() {
-  return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps),
+  const fh = diag.fpsH.slice().sort((a, b) => a - b);
+  return { app: 'house-scanner', when: new Date().toISOString(), ua: navigator.userAgent, fps: Math.round(fps), fpsMedian: fh.length ? fh[fh.length >> 1] : null, fpsLow10: fh.length ? fh[Math.floor(fh.length * .1)] : null, liveShown: depth.liveShown || null, ibrPhotos: ibr.k || null,
     session: xrSession ? { features: xrSession.enabledFeatures || null, depthUsage: xrSession.depthUsage || null, depthFormat: xrSession.depthDataFormat || null } : null,
     depth: { status: depth.status, sensor: depth.sensor, mode: depth.modeName, cfg: depth.cfg, calLocked: !!(depth.cal && depth.cal.locked), calMethod: depth.cal && depth.cal.method, agree: depth.agree, metaStale: !!depth.metaStale,
       lag: depth.lag || 0, lagOK: !!depth.lagOK, lagScores: depth.lagS ? Array.from(depth.lagS) : null, msApply: depth.ms, workerLatency: depth.lat, track: depth.track || null, trackOK: depth.trackOK, drift: Array.from(Dm.elements), rawFrames: depth.rawN || 0, tsdfMs: depth.tsdfMs, tsdfRegions: depth.tsdfRegions, liveMeshes: liveM.size, exposure: depth.expGain, noWorker: !!depth.noWorker },
     camera: { status: colorCam.status, clock: colorCam.clock || null, latencyMs: colorCam.lat != null ? Math.round(colorCam.lat) : null, k1: colorCam.k1 || 0, aligned: colorCam.aligned, f: colorCam.f, cx: colorCam.cx, cy: colorCam.cy, bitmap: !colorCam.noBmp },
-    storage: diag.storage || null, quickSaves: diag.quickSaves || 0, map: { voxels: N, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
+    storage: diag.storage || null, quickSaves: diag.quickSaves || 0, map: { voxels: N, free: freeIds.length, recycled, confirmed, tiles: tileN, cleaned, erased, mapFull, fine: FN, fineConfirmed: fconf, zones: det.zones.length, photos: kf.n, blurredRejected: kf.blurred || 0 },
     layout: { metaCells: metaSurf.n, removed: lay.removed.size, added: lay.added.size, coverage: coverage() }, error: scanErr || null, log: diag.log };
 }
 async function storageInfo() { try { const e = await navigator.storage.estimate(), p = navigator.storage.persisted ? await navigator.storage.persisted() : null; diag.storage = { usedMB: Math.round(e.usage / 1e6), quotaMB: Math.round(e.quota / 1e6), persisted: p }; } catch (err) {} }
@@ -2872,7 +2891,7 @@ $('fOpen').addEventListener('change', async e => {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop((t, frame) => {
   const dt = Math.min(.1, clock.getDelta()); clockT += dt; pmat.uniforms.time.value = clockT;
-  fpsAcc += dt; fpsN++; if (fpsAcc > .5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+  fpsAcc += dt; fpsN++; if (fpsAcc > .5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; if (renderer.xr.isPresenting) { diag.fpsH.push(Math.round(fps)); if (diag.fpsH.length > 1200) diag.fpsH.shift(); } }
   if (frame) {
     try {
     lastFrame = frame;
@@ -2908,7 +2927,7 @@ renderer.setAnimationLoop((t, frame) => {
     flushGeo();
     updatePointer(); toastT -= dt; if ((Math.floor(clockT * 4) !== Math.floor((clockT - dt) * 4)) || panel.hover !== panel.lastHover) { drawPanel(); panel.lastHover = panel.hover; }
     if (Math.floor(clockT / 10) !== Math.floor((clockT - dt) / 10)) diagSave();
-    autoTick(dt); sweepTick(); relocTick(); if (replayMode || ibr.live) ibrUpdate(renderer.xr.getCamera());
+    autoTick(dt); sweepTick(); relocTick(); if (Math.floor(clockT * 2) !== Math.floor((clockT - dt) * 2)) liveCull(); if (replayMode || ibr.live) ibrUpdate(renderer.xr.getCamera());
     if (showMode === 4 && !ibr.live && kfMem.length && !replayMode && Math.floor(clockT) !== Math.floor(clockT - dt)) applySurf(); if (Math.floor(clockT) !== Math.floor(clockT - dt)) updateGuide(); drawGuideArrow();
     hud.mesh.visible = renderer.xr.isPresenting; if (hud.mesh.visible) { followHud(dt); if (Math.floor(clockT * 6) !== Math.floor((clockT - dt) * 6)) drawHud(); }
     } catch (e) { scanErr = (e && e.message || String(e)).slice(0, 60); diagLog('error', (e && e.stack) || scanErr); try { glBack(); } catch (_) {} }
